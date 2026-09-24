@@ -1,10 +1,8 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
-from harness.config import Config
 from harness.policy import ToolGate
 from harness.session import SessionError, SessionOutcome, SessionRequest
 
@@ -34,9 +32,3 @@ def returns(output: dict[str, Any]) -> Responder:
 
 def fails(message: str = "boom") -> SessionError:
     return SessionError(message)
-
-
-def default_config(tmp_path: Path) -> Config:
-    return Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "plugin_dir": str(tmp_path / "plugin")}
-    )
