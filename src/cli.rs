@@ -109,8 +109,8 @@ pub async fn run<S: Session>(
 }
 
 fn single_instance(paths: &Paths) -> Result<InstanceLock, i32> {
-    let lock_file = paths.state_dir.join("harness.lock");
-    match InstanceLock::try_acquire(&paths.state_dir) {
+    let lock_file = paths.instance_lock_file();
+    match InstanceLock::try_acquire(&lock_file) {
         Ok(Some(lock)) => Ok(lock),
         Ok(None) => {
             eprintln!(
@@ -382,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn second_instance_refuses_to_run_sessions() {
         let env = test_env();
-        let held = InstanceLock::try_acquire(&env.paths.state_dir)
+        let held = InstanceLock::try_acquire(&env.paths.instance_lock_file())
             .unwrap()
             .unwrap();
         let (code, session) = run_with(&env, &["card", "EX-1"], no_session()).await;

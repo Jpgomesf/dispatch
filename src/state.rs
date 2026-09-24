@@ -16,7 +16,7 @@ pub enum CardStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardState {
     pub status: CardStatus,
     pub updated_at: DateTime<Utc>,
@@ -24,7 +24,7 @@ pub struct CardState {
     pub pr_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
     pub cursors: BTreeMap<String, String>,
@@ -32,10 +32,12 @@ pub struct State {
 }
 
 impl State {
+    #[must_use]
     pub fn status(&self, card_ref: &str) -> Option<CardStatus> {
         self.cards.get(card_ref).map(|card| card.status)
     }
 
+    #[must_use]
     pub fn in_progress(&self, card_ref: &str) -> bool {
         self.status(card_ref) == Some(CardStatus::InProgress)
     }
@@ -121,19 +123,23 @@ pub struct InstanceLock {
 
 impl InstanceLock {
     /// `Ok(None)` when another process holds the lock.
-    pub fn try_acquire(state_dir: &Path) -> Result<Option<InstanceLock>> {
-        std::fs::create_dir_all(state_dir)
-            .with_context(|| format!("create state dir {}", state_dir.display()))?;
+    pub fn try_acquire(path: &Path) -> Result<Option<InstanceLock>> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create state dir {}", dir.display()))?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(state_dir.join("harness.lock"))
-            .context("open harness.lock")?;
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
         match file.try_lock() {
             Ok(()) => Ok(Some(InstanceLock { _file: file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(error)) => Err(error).context("lock harness.lock"),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("lock {}", path.display()))
+            }
         }
     }
 }
@@ -222,11 +228,12 @@ mod tests {
     #[test]
     fn instance_lock_is_exclusive_until_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let first = InstanceLock::try_acquire(dir.path()).unwrap();
+        let lock_file = dir.path().join("harness.lock");
+        let first = InstanceLock::try_acquire(&lock_file).unwrap();
         assert!(first.is_some());
-        assert!(InstanceLock::try_acquire(dir.path()).unwrap().is_none());
+        assert!(InstanceLock::try_acquire(&lock_file).unwrap().is_none());
         drop(first);
-        assert!(InstanceLock::try_acquire(dir.path()).unwrap().is_some());
+        assert!(InstanceLock::try_acquire(&lock_file).unwrap().is_some());
     }
 
     #[tokio::test]

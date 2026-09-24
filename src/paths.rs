@@ -16,7 +16,7 @@ pub fn resolve_config_path(cli_value: Option<&Path>, env_value: Option<&str>) ->
     expand_user(&raw)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub config: PathBuf,
     pub state_dir: PathBuf,
@@ -43,6 +43,10 @@ impl Paths {
 
     pub fn kill_switch(&self) -> PathBuf {
         self.state_dir.join("STOP")
+    }
+
+    pub fn instance_lock_file(&self) -> PathBuf {
+        self.state_dir.join("harness.lock")
     }
 
     /// Per-card git worktrees live under the state dir, never inside the workspace.
@@ -93,6 +97,10 @@ mod tests {
         let paths = Paths::resolve(Path::new("c.toml"), &config);
         assert_eq!(paths.state_file(), PathBuf::from("/var/example/state.json"));
         assert_eq!(paths.kill_switch(), PathBuf::from("/var/example/STOP"));
+        assert_eq!(
+            paths.instance_lock_file(),
+            PathBuf::from("/var/example/harness.lock")
+        );
         assert_eq!(
             paths.worktrees_dir(),
             PathBuf::from("/var/example/worktrees")
