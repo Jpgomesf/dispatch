@@ -6,19 +6,25 @@ use tokio::process::Command;
 
 use crate::config::Workspace;
 
-/// `EX-123` → `ex-123`; anything outside `[a-z0-9]` becomes `-`.
-pub fn slug(card_ref: &str) -> String {
-    let lowered: String = card_ref
+/// Directory name for a ref or workspace name: readable part plus a stable hash of the
+/// original, so names that normalise alike (`EX-1`, `ex_1`, `EX/1`) never share a directory.
+/// `EX-123` → `ex-123-<8 hex>`; anything outside `[a-z0-9]` becomes `-`.
+pub fn slug(name: &str) -> String {
+    let lowered: String = name
         .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let trimmed = lowered.trim_matches('-');
-    if trimmed.is_empty() {
-        "card".into()
-    } else {
-        trimmed.into()
-    }
+    let readable = if trimmed.is_empty() { "card" } else { trimmed };
+    format!("{readable}-{:08x}", fnv1a(name.as_bytes()) >> 32)
+}
+
+/// 64-bit FNV-1a: tiny, dependency-free and stable across Rust versions (unlike `DefaultHasher`).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -127,9 +133,27 @@ mod tests {
 
     #[test]
     fn slugs() {
-        assert_eq!(slug("EX-123"), "ex-123");
-        assert_eq!(slug("org/repo#7"), "org-repo-7");
-        assert_eq!(slug("--"), "card");
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(
+            fnv1a(b"a"),
+            0xaf63_dc4c_8601_ec8c,
+            "FNV-1a reference vector"
+        );
+        let ex = slug("EX-123");
+        assert!(
+            ex.starts_with("ex-123-") && ex.len() == "ex-123-".len() + 8,
+            "{ex}"
+        );
+        assert_eq!(slug("EX-123"), ex, "stable");
+        assert!(slug("org/repo#7").starts_with("org-repo-7-"));
+        assert!(slug("--").starts_with("card-"));
+    }
+
+    #[test]
+    fn slugs_of_refs_that_normalise_alike_differ() {
+        let names = ["EX-1", "ex-1", "EX_1", "EX/1", "EX 1"];
+        let slugs: std::collections::HashSet<String> = names.iter().map(|n| slug(n)).collect();
+        assert_eq!(slugs.len(), names.len(), "{slugs:?}");
     }
 
     #[tokio::test]
@@ -172,7 +196,7 @@ mod tests {
 
         let first = card_checkout(&ws, "EX-1", &wt).await.unwrap();
         let second = card_checkout(&ws, "EX-2", &wt).await.unwrap();
-        assert_eq!(first, wt.join("example-app/ex-1"));
+        assert_eq!(first, wt.join(slug("Example App")).join(slug("EX-1")));
         assert_ne!(first, second);
         assert!(first.join("README.md").is_file());
         assert_eq!(card_checkout(&ws, "EX-1", &wt).await.unwrap(), first);
