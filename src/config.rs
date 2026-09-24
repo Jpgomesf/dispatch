@@ -292,6 +292,14 @@ match = ["EX-"]
     }
 
     #[test]
+    fn example_config_is_valid() {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/config.example.toml");
+        let config = load_config(&example).unwrap();
+        assert_eq!(config.card.max_parallel, 2);
+        assert_eq!(config.workspaces[0].name, "example-app");
+    }
+
+    #[test]
     fn workspace_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::from_toml(&config_toml(dir.path())).unwrap();
