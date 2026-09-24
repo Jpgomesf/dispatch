@@ -20,7 +20,9 @@ const PAGE_SIZE: u32 = 50;
 const MAX_PAGES: usize = 10;
 
 /// `jql` narrowing must stay inside its parentheses: balanced, never closing below depth 0
-/// outside quotes, and no `ORDER BY`. That is what makes `AND (<jql>)` unable to widen.
+/// outside quotes, no `ORDER BY`, and no `\` outside quotes (a JQL escape there would let a
+/// quote or parenthesis mean something other than what this scanner sees). That is what
+/// makes `AND (<jql>)` unable to widen.
 pub fn validate_narrowing(jql: &str) -> Result<(), String> {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
@@ -39,6 +41,7 @@ pub fn validate_narrowing(jql: &str) -> Result<(), String> {
         }
         match c {
             '"' | '\'' => quote = Some(c),
+            '\\' => return Err("'\\' outside a quoted string is not allowed".into()),
             '(' => depth += 1,
             ')' => {
                 depth = depth
@@ -359,6 +362,8 @@ mod tests {
             "project = EX ORDER BY created",
             "(project = EX",
             "summary ~ \"open",
+            r#"summary ~ \"x) OR (summary ~ "y\"" OR project = OTHER"#,
+            r"summary ~ a\)b",
         ] {
             assert!(validate_narrowing(bad).is_err(), "{bad}");
         }

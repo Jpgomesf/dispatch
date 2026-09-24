@@ -14,7 +14,8 @@ use super::http::{HttpError, client};
 use crate::config::LinearConfig;
 
 pub const SOURCE: &str = "linear";
-/// Pages of 50 per fetch; the cursor catches up over the next polls if there are more.
+/// Pages of 50 per fetch. Linear returns newest first, so more than 500 changes within one
+/// poll interval would skip the oldest (the cursor moves to the newest); not a realistic load.
 const MAX_PAGES: usize = 10;
 
 /// Filter for `issues`: personal scope first, then narrowing. No config value can remove or
