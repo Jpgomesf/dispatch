@@ -33,9 +33,11 @@ match = ["#example-channel", "Example Co"]   # substrings of title/subtitle rout
 
 [intake.linear]
 enabled = false
-api_key_env = "LINEAR_API_KEY"   # personal API key; name of the env var, never the key
+api_key_env = "LINEAR_API_KEY"   # personal API key; name of the variable, never the key
 poll = "60s"
-filter = { team = "EX", labels = ["agent"], assignee = "me" }
+projects = ["Example App"]       # optional narrowing; assignee = me is always enforced
+teams = []
+labels = []
 
 [intake.jira]
 enabled = false
@@ -43,10 +45,32 @@ base_url = "https://example.atlassian.net"
 email_env = "JIRA_EMAIL"
 token_env = "JIRA_API_TOKEN"
 poll = "60s"
-jql = "project = EX AND labels = agent"
+jql = "project = EX"             # optional narrowing; runner always ANDs assignee = currentUser()
 ```
 
-`[heartbeat] interval` default becomes `30m`. Unknown keys are still rejected.
+`[heartbeat]` is renamed `[triage]` (it is now started by events as well as the
+timer); `interval` default becomes `30m` (the fallback sweep). Model/effort
+defaults stay `sonnet` / `medium`. Unknown keys are still rejected.
+
+## Secrets
+
+- File: `~/.config/claude-harness/secrets.env` (`KEY=value` lines, `#` comments),
+  override with `HARNESS_SECRETS`. Outside the repo; never logged or put in a
+  session context.
+- Re-read on every poll, so keys can be added or rotated while the runner runs.
+  A source whose key is missing stays idle with one stdout line (once per state
+  change) and starts by itself when the key appears.
+- Refused (source idle, one line) if the file is group/world readable (not `0600`).
+- A real environment variable of the same name wins over the file.
+- `harness check` reports which sources have their keys, never the values.
+
+## Personal scope (enforced, not configurable)
+
+- Linear: every query includes `assignee: { isMe: { eq: true } }`; `projects`,
+  `teams`, `labels` only narrow further.
+- Jira: the query is always `assignee = currentUser() AND (<jql>)`; `jql` only
+  narrows further.
+- Both authenticate as the key's owner, so "me" is the person whose key it is.
 
 ## Store: `harness.db` (SQLite, machine-wide)
 
@@ -118,6 +142,12 @@ never stops the others.
 
 ## Dispatch
 
+- Slack (via notifications) and other message events are not acted on by the
+  runner: they only start triage. The triage session (`[triage]` model/effort,
+  default sonnet/medium) reads the full thread through the connector, decides
+  relevance, and per event ignores, sends an initial response via `outreach`,
+  drafts, or turns it into a card. Whether an initial response is sent or
+  drafted is decided by Claude Code permissions.
 - First `new` event for a runner opens a batch window; when it closes, all `new`
   events become `batched` and go to one triage session as `events: [...]` in the
   heartbeat context (in addition to cursors, sources, workspaces). On success they
