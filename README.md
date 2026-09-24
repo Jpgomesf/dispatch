@@ -54,9 +54,9 @@ or `plugin_dir` in config). Use it, fork it, or replace it with your own
 skills: the runner only relies on the JSON context it sends and the result
 shapes it reads back (TriageResult, CardResult, DiscussionResult).
 
-Who may be messaged is decided by your Claude Code permission rules and hooks
-(and `outreach.md` with the starter pack), not by dispatch; a denied send
-becomes a draft.
+Who may be messaged is decided by your Claude Code permission rules and hooks,
+not by dispatch. With the starter pack, `outreach.md` narrows it further and a
+denied send becomes a draft.
 
 ## Commands
 
