@@ -76,10 +76,9 @@ Pick one:
 - **Timer calling one tick:** `harness heartbeat --once` from launchd
   (`StartInterval` in a LaunchAgent plist, macOS) or a systemd `.timer` +
   `.service` pair (Linux). The interval in the scheduler replaces
-  `[heartbeat].interval`. A tick lasts until its cards finish, and a starting
-  heartbeat marks cards left `in_progress` as failed, so never let two ticks
-  overlap: launchd and systemd do not start a job that is still running; plain
-  cron does, so avoid it.
+  `[heartbeat].interval`. A tick lasts until its cards finish; a tick that
+  starts while another harness run is still going exits `1` without doing
+  anything (single-instance lock), so overlapping timers only waste a start.
 
 Either way: run as your user (so it sees your Claude, `gh` and connector auth),
 set `PATH` to include `claude`, `gh` and `git`, and send stdout to a file or the

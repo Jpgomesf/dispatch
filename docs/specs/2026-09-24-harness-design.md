@@ -150,7 +150,9 @@ interval while cards run:
 - **Checkouts.** Parallel cards in one workspace must not share a checkout. Every
   card whose workspace is the root of a git checkout runs in its own worktree,
   `git worktree add --detach <state_dir>/worktrees/<workspace>/<ref-slug>`,
-  reused when it exists so a resumed card finds its work; the workflow skill
+  reused when it exists so a resumed card finds its work (each slug carries 8 hex
+  characters of an FNV-1a hash of the original name, so refs that normalise
+  alike never share a directory); the workflow skill
   then branches from the up-to-date default branch as usual. When a card ends
   `done`, the runner runs `git worktree remove` without `--force`, which refuses
   (and keeps the tree) when anything is uncommitted or untracked. A workspace
@@ -164,17 +166,32 @@ interval while cards run:
 
 - **Kill switch** (`harness stop`): checked before every triage and card start
   and polled every 5s while waiting. Once present, nothing new starts and
-  running sessions are terminated gracefully (SIGTERM to the `claude` process);
-  the loop exits when they have ended.
+  running sessions are terminated gracefully (SIGTERM to the session's process
+  group); the loop exits when they have ended.
 - **SIGINT / SIGTERM**: the first signal does the same; the second SIGKILLs
   running sessions; a third exits immediately. Terminated cards are recorded
   `failed`.
+- Each `claude` process leads its own process group, so signals reach the
+  subprocesses it started. Once `claude` exits, its output pipes get 5s to close;
+  then whatever is left in the group is killed, so a stray subprocess never
+  holds a card slot or blocks shutdown.
+
+### Single instance and state
+
+`heartbeat` and `card` take an exclusive, non-blocking lock on
+`<state_dir>/harness.lock` for the life of the process. A second one exits `1`
+with a one-line message, so two processes never run the same card in one
+worktree and a starting heartbeat never releases another process's live cards.
+`check`, `stop` and `resume` do not take the lock.
 
 State (`state.json`): `cursors`, `cards` (`ref → {status, updated_at, pr_url}`,
 status `in_progress|done|blocked|failed`). Every read-modify-write holds an
-exclusive lock on `<state_dir>/state.lock`, since parallel card tasks and other
-`harness` processes share the file; writes are atomic (temp file, fsync,
-rename), so readers need no lock.
+exclusive lock on `<state_dir>/state.lock`, since parallel card tasks share the
+file; writes are atomic (temp file, fsync, rename), so readers need no lock.
+State I/O runs on the blocking thread pool. A card starts only through a
+compare-and-set to `in_progress` inside that lock: a card already
+`in_progress` is skipped. If `state.json` cannot be read, the scheduler prints
+one line and skips scheduling until it can. It never assumes an empty state.
 
 ### Messaging policy lives in Claude Code
 
