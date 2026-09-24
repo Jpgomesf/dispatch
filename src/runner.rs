@@ -1,5 +1,6 @@
-//! Sessions: triage, cards and discussions, each one `claude` process. Scheduling (when they
-//! start, batching of intake events, parallelism) lives in `coordinator`.
+//! Sessions: triage, cards and discussions, each one `claude` process recorded as an attempt.
+//! Scheduling (when they start, batching of intake events, parallelism) lives in
+//! `coordinator`; what follows an attempt is decided by the rules in `outcome`.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -9,24 +10,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, interval_at};
 
-use crate::config::{Config, Effort, UnknownWorkspace, Workspace};
-use crate::intake::secrets::{EnvLookup, Secrets, process_env};
-use crate::intake::{CardScope, Event, IntakeContext, card_scope};
+use crate::config::{Config, Effort};
+use crate::intake::secrets::{EnvLookup, process_env};
+use crate::intake::{Event, IntakeContext};
+use crate::outcome::{Next, Outcome};
 use crate::paths::Paths;
-use crate::prompts::{INTAKE_CURSOR_PREFIX, card_prompt, discussion_prompt, triage_prompt};
-use crate::results::{
-    CardOutcome, CardResult, DiscussionResult, DiscussionToRun, TriageResult, card_schema,
-    discussion_schema, triage_schema,
-};
+use crate::prompts::{Escalation, INTAKE_CURSOR_PREFIX, triage_prompt};
+use crate::results::{TriageResult, triage_schema};
 use crate::session::{
     Control, Ended, Limits, Mode, Notice, Session, SessionReport, SessionRequest, Shutdown,
 };
-use crate::state::{CardState, CardStatus};
+use crate::state::CardStatus;
 use crate::store::{AttemptEnd, CLAIM_LEASE, CLAIM_RENEW, Claim, Store};
-use crate::worktree;
+
+mod cards;
+mod discussions;
+
+pub(crate) use discussions::QueuedDiscussion;
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 pub type Output = Arc<dyn Fn(String) + Send + Sync>;
@@ -74,13 +78,44 @@ fn cost(cost_usd: Option<f64>) -> String {
         .unwrap_or_default()
 }
 
-impl From<CardOutcome> for CardStatus {
-    fn from(outcome: CardOutcome) -> Self {
-        match outcome {
-            CardOutcome::Done => CardStatus::Done,
-            CardOutcome::Blocked => CardStatus::Blocked,
-            CardOutcome::Failed => CardStatus::Failed,
-        }
+pub(crate) fn time(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// What follows an attempt, for its output line.
+fn describe(next: &Result<Next, String>) -> String {
+    match next {
+        Ok(Next::Finished | Next::Blocked) => String::new(),
+        Ok(Next::Retry { at }) => format!("; retry at {}", time(*at)),
+        Ok(Next::NeedsHuman(reason)) => format!("; needs_human ({})", reason.as_str()),
+        Err(error) => format!("; not recorded ({error})"),
+    }
+}
+
+/// How an attempt ended: the agent's result when its structured output parses as `T` (with
+/// the outcome and summary `verdict` reads from it), else the class of the failure.
+fn judge<T: DeserializeOwned>(
+    ended: &Ended,
+    what: &str,
+    verdict: impl Fn(&T) -> (Outcome, String),
+) -> (Outcome, String, Option<T>) {
+    match ended.output() {
+        Ok(output) => match serde_json::from_value::<T>(output) {
+            Ok(result) => {
+                let (outcome, summary) = verdict(&result);
+                (outcome, summary, Some(result))
+            }
+            Err(e) => (
+                Outcome::InvalidOutput,
+                format!("invalid {what} result: {e}"),
+                None,
+            ),
+        },
+        Err(detail) => (
+            Outcome::of_ended(ended).unwrap_or(Outcome::Crash),
+            detail,
+            None,
+        ),
     }
 }
 
@@ -160,9 +195,8 @@ impl<S: Session> Runner<S> {
     }
 
     pub(crate) fn emit(&self, kind: &str, status: &str, detail: &str) {
-        let now = self.now().format("%Y-%m-%dT%H:%M:%SZ");
         (self.out)(
-            format!("{now} {kind} {status} {detail}")
+            format!("{} {kind} {status} {detail}", time(self.now()))
                 .trim_end()
                 .to_string(),
         );
@@ -220,23 +254,49 @@ impl<S: Session> Runner<S> {
     }
 
     /// At startup, under the instance lock (no other live process of this runner): attempts
-    /// left open are closed as `crash`, cards left `in_progress` become `failed` so triage can
-    /// queue them again, this runner's claims are released, and batches a crashed triage held
-    /// go back to `new`.
+    /// left open are closed as `crash`, cards left `in_progress` follow the retry rules for a
+    /// crash, this runner's claims are released, and batches a crashed triage held go back to
+    /// `new`.
     pub async fn recover(&self) {
-        let runner = self.name().to_string();
-        let now = self.now();
+        let (runner, now) = (self.name().to_string(), self.now());
         let recovered = self
             .store
             .call(move |store| {
-                store.close_open_attempts(&runner, "crash", STOPPED_MID_SESSION, now)?;
-                store.fail_in_progress(&runner, now)?;
+                let open = store.open_attempts(&runner)?;
+                store.close_open_attempts(
+                    &runner,
+                    Outcome::Crash.as_str(),
+                    STOPPED_MID_SESSION,
+                    now,
+                )?;
                 store.release_all(&runner)?;
-                store.requeue_batched(&runner)
+                store.requeue_batched(&runner)?;
+                let state = store.load_state(&runner)?;
+                let stranded: Vec<(String, Option<i64>)> = state
+                    .cards
+                    .iter()
+                    .filter(|(_, card)| card.status == CardStatus::InProgress)
+                    .map(|(card_ref, _)| {
+                        let attempt = open
+                            .iter()
+                            .rfind(|a| a.mode == Mode::Card.as_str() && &a.reference == card_ref);
+                        (card_ref.clone(), attempt.map(|a| a.id))
+                    })
+                    .collect();
+                Ok(stranded)
             })
             .await;
-        if let Err(error) = recovered {
-            self.emit("triage", "failed", &format!("store: {error}"));
+        match recovered {
+            Err(error) => self.emit("triage", "failed", &format!("store: {error}")),
+            Ok(stranded) => {
+                for (card_ref, attempt) in stranded {
+                    let next = self
+                        .settle_card(&card_ref, attempt, Outcome::Crash, None)
+                        .await;
+                    let detail = format!("{card_ref} — {STOPPED_MID_SESSION}{}", describe(&next));
+                    self.emit("card", Outcome::Crash.as_str(), &detail);
+                }
+            }
         }
     }
 
@@ -298,13 +358,13 @@ impl<S: Session> Runner<S> {
     async fn end_attempt(
         &self,
         id: i64,
-        outcome: &str,
+        outcome: Outcome,
         report: &SessionReport,
         summary: &str,
         blocked_on: Option<String>,
     ) {
         let end = AttemptEnd {
-            outcome: outcome.to_string(),
+            outcome: outcome.as_str().to_string(),
             summary: one_line(summary),
             blocked_on,
             session_id: report.session_id.clone(),
@@ -358,258 +418,9 @@ impl<S: Session> Runner<S> {
         Ok(output)
     }
 
-    pub fn resolve_workspace(
-        &self,
-        card_ref: &str,
-        name: Option<&str>,
-    ) -> Result<Option<Workspace>, UnknownWorkspace> {
-        match name {
-            Some(name) => self.config.workspace_named(name).map(|w| Some(w.clone())),
-            None => Ok(self.config.workspace_for(card_ref).cloned()),
-        }
-    }
-
-    pub async fn run_card(
-        &self,
-        card_ref: &str,
-        workspace_name: Option<&str>,
-    ) -> Result<Option<CardResult>, UnknownWorkspace> {
-        let workspace = self.resolve_workspace(card_ref, workspace_name)?;
-        Ok(self.run_card_in(card_ref, workspace, &[]).await)
-    }
-
-    /// Personal scope, then the `card:<ref>` claim, then the session.
-    pub(crate) async fn run_card_in(
-        &self,
-        card_ref: &str,
-        workspace: Option<Workspace>,
-        blocked_by: &[String],
-    ) -> Option<CardResult> {
-        let secrets = Secrets::load(&self.paths.secrets, self.env.clone());
-        if let CardScope::Refused(reason) = card_scope(&self.config, &secrets, card_ref).await {
-            self.emit(
-                "card",
-                "refused",
-                &format!("{card_ref} — {}", one_line(&reason)),
-            );
-            return None;
-        }
-        let key = format!("card:{card_ref}");
-        match self
-            .claimed(&key, self.claimed_card(card_ref, workspace, blocked_by))
-            .await
-        {
-            Ok(result) => result,
-            Err(reason) => {
-                self.emit("card", "skipped", &format!("{card_ref} — {reason}"));
-                None
-            }
-        }
-    }
-
-    async fn claimed_card(
-        &self,
-        card_ref: &str,
-        workspace: Option<Workspace>,
-        blocked_by: &[String],
-    ) -> Option<CardResult> {
-        let started = self
-            .record_card(card_ref, CardStatus::InProgress, None, blocked_by)
-            .await;
-        let worked = match started {
-            Ok(()) => self.work_card(card_ref, workspace.as_ref()).await,
-            Err(error) => Err(error),
-        };
-        match worked {
-            Err(error) => {
-                let _ = self
-                    .record_card(card_ref, CardStatus::Failed, None, blocked_by)
-                    .await;
-                self.emit(
-                    "card",
-                    "failed",
-                    &format!("{card_ref} — {}", one_line(&error)),
-                );
-                None
-            }
-            Ok((result, cost_usd, checkout)) => {
-                let status = result.status.into();
-                let pr_url = result.pr_url.clone();
-                if let Err(error) = self.record_card(card_ref, status, pr_url, blocked_by).await {
-                    self.emit("card", "failed", &format!("{card_ref} — {error}"));
-                    return None;
-                }
-                let detail = format!("{card_ref}{} — {}", cost(cost_usd), result.summary);
-                self.emit("card", result.status.as_str(), &detail);
-                if let (CardOutcome::Done, Some(workspace)) = (result.status, &workspace) {
-                    // Best effort: a dirty worktree is kept for a person to look at.
-                    let _ = worktree::release_checkout(workspace, &checkout).await;
-                }
-                Some(result)
-            }
-        }
-    }
-
-    async fn record_card(
-        &self,
-        card_ref: &str,
-        status: CardStatus,
-        pr_url: Option<String>,
-        blocked_by: &[String],
-    ) -> Result<(), String> {
-        let card = CardState {
-            status,
-            updated_at: self.now(),
-            pr_url,
-        };
-        let (runner, card_ref, blocked_by) = (
-            self.name().to_string(),
-            card_ref.to_string(),
-            blocked_by.to_vec(),
-        );
-        self.store
-            .call(move |s| s.set_card(&runner, &card_ref, &card, &blocked_by))
-            .await
-            .map_err(|e| format!("store: {e}"))
-    }
-
-    async fn work_card(
-        &self,
-        card_ref: &str,
-        workspace: Option<&Workspace>,
-    ) -> Result<(CardResult, Option<f64>, PathBuf), String> {
-        let checkout = match workspace {
-            Some(w) => worktree::card_checkout(w, card_ref, &self.paths.worktrees_dir()).await?,
-            None => self.state_dir(),
-        };
-        let prompt = card_prompt(
-            card_ref,
-            workspace.map(|w| (w, checkout.as_path())),
-            &self.config,
-            &self.paths,
-            self.now(),
-        );
-        let card = &self.config.card;
-        let request = self.request(
-            Mode::Card,
-            prompt,
-            (&card.model, card.effort, card.max_budget_usd),
-            checkout.clone(),
-            card_schema(),
-        );
-        let (id, _) = self.begin_attempt(Mode::Card, card_ref, &checkout).await?;
-        let report = self.run_session(request, id).await;
-        let parsed = report.ended.output().and_then(|output| {
-            serde_json::from_value::<CardResult>(output)
-                .map_err(|e| format!("invalid card result: {e}"))
-        });
-        match &parsed {
-            Ok(result) => {
-                let blocked_on = result.blocked_on.clone();
-                self.end_attempt(
-                    id,
-                    result.status.as_str(),
-                    &report,
-                    &result.summary,
-                    blocked_on,
-                )
-                .await;
-            }
-            Err(error) => self.end_attempt(id, "failed", &report, error, None).await,
-        }
-        Ok((parsed?, report.cost_usd, checkout))
-    }
-
-    /// The workspace a discussion runs in: `match` against its ref, then its thread.
-    fn discussion_workspace(&self, discussion: &DiscussionToRun) -> Option<Workspace> {
-        self.config
-            .workspace_for(&discussion.discussion_ref)
-            .or_else(|| self.config.workspace_for(&discussion.thread))
-            .cloned()
-    }
-
-    /// A discussion session: no assignee check (talking is never gated), claimed by
-    /// `discussion:<thread>`, in a detached worktree removed afterwards when clean.
-    pub async fn run_discussion(&self, discussion: DiscussionToRun) -> Option<DiscussionResult> {
-        let key = discussion.claim_key();
-        let label = discussion.discussion_ref.clone();
-        match self
-            .claimed(&key, self.work_discussion(&key, discussion))
-            .await
-        {
-            Ok(Ok((result, cost_usd))) => {
-                let detail = format!("{label}{} — {}", cost(cost_usd), result.summary);
-                self.emit("discussion", result.status.as_str(), &detail);
-                Some(result)
-            }
-            Ok(Err(error)) => {
-                self.emit(
-                    "discussion",
-                    "failed",
-                    &format!("{label} — {}", one_line(&error)),
-                );
-                None
-            }
-            Err(reason) => {
-                self.emit("discussion", "skipped", &format!("{label} — {reason}"));
-                None
-            }
-        }
-    }
-
-    async fn work_discussion(
-        &self,
-        key: &str,
-        discussion: DiscussionToRun,
-    ) -> Result<(DiscussionResult, Option<f64>), String> {
-        let workspace = self.discussion_workspace(&discussion);
-        let checkout = match &workspace {
-            Some(w) => worktree::card_checkout(w, key, &self.paths.worktrees_dir()).await?,
-            None => self.state_dir(),
-        };
-        let prompt = discussion_prompt(
-            &discussion,
-            workspace.as_ref().map(|w| (w, checkout.as_path())),
-            &self.config,
-            &self.paths,
-            self.now(),
-        );
-        let card = &self.config.card;
-        let request = self.request(
-            Mode::Discussion,
-            prompt,
-            (&card.model, card.effort, card.max_budget_usd),
-            checkout.clone(),
-            discussion_schema(),
-        );
-        let attempt = self
-            .begin_attempt(Mode::Discussion, &discussion.discussion_ref, &checkout)
-            .await;
-        let report = match &attempt {
-            Ok((id, _)) => self.run_session(request, *id).await,
-            Err(error) => SessionReport::ended(Ended::Crash(error.clone())),
-        };
-        if let Some(workspace) = &workspace {
-            // Discussions never commit; a dirty tree is kept for a person to look at.
-            let _ = worktree::release_checkout(workspace, &checkout).await;
-        }
-        let (id, _) = attempt?;
-        let parsed = report.ended.output().and_then(|output| {
-            serde_json::from_value::<DiscussionResult>(output)
-                .map_err(|e| format!("invalid discussion result: {e}"))
-        });
-        match &parsed {
-            Ok(result) => {
-                self.end_attempt(id, result.status.as_str(), &report, &result.summary, None)
-                    .await;
-            }
-            Err(error) => self.end_attempt(id, "failed", &report, error, None).await,
-        }
-        Ok((parsed?, report.cost_usd))
-    }
-
     /// One triage session over `events` (empty: a fallback sweep). Cursors are persisted as
-    /// soon as it returns.
+    /// soon as it returns. A failed triage is not retried here: its events go back to `new`
+    /// and the coordinator backs off.
     pub async fn triage(&self, events: Vec<Event>) -> Option<TriageResult> {
         match self.try_triage(&events).await {
             Ok((result, cost_usd)) => {
@@ -622,28 +433,52 @@ impl<S: Session> Runner<S> {
                     cost(cost_usd),
                     result.summary
                 );
-                self.emit("triage", "ok", &detail);
+                self.emit("triage", Outcome::Ok.as_str(), &detail);
                 Some(result)
             }
-            Err(error) => {
-                self.emit("triage", "failed", &one_line(&error));
+            Err((outcome, detail)) => {
+                self.emit("triage", outcome.as_str(), &one_line(&detail));
                 None
             }
         }
     }
 
-    async fn try_triage(&self, events: &[Event]) -> Result<(TriageResult, Option<f64>), String> {
+    /// Cards waiting for a person, with the last attempt's summary.
+    fn escalations(store: &Store, runner: &str) -> crate::store::Result<Vec<Escalation>> {
+        let state = store.load_state(runner)?;
+        let mut escalations = Vec::new();
+        for (card_ref, card) in &state.cards {
+            if card.status != CardStatus::NeedsHuman {
+                continue;
+            }
+            let last = store.attempts(runner, Some(card_ref), 1)?;
+            escalations.push(Escalation {
+                card_ref: card_ref.clone(),
+                reason: card.reason.clone().unwrap_or_default(),
+                attempts: card.attempts,
+                last_summary: last.into_iter().next().and_then(|a| a.summary),
+            });
+        }
+        Ok(escalations)
+    }
+
+    async fn try_triage(
+        &self,
+        events: &[Event],
+    ) -> Result<(TriageResult, Option<f64>), (Outcome, String)> {
+        let store_failed = |e: crate::store::StoreError| (Outcome::Crash, format!("store: {e}"));
         let runner = self.name().to_string();
-        let state = self
+        let (state, escalations) = self
             .store
-            .call(move |s| s.load_state(&runner))
+            .call(move |s| Ok((s.load_state(&runner)?, Self::escalations(s, &runner)?)))
             .await
-            .map_err(|e| format!("store: {e}"))?;
+            .map_err(store_failed)?;
         let prompt = triage_prompt(
             &self.config,
             &self.paths,
             &state.cursors,
             events,
+            &escalations,
             self.now(),
         );
         let triage = &self.config.triage;
@@ -655,20 +490,16 @@ impl<S: Session> Runner<S> {
             cwd.clone(),
             triage_schema(),
         );
-        let (id, _) = self.begin_attempt(Mode::Triage, "", &cwd).await?;
+        let (id, _) = self
+            .begin_attempt(Mode::Triage, "", &cwd)
+            .await
+            .map_err(|e| (Outcome::Crash, e))?;
         let report = self.run_session(request, id).await;
-        let parsed = report.ended.output().and_then(|output| {
-            serde_json::from_value::<TriageResult>(output)
-                .map_err(|e| format!("invalid triage result: {e}"))
+        let (outcome, summary, result) = judge(&report.ended, "triage", |r: &TriageResult| {
+            (Outcome::Ok, r.summary.clone())
         });
-        match &parsed {
-            Ok(result) => {
-                self.end_attempt(id, "ok", &report, &result.summary, None)
-                    .await
-            }
-            Err(error) => self.end_attempt(id, "failed", &report, error, None).await,
-        }
-        let result = parsed?;
+        self.end_attempt(id, outcome, &report, &summary, None).await;
+        let result = result.ok_or((outcome, summary))?;
         // The pollers' own cursors are never the skill's to change.
         let cursors: BTreeMap<String, String> = result
             .cursors

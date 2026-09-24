@@ -1,6 +1,8 @@
 //! The coordinator loop: starts triage (on a batch of intake events, or as the fallback
 //! sweep) and card / discussion sessions as separate tokio tasks, so triage keeps its
-//! cadence while sessions run. Intake sources run beside it as their own tasks.
+//! cadence while sessions run. Intake sources run beside it as their own tasks. Cards whose
+//! retry is due are queued by the runner itself; triage never restarts a card that awaits a
+//! retry or needs a person.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -8,10 +10,9 @@ use std::time::Duration;
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, sleep_until};
 
-use crate::intake;
-use crate::results::TriageResult;
-use crate::results::{CardToWork, DiscussionToRun};
-use crate::runner::{Runner, one_line};
+use crate::intake::{self, Event};
+use crate::results::{CardToWork, DiscussionToRun, TriageResult};
+use crate::runner::{QueuedDiscussion, Runner, one_line};
 use crate::session::Session;
 use crate::state::{CardStatus, State};
 
@@ -42,6 +43,17 @@ pub fn is_ready(card: &CardToWork, state: &State, batch: &HashSet<String>) -> bo
         })
 }
 
+/// `text` mentions `card_ref` as a whole token: `EX-1` is not in `EX-12` or `PREX-1`.
+#[must_use]
+pub fn mentions_ref(text: &str, card_ref: &str) -> bool {
+    !card_ref.is_empty()
+        && text.match_indices(card_ref).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + card_ref.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+}
+
 async fn wait_triage<T>(handle: &mut Option<JoinHandle<T>>) -> Result<T, JoinError> {
     match handle {
         Some(handle) => handle.await,
@@ -49,10 +61,18 @@ async fn wait_triage<T>(handle: &mut Option<JoinHandle<T>>) -> Result<T, JoinErr
     }
 }
 
+/// What a finished session task hands back.
+enum Finished {
+    Card,
+    /// A discussion to queue again, when the retry rules say so.
+    Discussion(Option<QueuedDiscussion>),
+}
+
 enum Wake {
     /// `None`: the triage failed or its task panicked.
     Triaged(Option<TriageResult>),
-    SessionDone(Id),
+    /// `None` when the task panicked.
+    SessionDone(Id, Option<Finished>),
     Tick,
 }
 
@@ -89,8 +109,8 @@ impl Batching {
 
 struct Loop {
     queue: Vec<CardToWork>,
-    discussions: VecDeque<DiscussionToRun>,
-    sessions: JoinSet<()>,
+    discussions: VecDeque<QueuedDiscussion>,
+    sessions: JoinSet<Finished>,
     running: HashMap<Id, Slot>,
     triage: Option<JoinHandle<Option<TriageResult>>>,
     /// Event ids handed to the running triage; finished from here whatever the task returns.
@@ -103,6 +123,18 @@ struct Loop {
     next_sweep: Instant,
     batching: Batching,
     state_error: Option<String>,
+}
+
+impl Loop {
+    fn running_cards(&self) -> HashSet<String> {
+        self.running
+            .values()
+            .filter_map(|slot| match slot {
+                Slot::Card(card_ref) => Some(card_ref.clone()),
+                Slot::Discussion(_) => None,
+            })
+            .collect()
+    }
 }
 
 impl<S: Session> Runner<S> {
@@ -143,8 +175,9 @@ impl<S: Session> Runner<S> {
     }
 
     /// Triage replaces the queue with its latest list: cards it no longer lists are dropped,
-    /// cards already queued keep their place (with fresh `blocked_by`), running or
-    /// `in_progress` cards are skipped, and at most `max_cards_per_tick` new cards join.
+    /// cards already queued keep their place (with fresh `blocked_by`), running,
+    /// `in_progress`, `needs_human` and retry-pending cards are skipped, and at most
+    /// `max_cards_per_tick` new cards join.
     fn merge_queue(
         &self,
         queue: &mut Vec<CardToWork>,
@@ -153,6 +186,7 @@ impl<S: Session> Runner<S> {
         state: &State,
     ) {
         let limit = self.config.triage.max_cards_per_tick as usize;
+        let now = self.now();
         let mut seen = HashSet::new();
         let mut added = 0;
         let mut next = Vec::new();
@@ -161,6 +195,7 @@ impl<S: Session> Runner<S> {
             if !seen.insert(card_ref.clone())
                 || running.contains(&card_ref)
                 || state.in_progress(&card_ref)
+                || state.held_back(&card_ref, now)
             {
                 continue;
             }
@@ -174,52 +209,64 @@ impl<S: Session> Runner<S> {
         *queue = next;
     }
 
+    /// Cards whose retry is due join the queue with the `blocked_by` they last started with;
+    /// they do not count against `max_cards_per_tick`.
+    fn queue_due_retries(&self, work: &mut Loop, state: &State) {
+        let now = self.now();
+        let running = work.running_cards();
+        for (card_ref, card) in &state.cards {
+            let known =
+                running.contains(card_ref) || work.queue.iter().any(|q| &q.card_ref == card_ref);
+            if card.retry_due(now) && !known {
+                work.queue.push(CardToWork {
+                    card_ref: card_ref.clone(),
+                    blocked_by: card.blocked_by.clone(),
+                });
+            }
+        }
+    }
+
     /// Discussions are one-off requests: appended (deduplicated by claim key), never replaced.
     fn merge_discussions(
-        discussions: &mut VecDeque<DiscussionToRun>,
+        discussions: &mut VecDeque<QueuedDiscussion>,
         listed: Vec<DiscussionToRun>,
         running: &HashMap<Id, Slot>,
     ) {
         for discussion in listed {
             let key = discussion.claim_key();
-            let known = discussions.iter().any(|d| d.claim_key() == key)
+            let known = discussions.iter().any(|d| d.discussion.claim_key() == key)
                 || running
                     .values()
                     .any(|slot| matches!(slot, Slot::Discussion(k) if *k == key));
             if !known {
-                discussions.push_back(discussion);
+                discussions.push_back(QueuedDiscussion::new(discussion));
             }
         }
-    }
-
-    fn has_free_slot(&self, work: &Loop) -> bool {
-        (!work.queue.is_empty() || !work.discussions.is_empty())
-            && work.running.len() < self.config.card.max_parallel as usize
-            && !self.should_stop()
     }
 
     /// Discussions first (someone is waiting for an answer), then ready cards.
     fn start_ready(&self, work: &mut Loop, state: &State) {
         let max_parallel = self.config.card.max_parallel as usize;
+        let now = self.now();
         while work.running.len() < max_parallel {
-            let Some(discussion) = work.discussions.pop_front() else {
+            let Some(index) = work.discussions.iter().position(|d| d.ready(now)) else {
                 break;
             };
-            let key = discussion.claim_key();
+            let Some(queued) = work.discussions.remove(index) else {
+                break;
+            };
+            let key = queued.discussion.claim_key();
             let me = self.clone();
-            let handle = work.sessions.spawn(async move {
-                me.run_discussion(discussion).await;
-            });
+            let handle = work
+                .sessions
+                .spawn(async move { Finished::Discussion(me.attempt_discussion(queued).await.1) });
             work.running.insert(handle.id(), Slot::Discussion(key));
         }
         let batch: HashSet<String> = work
             .queue
             .iter()
             .map(|c| c.card_ref.clone())
-            .chain(work.running.values().filter_map(|slot| match slot {
-                Slot::Card(card_ref) => Some(card_ref.clone()),
-                Slot::Discussion(_) => None,
-            }))
+            .chain(work.running_cards())
             .chain(work.started_cards.iter().cloned())
             .collect();
         let mut index = 0;
@@ -236,8 +283,54 @@ impl<S: Session> Runner<S> {
             let handle = work.sessions.spawn(async move {
                 me.run_card_in(&card.card_ref, workspace, &card.blocked_by)
                     .await;
+                Finished::Card
             });
             work.running.insert(handle.id(), Slot::Card(card_ref));
+        }
+    }
+
+    /// A new event that mentions a `needs_human` card is the external change it waited for:
+    /// its attempt count starts over and triage may list it again.
+    async fn reopen_mentioned(&self, events: &[Event]) {
+        let texts: Vec<String> = events
+            .iter()
+            .map(|event| {
+                format!(
+                    "{} {}",
+                    event.sender.as_deref().unwrap_or(""),
+                    event.payload
+                )
+            })
+            .collect();
+        let (runner, now) = (self.name().to_string(), self.now());
+        let reopened = self
+            .store()
+            .call(move |s| {
+                let state = s.load_state(&runner)?;
+                let mut reopened = Vec::new();
+                for (card_ref, card) in &state.cards {
+                    let mentioned = texts.iter().any(|text| mentions_ref(text, card_ref));
+                    if card.status == CardStatus::NeedsHuman
+                        && mentioned
+                        && s.reset_card(&runner, card_ref, true, now)?
+                    {
+                        reopened.push(card_ref.clone());
+                    }
+                }
+                Ok(reopened)
+            })
+            .await;
+        match reopened {
+            Ok(refs) => {
+                for card_ref in refs {
+                    self.emit(
+                        "card",
+                        "reopened",
+                        &format!("{card_ref} — a new event mentions it"),
+                    );
+                }
+            }
+            Err(error) => self.emit("triage", "failed", &one_line(&format!("store: {error}"))),
         }
     }
 
@@ -265,6 +358,9 @@ impl<S: Session> Runner<S> {
         };
         if events.is_empty() && !sweep_due {
             return;
+        }
+        if !events.is_empty() {
+            self.reopen_mentioned(&events).await;
         }
         work.in_flight = events.iter().map(|e| e.id).collect();
         let me = self.clone();
@@ -313,14 +409,7 @@ impl<S: Session> Runner<S> {
         if let Some(result) = result
             && let Some(state) = self.load_for_scheduling(&mut work.state_error).await
         {
-            let busy: HashSet<String> = work
-                .running
-                .values()
-                .filter_map(|slot| match slot {
-                    Slot::Card(card_ref) => Some(card_ref.clone()),
-                    Slot::Discussion(_) => None,
-                })
-                .collect();
+            let busy = work.running_cards();
             self.merge_queue(&mut work.queue, result.cards_to_work, &busy, &state);
             Self::merge_discussions(
                 &mut work.discussions,
@@ -331,9 +420,9 @@ impl<S: Session> Runner<S> {
     }
 
     /// The coordinator loop. `once`: one triage (over pending events, else a sweep), then
-    /// its cards and discussions (respecting `blocked_by` and `max_parallel`), and return;
-    /// cards whose blockers never finish are left for the next run. Intake sources only run
-    /// in the long-lived loop.
+    /// its cards and discussions, and any retry already due (respecting `blocked_by` and
+    /// `max_parallel`), and return; cards whose blockers never finish, and retries not yet
+    /// due, are left for the next run. Intake sources only run in the long-lived loop.
     pub async fn schedule(&self, interval: Duration, once: bool) {
         let mut work = Loop {
             queue: Vec::new(),
@@ -356,6 +445,7 @@ impl<S: Session> Runner<S> {
         };
         let mut shutdown = self.subscribe_shutdown();
         let wake = self.wake.clone();
+        let max_parallel = self.config.card.max_parallel as usize;
 
         loop {
             if self.should_stop() {
@@ -370,11 +460,12 @@ impl<S: Session> Runner<S> {
             if work.triage.is_none() && triage_allowed {
                 self.start_triage(&mut work, once).await;
             }
-            if self.has_free_slot(&work) {
-                // An unreadable store skips this tick's scheduling; never an empty state.
-                if let Some(state) = self.load_for_scheduling(&mut work.state_error).await {
-                    self.start_ready(&mut work, &state);
-                }
+            // An unreadable store skips this tick's scheduling; never an empty state.
+            if work.running.len() < max_parallel
+                && let Some(state) = self.load_for_scheduling(&mut work.state_error).await
+            {
+                self.queue_due_retries(&mut work, &state);
+                self.start_ready(&mut work, &state);
             }
             if once && work.triaged && work.triage.is_none() && work.sessions.is_empty() {
                 break;
@@ -384,10 +475,10 @@ impl<S: Session> Runner<S> {
             let event = tokio::select! {
                 joined = wait_triage(&mut work.triage) => Wake::Triaged(joined.ok().flatten()),
                 Some(done) = work.sessions.join_next_with_id(), if !work.sessions.is_empty() => {
-                    Wake::SessionDone(match done {
-                        Ok((id, ())) => id,
-                        Err(error) => error.id(),
-                    })
+                    match done {
+                        Ok((id, finished)) => Wake::SessionDone(id, Some(finished)),
+                        Err(error) => Wake::SessionDone(error.id(), None),
+                    }
                 }
                 () = sleep_until(work.next_sweep), if triage_idle => Wake::Tick,
                 () = sleep_until(window.unwrap_or_else(Instant::now)), if triage_idle && window.is_some() => Wake::Tick,
@@ -397,8 +488,11 @@ impl<S: Session> Runner<S> {
             };
             match event {
                 Wake::Triaged(result) => self.finish_triage(&mut work, result, interval).await,
-                Wake::SessionDone(id) => {
+                Wake::SessionDone(id, finished) => {
                     work.running.remove(&id);
+                    if let Some(Finished::Discussion(Some(retry))) = finished {
+                        work.discussions.push_back(retry);
+                    }
                 }
                 Wake::Tick => {}
             }

@@ -41,8 +41,11 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (runner, key)
     );
     ",
-    // 2: one row per session attempt (triage, card, discussion).
+    // 2: one row per session attempt (triage, card, discussion); card retries.
     "
+    ALTER TABLE cards ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE cards ADD COLUMN retry_at TEXT;
+    ALTER TABLE cards ADD COLUMN reason TEXT;
     CREATE TABLE attempts (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         runner     TEXT NOT NULL,

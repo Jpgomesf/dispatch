@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Row, params};
 
 use super::{Result, Store, iso, parse_time};
+use crate::outcome::{Outcome, Prior};
 
 /// A recorded session attempt.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +148,35 @@ impl Store {
         })
     }
 
+    /// The counted card attempts of the current run (the last `run` counted ones before
+    /// attempt `before`, when given), newest first: what the retry rules look back on.
+    pub fn card_chain(
+        &self,
+        runner: &str,
+        card_ref: &str,
+        before: Option<i64>,
+        run: u32,
+    ) -> Result<Vec<Prior>> {
+        let outcomes: Vec<String> = self.read(|c| {
+            let mut statement = c.prepare(
+                "SELECT outcome FROM attempts
+                 WHERE runner = ?1 AND mode = 'card' AND ref = ?2 AND outcome IS NOT NULL
+                     AND (?3 IS NULL OR id < ?3)
+                 ORDER BY id DESC",
+            )?;
+            statement
+                .query_map(params![runner, card_ref, before], |row| row.get(0))?
+                .collect()
+        })?;
+        Ok(outcomes
+            .iter()
+            .filter_map(|text| Outcome::parse(text))
+            .filter(|outcome| outcome.counts())
+            .map(|outcome| Prior { outcome })
+            .take(usize::try_from(run).unwrap_or(usize::MAX))
+            .collect())
+    }
+
     /// This runner's attempts that have not ended, oldest first.
     pub fn open_attempts(&self, runner: &str) -> Result<Vec<Attempt>> {
         self.read(|c| {
@@ -235,6 +265,47 @@ mod tests {
         assert_eq!(ex1[0].mode, "discussion", "newest first");
         assert_eq!(store.attempts("alpha", None, 2).unwrap().len(), 2);
         assert_eq!(store.attempts("alpha", None, -1).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn the_chain_is_the_counted_attempts_of_the_current_run() {
+        let (_dir, store) = temp_store();
+        let cwd = Path::new("/tmp/example");
+        let mut ids = Vec::new();
+        for outcome in ["done", "timeout", "interrupted", "failed", "crash"] {
+            let (id, _) = store
+                .begin_attempt("alpha", "card", "EX-1", cwd, now())
+                .unwrap();
+            store.end_attempt(id, &end(outcome)).unwrap();
+            ids.push(id);
+        }
+        store
+            .begin_attempt("alpha", "discussion", "EX-1", cwd, now())
+            .unwrap();
+        let outcomes =
+            |chain: Vec<Prior>| -> Vec<Outcome> { chain.into_iter().map(|p| p.outcome).collect() };
+        assert_eq!(
+            outcomes(store.card_chain("alpha", "EX-1", None, 3).unwrap()),
+            [Outcome::Crash, Outcome::Failed, Outcome::Timeout],
+            "interruptions are not counted; the run is three long"
+        );
+        assert_eq!(
+            outcomes(store.card_chain("alpha", "EX-1", Some(ids[4]), 1).unwrap()),
+            [Outcome::Failed],
+            "before the current attempt"
+        );
+        assert!(
+            store
+                .card_chain("alpha", "EX-1", None, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .card_chain("beta", "EX-1", None, 3)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

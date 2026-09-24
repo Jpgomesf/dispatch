@@ -6,6 +6,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 use crate::intake::secrets::tests::write_secrets;
+use crate::results::{CardOutcome, DiscussionToRun};
 use crate::testing::*;
 
 const MINUTE: Duration = Duration::from_secs(60);
@@ -75,17 +76,12 @@ async fn a_crashed_runners_lease_expires() {
     assert!(lines[1].contains("card done EX-1"), "{lines:?}");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn recover_resets_what_a_crash_left_behind() {
     let env = test_env();
     let (runner, _) = make_runner(&env, FakeSession::sequence(vec![]));
     let store = env.store();
-    let card = CardState {
-        status: CardStatus::InProgress,
-        updated_at: now(),
-        pr_url: None,
-    };
-    store.set_card("example-app", "EX-1", &card, &[]).unwrap();
+    store.start_card("example-app", "EX-1", &[], now()).unwrap();
     store
         .claim("card:EX-1", "example-app", now(), CLAIM_LEASE)
         .unwrap();
@@ -107,7 +103,14 @@ async fn recover_resets_what_a_crash_left_behind() {
     runner.recover().await;
 
     let state = store.load_state("example-app").unwrap();
-    assert_eq!(state.status("EX-1"), Some(CardStatus::Failed));
+    let card = &state.cards["EX-1"];
+    assert_eq!(card.status, CardStatus::Failed);
+    assert_eq!(card.attempts, 1, "a crash counts");
+    assert_eq!(
+        card.retry_at,
+        Some(now() + chrono::TimeDelta::minutes(1)),
+        "retried after the first backoff"
+    );
     assert_eq!(store.holder("card:EX-1", now()).unwrap(), None);
     assert_eq!(
         store.holder("card:EX-2", now()).unwrap().as_deref(),
@@ -240,7 +243,10 @@ async fn invalid_discussion_result_is_a_failure() {
     let session = FakeSession::sequence(vec![ok(json!({"ref": "EX-9", "status": "done"}))]);
     let (runner, lines) = make_runner(&env, session);
     assert!(runner.run_discussion(discussion("t")).await.is_none());
-    assert!(lines_of(&lines)[0].contains("discussion failed EX-9 — invalid discussion result"));
+    assert!(
+        lines_of(&lines)[0]
+            .contains("discussion invalid_output EX-9 cost=$0.05 — invalid discussion result")
+    );
 }
 
 #[tokio::test]
@@ -280,7 +286,7 @@ async fn every_session_is_recorded_as_an_attempt() {
             "triage  #1 ok session-1",
             "card EX-1 #1 blocked session-2",
             "discussion EX-9 #1 replied session-3",
-            "card EX-1 #2 failed session-4",
+            "card EX-1 #2 api_error session-4",
         ]
     );
     assert_eq!(attempts[1].cost_usd, Some(0.05));

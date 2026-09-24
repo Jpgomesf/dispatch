@@ -89,6 +89,8 @@ pub struct CardConfig {
     /// Wall-clock limit of one card attempt.
     #[serde(deserialize_with = "duration_from_str")]
     pub timeout: Duration,
+    /// Counted attempts per card (and per discussion) before it needs a person.
+    pub max_attempts: u32,
     /// `{ref}` is replaced by the card ref.
     pub objective: String,
 }
@@ -101,6 +103,7 @@ impl Default for CardConfig {
             max_budget_usd: 20.0,
             max_parallel: 2,
             timeout: Duration::from_secs(3 * 60 * 60),
+            max_attempts: 3,
             objective: CARD_OBJECTIVE.into(),
         }
     }
@@ -234,6 +237,9 @@ impl Config {
         }
         if self.card.max_parallel == 0 {
             return Err("card.max_parallel must be >= 1".into());
+        }
+        if self.card.max_attempts == 0 {
+            return Err("card.max_attempts must be >= 1".into());
         }
         for (key, objective) in [
             ("triage.objective", &self.triage.objective),
@@ -373,6 +379,7 @@ match = ["EX-"]
         assert_eq!(config.card.timeout, minutes(180));
         assert_eq!(config.discussion.timeout, minutes(60));
         assert_eq!(config.sessions.idle_timeout, minutes(15));
+        assert_eq!(config.card.max_attempts, 3);
         assert_eq!(
             config.state_dir,
             expand_user(Path::new("~/.local/state/dispatch"))
@@ -432,6 +439,7 @@ match = ["EX-"]
             "[card]\ntimeout = \"0s\"",
             "[sessions]\nidle_timeout = \"-1m\"",
             "[sessions]\nunknown = 1",
+            "[card]\nmax_attempts = 0",
         ] {
             let raw = format!("name = \"example-app\"\n{body}");
             assert!(Config::from_toml(&raw).is_err(), "{raw}");

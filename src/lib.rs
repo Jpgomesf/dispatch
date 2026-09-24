@@ -6,6 +6,7 @@ pub mod config;
 pub mod coordinator;
 pub mod durations;
 pub mod intake;
+pub mod outcome;
 pub mod paths;
 pub mod prompts;
 pub mod report;

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 
+use crate::state::CardStatus;
 use crate::store::{Attempt, Result, Store};
 
 /// Attempts `dispatch history` shows when no ref is given.
@@ -76,14 +77,24 @@ pub fn status_lines(
     };
     lines.push(format!("cards:        {summary}"));
     for (card_ref, card) in &state.cards {
-        if card.status == crate::state::CardStatus::Done {
+        if card.status == CardStatus::Done {
             continue;
         }
-        lines.push(format!(
+        let mut line = format!(
             "  {card_ref} {} since {}",
             card.status.as_str(),
             time(card.updated_at)
-        ));
+        );
+        if card.attempts > 0 {
+            line.push_str(&format!(", {} attempt(s) in this run", card.attempts));
+        }
+        if let Some(at) = card.retry_at {
+            line.push_str(&format!(", retry at {}", time(at)));
+        }
+        if let Some(reason) = &card.reason {
+            line.push_str(&format!(", reason {reason}"));
+        }
+        lines.push(line);
     }
 
     let claims = store.claims_held(runner, now)?;
@@ -173,17 +184,21 @@ mod tests {
         store
             .begin_attempt("other-app", "card", "EX-9", cwd, now())
             .unwrap();
-        let card = |status| CardState {
-            status,
-            updated_at: now(),
-            pr_url: None,
-        };
+        let card = |status| CardState::new(status, now());
         store
-            .set_card("example-app", "EX-1", &card(CardStatus::InProgress), &[])
+            .set_card("example-app", "EX-1", &card(CardStatus::InProgress))
             .unwrap();
         store
-            .set_card("example-app", "EX-0", &card(CardStatus::Done), &[])
+            .set_card("example-app", "EX-0", &card(CardStatus::Done))
             .unwrap();
+        let mut waiting = card(CardStatus::Failed);
+        waiting.attempts = 2;
+        waiting.retry_at = Some(now() + chrono::TimeDelta::minutes(2));
+        store.set_card("example-app", "EX-2", &waiting).unwrap();
+        let mut escalated = card(CardStatus::NeedsHuman);
+        escalated.attempts = 3;
+        escalated.reason = Some("max_attempts".into());
+        store.set_card("example-app", "EX-3", &escalated).unwrap();
         store
             .claim("card:EX-1", "example-app", now(), CLAIM_LEASE)
             .unwrap();
@@ -202,10 +217,18 @@ mod tests {
         );
         assert!(text.contains("events:       0 new, 0 batched"), "{text}");
         assert!(
-            text.contains("cards:        1 done, 1 in_progress"),
+            text.contains("cards:        1 done, 1 failed, 1 in_progress, 1 needs_human"),
             "{text}"
         );
         assert!(text.contains("  EX-1 in_progress since"), "{text}");
+        assert!(
+            text.contains("  EX-2 failed since 2026-01-15T09:30:00Z, 2 attempt(s) in this run, retry at 2026-01-15T09:32:00Z"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  EX-3 needs_human since 2026-01-15T09:30:00Z, 3 attempt(s) in this run, reason max_attempts"),
+            "{text}"
+        );
         assert!(
             !text.contains("  EX-0"),
             "done cards are only counted: {text}"

@@ -40,6 +40,18 @@ impl<'a> WorkspaceContext<'a> {
     }
 }
 
+/// A card waiting for a person (`needs_human`): shown to triage so it can escalate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Escalation {
+    #[serde(rename = "ref")]
+    pub card_ref: String,
+    /// `max_attempts`, `no_progress`, `failed` or `environment`.
+    pub reason: String,
+    /// Counted attempts in the run that ended here.
+    pub attempts: u32,
+    pub last_summary: Option<String>,
+}
+
 #[derive(Serialize)]
 struct TriageContext<'a> {
     now: String,
@@ -50,6 +62,7 @@ struct TriageContext<'a> {
     outreach_file: String,
     /// Empty: a fallback sweep.
     events: &'a [Event],
+    escalations: &'a [Escalation],
 }
 
 #[derive(Serialize)]
@@ -104,6 +117,7 @@ pub fn triage_prompt(
     paths: &Paths,
     cursors: &BTreeMap<String, String>,
     events: &[Event],
+    escalations: &[Escalation],
     now: DateTime<Utc>,
 ) -> String {
     let skill_cursors = cursors
@@ -119,6 +133,7 @@ pub fn triage_prompt(
         workspaces: all_workspaces(config),
         outreach_file: paths.outreach_file.display().to_string(),
         events,
+        escalations,
     };
     render(&config.triage.objective, &context)
 }
@@ -195,7 +210,20 @@ mod tests {
             occurred_at: now(),
             payload: json!({"body": "test event"}),
         }];
-        let prompt = triage_prompt(&env.config, &env.paths, &cursors, &events, now());
+        let escalations = vec![Escalation {
+            card_ref: "EX-4".into(),
+            reason: "max_attempts".into(),
+            attempts: 3,
+            last_summary: Some("no result within 3h".into()),
+        }];
+        let prompt = triage_prompt(
+            &env.config,
+            &env.paths,
+            &cursors,
+            &events,
+            &escalations,
+            now(),
+        );
         let expected_start = format!("{}\n\n```json\n", crate::config::TRIAGE_OBJECTIVE);
         assert!(prompt.starts_with(&expected_start), "{prompt}");
         let context = context_of(&prompt);
@@ -214,14 +242,21 @@ mod tests {
             json!({"id": "7", "source": "manual", "kind": "message", "mentions_me": true,
                    "sender": null, "occurred_at": "2026-01-15T09:30:00Z", "payload": {"body": "test event"}})
         );
+        assert_eq!(
+            context["escalations"],
+            json!([{"ref": "EX-4", "reason": "max_attempts", "attempts": 3,
+                    "last_summary": "no result within 3h"}])
+        );
         let sweep = context_of(&triage_prompt(
             &env.config,
             &env.paths,
             &cursors,
             &[],
+            &[],
             now(),
         ));
         assert_eq!(sweep["events"], json!([]));
+        assert_eq!(sweep["escalations"], json!([]));
     }
 
     #[test]
@@ -290,7 +325,7 @@ mod tests {
         let card = card_prompt("EX-4", None, &env.config, &env.paths, now());
         assert!(card.starts_with("Ship EX-4; then report on EX-4.\n\n```json\n"));
         assert_eq!(context_of(&card)["ref"], "EX-4");
-        let triage = triage_prompt(&env.config, &env.paths, &BTreeMap::new(), &[], now());
+        let triage = triage_prompt(&env.config, &env.paths, &BTreeMap::new(), &[], &[], now());
         assert!(triage.starts_with("Look around.\n\n```json\n"));
     }
 
