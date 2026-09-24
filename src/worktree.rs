@@ -8,13 +8,15 @@ use crate::config::Workspace;
 
 /// Directory name for a ref or workspace name: readable part plus a stable hash of the
 /// original, so names that normalise alike (`EX-1`, `ex_1`, `EX/1`) never share a directory.
-/// `EX-123` → `ex-123-<8 hex>`; anything outside `[a-z0-9]` becomes `-`.
+/// `EX-123` → `ex-123-<8 hex>`; anything outside `[a-z0-9]` becomes `-`, and the readable
+/// part is capped at 48 characters (discussion keys can be long URLs).
 #[must_use]
 pub fn slug(name: &str) -> String {
     let lowered: String = name
         .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(48)
         .collect();
     let trimmed = lowered.trim_matches('-');
     let readable = if trimmed.is_empty() { "card" } else { trimmed };
@@ -59,8 +61,9 @@ async fn is_checkout_root(path: &Path) -> bool {
     }
 }
 
-/// Where a card runs: `<worktrees_dir>/<workspace>/<ref-slug>`, a detached worktree of the
-/// workspace, reused when it already exists (resume). A workspace that is not a git checkout
+/// Where a card (or a discussion, named by its claim key) runs:
+/// `<worktrees_dir>/<workspace>/<name-slug>`, a detached worktree of the workspace, reused
+/// when it already exists (resume). A workspace that is not a git checkout
 /// is returned as is; the workflow skill reports it as blocked.
 pub async fn card_checkout(
     workspace: &Workspace,
@@ -148,6 +151,9 @@ mod tests {
         assert_eq!(slug("EX-123"), ex, "stable");
         assert!(slug("org/repo#7").starts_with("org-repo-7-"));
         assert!(slug("--").starts_with("card-"));
+        let long = slug("discussion:https://example.com/a/very/long/path/to/a/comment/12345");
+        assert!(long.starts_with("discussion-https---example-com-a-very-long-path-"));
+        assert!(long.len() <= 48 + 1 + 8, "{long}");
     }
 
     #[test]

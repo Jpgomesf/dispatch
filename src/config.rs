@@ -6,6 +6,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::durations::parse_duration;
 
+mod intake;
+
+pub use intake::{
+    IntakeConfig, JiraConfig, LINEAR_API_URL, LinearConfig, NotificationsConfig, SLACK_APP_ID,
+};
+
 pub const DEFAULT_CONFIG_DIR: &str = "~/.config/claude-harness";
 pub const DEFAULT_STATE_DIR: &str = "~/.local/state/claude-harness";
 
@@ -31,9 +37,11 @@ impl Effort {
     }
 }
 
+/// Triage sessions: started by a batch of intake events, or by the fallback sweep timer.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct HeartbeatConfig {
+pub struct TriageConfig {
+    /// Fallback sweep: a triage with no events this long after the previous sweep.
     #[serde(deserialize_with = "duration_from_str")]
     pub interval: Duration,
     pub model: String,
@@ -42,10 +50,10 @@ pub struct HeartbeatConfig {
     pub max_cards_per_tick: u32,
 }
 
-impl Default for HeartbeatConfig {
+impl Default for TriageConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(600),
+            interval: Duration::from_secs(30 * 60),
             model: "sonnet".into(),
             effort: Effort::Medium,
             max_budget_usd: 1.0,
@@ -60,7 +68,7 @@ pub struct CardConfig {
     pub model: String,
     pub effort: Effort,
     pub max_budget_usd: f64,
-    /// Card sessions running at the same time under `heartbeat`.
+    /// Card and discussion sessions running at the same time under `heartbeat`.
     pub max_parallel: u32,
 }
 
@@ -109,24 +117,29 @@ pub struct Workspace {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Required; unique per machine (`[a-z0-9-]+`): claims, branches and labels carry it.
+    pub name: String,
     pub outreach_file: PathBuf,
     pub state_dir: PathBuf,
     pub plugin_dir: Option<PathBuf>,
-    pub heartbeat: HeartbeatConfig,
+    pub triage: TriageConfig,
     pub card: CardConfig,
     pub sources: SourcesConfig,
+    pub intake: IntakeConfig,
     pub workspaces: Vec<Workspace>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            name: String::new(),
             outreach_file: expand_user(&Path::new(DEFAULT_CONFIG_DIR).join("outreach.md")),
             state_dir: expand_user(Path::new(DEFAULT_STATE_DIR)),
             plugin_dir: None,
-            heartbeat: HeartbeatConfig::default(),
+            triage: TriageConfig::default(),
             card: CardConfig::default(),
             sources: SourcesConfig::default(),
+            intake: IntakeConfig::default(),
             workspaces: Vec::new(),
         }
     }
@@ -143,8 +156,14 @@ impl Config {
     }
 
     fn validated(mut self) -> Result<Config, String> {
-        if self.heartbeat.max_budget_usd <= 0.0 {
-            return Err("heartbeat.max_budget_usd must be > 0".into());
+        if !is_valid_name(&self.name) {
+            return Err(format!(
+                "name is required and must match [a-z0-9-]+ (got {:?})",
+                self.name
+            ));
+        }
+        if self.triage.max_budget_usd <= 0.0 {
+            return Err("triage.max_budget_usd must be > 0".into());
         }
         if self.card.max_budget_usd <= 0.0 {
             return Err("card.max_budget_usd must be > 0".into());
@@ -152,6 +171,7 @@ impl Config {
         if self.card.max_parallel == 0 {
             return Err("card.max_parallel must be >= 1".into());
         }
+        self.intake.validate()?;
         self.outreach_file = expand_user(&self.outreach_file);
         self.state_dir = expand_user(&self.state_dir);
         self.plugin_dir = self.plugin_dir.as_deref().map(expand_user);
@@ -175,6 +195,15 @@ impl Config {
                 .any(|pattern| card_ref.contains(pattern.as_str()))
         })
     }
+}
+
+/// Runner names go into claim keys, branch names and labels.
+#[must_use]
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 pub fn load_config(path: &Path) -> Result<Config, String> {
@@ -206,11 +235,12 @@ pub(crate) mod tests {
         let root = root.display();
         format!(
             r#"
+name = "example-app"
 outreach_file = "{root}/outreach.md"
 state_dir = "{root}/state"
 plugin_dir = "{root}/plugin"
 
-[heartbeat]
+[triage]
 interval = "10m"
 max_cards_per_tick = 2
 
@@ -231,8 +261,8 @@ match = ["EX-"]
     fn loads_full_config() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::from_toml(&config_toml(dir.path())).unwrap();
-        assert_eq!(config.heartbeat.interval, Duration::from_secs(600));
-        assert_eq!(config.heartbeat.max_cards_per_tick, 2);
+        assert_eq!(config.triage.interval, Duration::from_secs(600));
+        assert_eq!(config.triage.max_cards_per_tick, 2);
         assert_eq!(config.card.model, "claude-opus-5-5");
         assert_eq!(config.card.effort, Effort::High);
         assert_eq!(config.card.max_parallel, 2);
@@ -246,10 +276,10 @@ match = ["EX-"]
     #[test]
     fn defaults_match_spec() {
         let config = Config::default();
-        assert_eq!(config.heartbeat.model, "sonnet");
-        assert_eq!(config.heartbeat.effort, Effort::Medium);
-        assert_eq!(config.heartbeat.max_budget_usd, 1.0);
-        assert_eq!(config.heartbeat.max_cards_per_tick, 1);
+        assert_eq!(config.triage.model, "sonnet");
+        assert_eq!(config.triage.effort, Effort::Medium);
+        assert_eq!(config.triage.max_budget_usd, 1.0);
+        assert_eq!(config.triage.max_cards_per_tick, 1);
         assert_eq!(config.card.model, "claude-opus-5-5");
         assert_eq!(config.card.effort, Effort::High);
         assert_eq!(config.card.max_budget_usd, 20.0);
@@ -263,12 +293,25 @@ match = ["EX-"]
             expand_user(Path::new("~/.config/claude-harness/outreach.md"))
         );
         assert!(!config.state_dir.starts_with("~"));
-        assert_eq!(Config::from_toml("").unwrap(), config);
+        assert_eq!(config.triage.interval, Duration::from_secs(30 * 60));
+        assert_eq!(config.intake.batch_window, Duration::from_secs(60));
+        assert!(!config.intake.notifications.enabled);
+        assert_eq!(config.intake.notifications.apps, [SLACK_APP_ID]);
+        assert_eq!(config.intake.linear.api_key_env, "LINEAR_API_KEY");
+        assert_eq!(config.intake.jira.token_env, "JIRA_API_TOKEN");
+        let minimal = Config::from_toml("name = \"example-app\"").unwrap();
+        assert_eq!(
+            minimal,
+            Config {
+                name: "example-app".into(),
+                ..config
+            }
+        );
     }
 
     #[test]
     fn sources_accept_free_form_keys() {
-        let config = Config::from_toml("[sources]\njira_board = \"EX\"\n").unwrap();
+        let config = Config::from_toml("name = \"ex\"\n[sources]\njira_board = \"EX\"\n").unwrap();
         assert_eq!(config.sources.extra["jira_board"], "EX");
         let dumped = serde_json::to_value(&config.sources).unwrap();
         assert_eq!(dumped["jira_board"], "EX");
@@ -277,26 +320,73 @@ match = ["EX-"]
 
     #[test]
     fn rejects_invalid_config() {
-        for raw in [
+        for body in [
             "unknown_key = 1",
-            "[heartbeat]\ninterval = \"soon\"",
-            "[heartbeat]\neffort = \"extreme\"",
+            "[triage]\ninterval = \"soon\"",
+            "[triage]\neffort = \"extreme\"",
             "[card]\nmax_budget_usd = 0",
             "[card]\nmax_parallel = 0",
-            "[heartbeat]\nmax_cards_per_tick = -1",
+            "[triage]\nmax_cards_per_tick = -1",
             "[send]\nmode = \"all\"",
             "[[workspaces]]\nname = \"x\"",
+            "[heartbeat]\ninterval = \"10m\"",
+            "[intake]\nunknown = 1",
+            "[intake.linear]\napi_key = \"lin_api_example\"",
+            "[intake.linear]\napi_url = \"https://example.com\"",
+            "[intake.jira]\nenabled = true\nbase_url = \"http://example.atlassian.net\"",
+            "[intake.jira]\njql = \"project = EX) OR (project = OTHER\"",
+            "[intake.notifications]\npoll = \"often\"",
         ] {
-            assert!(Config::from_toml(raw).is_err(), "{raw}");
+            let raw = format!("name = \"example-app\"\n{body}");
+            assert!(Config::from_toml(&raw).is_err(), "{raw}");
         }
+        for name in ["", "Example", "ex_app", "ex app", "ex/app"] {
+            let raw = format!("name = {name:?}");
+            assert!(Config::from_toml(&raw).is_err(), "{raw}");
+        }
+        assert!(Config::from_toml("").is_err(), "name is required");
     }
 
     #[test]
     fn example_config_is_valid() {
         let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/config.example.toml");
         let config = load_config(&example).unwrap();
+        assert!(is_valid_name(&config.name));
         assert_eq!(config.card.max_parallel, 2);
         assert_eq!(config.workspaces[0].name, "example-app");
+    }
+
+    #[test]
+    fn loads_intake_sections() {
+        let raw = r##"
+name = "example-app"
+
+[intake]
+batch_window = "30s"
+allow_senders = ["Example Person"]
+
+[intake.notifications]
+enabled = true
+poll = "5s"
+match = ["#example-channel"]
+
+[intake.linear]
+enabled = true
+projects = ["Example App"]
+
+[intake.jira]
+enabled = true
+base_url = "https://example.atlassian.net"
+jql = "project = EX"
+"##;
+        let config = Config::from_toml(raw).unwrap();
+        let intake = &config.intake;
+        assert_eq!(intake.batch_window, Duration::from_secs(30));
+        assert_eq!(intake.notifications.match_, ["#example-channel"]);
+        assert_eq!(intake.notifications.apps, [SLACK_APP_ID]);
+        assert_eq!(intake.linear.projects, ["Example App"]);
+        assert_eq!(intake.linear.api_url, LINEAR_API_URL);
+        assert_eq!(intake.jira.jql, "project = EX");
     }
 
     #[test]
