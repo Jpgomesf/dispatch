@@ -8,7 +8,7 @@ use crate::config::{UnknownWorkspace, Workspace};
 use crate::intake::secrets::Secrets;
 use crate::intake::{CardScope, card_scope};
 use crate::outcome::{self, Next, Outcome};
-use crate::prompts::card_prompt;
+use crate::prompts::{PREVIOUS_ATTEMPTS, PreviousAttempt, card_prompt};
 use crate::results::{CardOutcome, CardResult, card_schema};
 use crate::session::{Mode, Session, SessionReport};
 use crate::state::{CardState, CardStatus};
@@ -163,9 +163,18 @@ impl<S: Session> Runner<S> {
             Some(w) => worktree::head(w, &checkout).await,
             None => None,
         };
+        // Best effort: without its history a session still starts, from git and the tracker.
+        let (runner, owned_ref) = (self.name().to_string(), card_ref.to_string());
+        let previous: Vec<PreviousAttempt> = self
+            .store
+            .call(move |s| s.recent_card_attempts(&runner, &owned_ref, PREVIOUS_ATTEMPTS))
+            .await
+            .map(|attempts| attempts.iter().map(PreviousAttempt::from).collect())
+            .unwrap_or_default();
         let prompt = card_prompt(
             card_ref,
             workspace.as_ref().map(|w| (w, checkout.as_path())),
+            &previous,
             &self.config,
             &self.paths,
             self.now(),

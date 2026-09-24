@@ -153,6 +153,28 @@ impl Store {
         })
     }
 
+    /// The last `limit` card attempts of `card_ref` that ended, oldest first.
+    pub fn recent_card_attempts(
+        &self,
+        runner: &str,
+        card_ref: &str,
+        limit: i64,
+    ) -> Result<Vec<Attempt>> {
+        let mut attempts = self.read(|c| {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM attempts
+                 WHERE runner = ?1 AND mode = 'card' AND ref = ?2 AND ended_at IS NOT NULL
+                 ORDER BY id DESC LIMIT ?3"
+            );
+            let mut statement = c.prepare(&sql)?;
+            statement
+                .query_map(params![runner, card_ref, limit], attempt_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        attempts.reverse();
+        Ok(attempts)
+    }
+
     /// The counted card attempts of the current run (the last `run` counted ones before
     /// attempt `before`, when given), newest first: what the retry rules look back on.
     pub fn card_chain(
@@ -318,6 +340,14 @@ mod tests {
                 .card_chain("beta", "EX-1", None, 3)
                 .unwrap()
                 .is_empty()
+        );
+
+        let recent = store.recent_card_attempts("alpha", "EX-1", 3).unwrap();
+        let outcomes: Vec<&str> = recent.iter().filter_map(|a| a.outcome.as_deref()).collect();
+        assert_eq!(
+            outcomes,
+            ["interrupted", "failed", "crash"],
+            "oldest first; the open discussion is not a card attempt"
         );
     }
 

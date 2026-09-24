@@ -8,6 +8,10 @@ use crate::config::{Config, SourcesConfig, Workspace};
 use crate::intake::Event;
 use crate::paths::Paths;
 use crate::results::DiscussionToRun;
+use crate::store::Attempt;
+
+/// How many earlier attempts a card session sees.
+pub const PREVIOUS_ATTEMPTS: i64 = 3;
 
 /// Cursor keys the runner's own pollers use; never shown to the skill.
 pub const INTAKE_CURSOR_PREFIX: &str = "intake:";
@@ -65,6 +69,32 @@ struct TriageContext<'a> {
     escalations: &'a [Escalation],
 }
 
+/// An earlier attempt at the card, so a fresh session starts from what was learned rather
+/// than from a resumed transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviousAttempt {
+    pub attempt: u32,
+    pub outcome: String,
+    pub summary: Option<String>,
+    pub blocked_on: Option<String>,
+    pub session_id: Option<String>,
+    /// Commits it added to the worktree's HEAD; `null` when the card has no worktree.
+    pub new_commits: Option<u32>,
+}
+
+impl From<&Attempt> for PreviousAttempt {
+    fn from(attempt: &Attempt) -> Self {
+        PreviousAttempt {
+            attempt: attempt.attempt,
+            outcome: attempt.outcome.clone().unwrap_or_default(),
+            summary: attempt.summary.clone(),
+            blocked_on: attempt.blocked_on.clone(),
+            session_id: attempt.session_id.clone(),
+            new_commits: attempt.new_commits,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct CardContext<'a> {
     now: String,
@@ -74,6 +104,8 @@ struct CardContext<'a> {
     workspace: Option<WorkspaceContext<'a>>,
     workspaces: Vec<WorkspaceContext<'a>>,
     outreach_file: String,
+    /// The last few attempts, oldest first.
+    previous_attempts: &'a [PreviousAttempt],
 }
 
 #[derive(Serialize)]
@@ -142,6 +174,7 @@ pub fn triage_prompt(
 pub fn card_prompt(
     card_ref: &str,
     workspace: Option<(&Workspace, &Path)>,
+    previous_attempts: &[PreviousAttempt],
     config: &Config,
     paths: &Paths,
     now: DateTime<Utc>,
@@ -153,6 +186,7 @@ pub fn card_prompt(
         workspace: workspace.map(|(w, checkout)| WorkspaceContext::of(w, checkout)),
         workspaces: all_workspaces(config),
         outreach_file: paths.outreach_file.display().to_string(),
+        previous_attempts,
     };
     render(&objective_for(&config.card.objective, card_ref), &context)
 }
@@ -264,9 +298,18 @@ mod tests {
         let env = test_env();
         let workspace = &env.config.workspaces[0];
         let checkout = Path::new("/tmp/example/worktrees/example-app/ex-3");
+        let previous = [PreviousAttempt {
+            attempt: 1,
+            outcome: "timeout".into(),
+            summary: Some("no result within 3h".into()),
+            blocked_on: None,
+            session_id: Some("session-1".into()),
+            new_commits: Some(2),
+        }];
         let prompt = card_prompt(
             "EX-3",
             Some((workspace, checkout)),
+            &previous,
             &env.config,
             &env.paths,
             now(),
@@ -281,8 +324,14 @@ mod tests {
             context["workspaces"][0]["path"],
             workspace.path.display().to_string()
         );
-        let unmatched = card_prompt("ZZ-1", None, &env.config, &env.paths, now());
+        assert_eq!(
+            context["previous_attempts"],
+            json!([{"attempt": 1, "outcome": "timeout", "summary": "no result within 3h",
+                    "blocked_on": null, "session_id": "session-1", "new_commits": 2}])
+        );
+        let unmatched = card_prompt("ZZ-1", None, &[], &env.config, &env.paths, now());
         assert!(context_of(&unmatched)["workspace"].is_null());
+        assert_eq!(context_of(&unmatched)["previous_attempts"], json!([]));
     }
 
     #[test]
@@ -322,7 +371,7 @@ mod tests {
         let mut env = test_env();
         env.config.card.objective = "Ship {ref}; then report on {ref}.".into();
         env.config.triage.objective = "  Look around.  ".into();
-        let card = card_prompt("EX-4", None, &env.config, &env.paths, now());
+        let card = card_prompt("EX-4", None, &[], &env.config, &env.paths, now());
         assert!(card.starts_with("Ship EX-4; then report on EX-4.\n\n```json\n"));
         assert_eq!(context_of(&card)["ref"], "EX-4");
         let triage = triage_prompt(&env.config, &env.paths, &BTreeMap::new(), &[], &[], now());

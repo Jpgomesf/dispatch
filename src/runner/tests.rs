@@ -342,6 +342,35 @@ async fn attempts_that_add_no_commits_twice_in_a_row_need_a_person() {
 }
 
 #[tokio::test]
+async fn a_fresh_attempt_sees_the_last_three_attempts() {
+    let mut env = test_env();
+    env.config.card.max_attempts = 9;
+    let session = FakeSession::sequence(vec![
+        fail("boom 1"),
+        ended(crate::session::Ended::Timeout("no result within 3h".into())),
+        ok(card_output("EX-1", "failed")),
+        ok(card_output("EX-1", "done")),
+    ]);
+    let (runner, _) = make_runner(&env, session);
+    for _ in 0..4 {
+        runner.run_card_in("EX-1", None, &[]).await;
+    }
+    let calls = runner.session().calls();
+    assert_eq!(calls[0].context()["previous_attempts"], json!([]));
+    assert_eq!(
+        calls[3].context()["previous_attempts"],
+        json!([
+            {"attempt": 1, "outcome": "api_error", "summary": "boom 1", "blocked_on": null,
+             "session_id": "session-1", "new_commits": null},
+            {"attempt": 2, "outcome": "timeout", "summary": "no result within 3h",
+             "blocked_on": null, "session_id": "session-2", "new_commits": null},
+            {"attempt": 3, "outcome": "failed", "summary": "implemented", "blocked_on": null,
+             "session_id": "session-3", "new_commits": null},
+        ])
+    );
+}
+
+#[tokio::test]
 async fn each_mode_gets_its_timeout_and_the_shared_idle_limit() {
     let mut env = test_env();
     env.config.triage.timeout = MINUTE * 20;
