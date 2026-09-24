@@ -120,7 +120,7 @@ write (temp file + rename).
 
 ### Send policy (enforced by the runner, not the model)
 
-A `can_use_tool` callback classifies every tool call:
+A PreToolUse hook classifies every tool call, subagents included (`can_use_tool` only fires for calls auto mode would ask about, so it would miss allowed sends):
 
 - **Send tools** (Slack `send_message` / `schedule_message`; Gmail
   `send_message` / `reply` / `forward`; matched by suffix so the server prefix
