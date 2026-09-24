@@ -1,8 +1,8 @@
 {
   "name": "claude-harness",
   "displayName": "Claude Harness",
-  "version": "0.1.0",
-  "description": "Skill pack for claude-harness: heartbeat triage and end-to-end card work (workflow), unblocking people (outreach), and reviewer-ready PR descriptions (pr-description).",
+  "version": "0.2.0",
+  "description": "Skill pack for claude-harness: event triage, end-to-end card work and discussion answers (workflow), unblocking people (outreach), and reviewer-ready PR descriptions (pr-description).",
   "author": { "name": "claude-harness contributors" },
   "keywords": ["automation", "workflow", "tracker", "slack", "pull-request"]
 }

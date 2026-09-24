@@ -86,7 +86,8 @@ stated as facts, not promises.
 **Links** — *when* any exist: `Closes #N` (the exact keyword auto-closes on
 merge), the tracker card, the spec, related PRs.
 
-Footer — the attribution line the repo or harness asks for, if any.
+Footer — the attribution line the repo or harness asks for, if any. *When* a
+claude-harness runner opens the PR, the footer names it: `Opened by agent:<runner>`.
 
 ## Verification rules
 
