@@ -3,11 +3,15 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::config::Effort;
 
@@ -56,12 +60,16 @@ pub trait Session: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct ClaudeCli {
     pub program: PathBuf,
+    /// How long to wait for stdout/stderr to close after `claude` exits before killing
+    /// whatever is left in its process group.
+    pub pipe_grace: Duration,
 }
 
 impl Default for ClaudeCli {
     fn default() -> Self {
         ClaudeCli {
             program: PathBuf::from("claude"),
+            pipe_grace: Duration::from_secs(5),
         }
     }
 }
@@ -122,13 +130,39 @@ pub fn outcome_from_stdout(stdout: &str) -> Result<SessionOutcome, SessionError>
     })
 }
 
-fn signal_child(pid: Option<u32>, signal: libc::c_int) {
-    if let Some(pid) = pid.and_then(|p| libc::pid_t::try_from(p).ok()) {
-        // SAFETY: plain kill(2) on our own child's pid; no memory is shared.
+/// Signal every process in the session's group (the child leads a group of its own), so
+/// subprocesses `claude` started are stopped with it.
+fn signal_group(group: Option<u32>, signal: libc::c_int) {
+    if let Some(group) = group.and_then(|p| libc::pid_t::try_from(p).ok()) {
+        // SAFETY: plain kill(2) on the process group we created; no memory is shared.
         unsafe {
-            libc::kill(pid, signal);
+            libc::kill(-group, signal);
         }
     }
+}
+
+type Buffer = Arc<Mutex<Vec<u8>>>;
+
+/// Read a pipe into a shared buffer, so what was read survives a timeout.
+fn drain(mut pipe: impl AsyncRead + Unpin + Send + 'static) -> (Buffer, JoinHandle<()>) {
+    let buffer: Buffer = Arc::default();
+    let sink = buffer.clone();
+    let reader = tokio::spawn(async move {
+        let mut chunk = [0u8; 8192];
+        while let Ok(read) = pipe.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            sink.lock()
+                .expect("pipe buffer")
+                .extend_from_slice(&chunk[..read]);
+        }
+    });
+    (buffer, reader)
+}
+
+fn text(buffer: &Buffer) -> String {
+    String::from_utf8_lossy(&buffer.lock().expect("pipe buffer")).into_owned()
 }
 
 fn last_line(text: &str) -> &str {
@@ -154,19 +188,13 @@ impl Session for ClaudeCli {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| SessionError(format!("cannot start {}: {e}", self.program.display())))?;
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
-        let read_out = tokio::spawn(async move {
-            let mut text = String::new();
-            stdout.read_to_string(&mut text).await.map(|_| text)
-        });
-        let read_err = tokio::spawn(async move {
-            let mut text = String::new();
-            stderr.read_to_string(&mut text).await.map(|_| text)
-        });
+        let group = child.id();
+        let (stdout, mut read_out) = drain(child.stdout.take().expect("piped stdout"));
+        let (stderr, mut read_err) = drain(child.stderr.take().expect("piped stderr"));
 
         let mut terminated = false;
         let status = loop {
@@ -180,11 +208,11 @@ impl Session for ClaudeCli {
                         Shutdown::Run => {}
                         Shutdown::Graceful => {
                             terminated = true;
-                            signal_child(child.id(), libc::SIGTERM);
+                            signal_group(group, libc::SIGTERM);
                         }
                         Shutdown::Force => {
                             terminated = true;
-                            let _ = child.start_kill();
+                            signal_group(group, libc::SIGKILL);
                         }
                     }
                 }
@@ -192,8 +220,23 @@ impl Session for ClaudeCli {
         }
         .map_err(|e| SessionError(format!("waiting for claude: {e}")))?;
 
-        let stdout = read_out.await.ok().and_then(Result::ok).unwrap_or_default();
-        let stderr = read_err.await.ok().and_then(Result::ok).unwrap_or_default();
+        // A leftover subprocess holding a pipe open must not pin this session forever.
+        let pipes_closed = timeout(self.pipe_grace, async {
+            let _ = tokio::join!(&mut read_out, &mut read_err);
+        })
+        .await;
+        if pipes_closed.is_err() {
+            signal_group(group, libc::SIGKILL);
+            let after_kill = timeout(Duration::from_secs(1), async {
+                let _ = tokio::join!(&mut read_out, &mut read_err);
+            })
+            .await;
+            if after_kill.is_err() {
+                read_out.abort();
+                read_err.abort();
+            }
+        }
+        let (stdout, stderr) = (text(&stdout), text(&stderr));
         if terminated {
             return Err(SessionError("terminated: harness is stopping".into()));
         }
@@ -309,6 +352,7 @@ mod tests {
     async fn missing_program_is_a_session_error() {
         let cli = ClaudeCli {
             program: PathBuf::from("/nonexistent/claude-example"),
+            ..ClaudeCli::default()
         };
         let (_tx, rx) = watch::channel(Shutdown::Run);
         let request = SessionRequest {
@@ -319,45 +363,96 @@ mod tests {
         assert!(error.0.starts_with("cannot start"), "{}", error.0);
     }
 
-    #[tokio::test]
-    async fn graceful_shutdown_terminates_the_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-claude");
-        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+    /// A fake `claude`: a shell script with the given body.
+    fn fake_cli(dir: &std::path::Path, body: &str) -> ClaudeCli {
+        let script = dir.join("fake-claude");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
-        let cli = ClaudeCli { program: script };
-        let (tx, rx) = watch::channel(Shutdown::Run);
-        let request = SessionRequest {
-            cwd: dir.path().to_path_buf(),
+        ClaudeCli {
+            program: script,
+            pipe_grace: Duration::from_millis(300),
+        }
+    }
+
+    fn in_dir(dir: &std::path::Path) -> SessionRequest {
+        SessionRequest {
+            cwd: dir.to_path_buf(),
             ..request()
-        };
+        }
+    }
+
+    fn is_alive(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_terminates_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let body = format!("sleep 30 &\necho $! > {}\nsleep 30", pid_file.display());
+        let cli = fake_cli(dir.path(), &body);
+        let (tx, rx) = watch::channel(Shutdown::Run);
+        let request = in_dir(dir.path());
         let run = tokio::spawn(async move { cli.run(request, rx).await });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let written =
+            |p: &std::path::Path| std::fs::read_to_string(p).is_ok_and(|t| t.ends_with('\n'));
+        for _ in 0..100 {
+            if written(&pid_file) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         tx.send_replace(Shutdown::Graceful);
-        let error = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+        let error = timeout(Duration::from_secs(3), run)
             .await
-            .expect("child ended")
+            .expect("session ended promptly")
             .unwrap()
             .unwrap_err();
         assert!(error.0.starts_with("terminated"), "{}", error.0);
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!is_alive(grandchild), "background sleep was left running");
+    }
+
+    #[tokio::test]
+    async fn grandchild_holding_stdout_does_not_pin_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        // The backgrounded sleep inherits stdout and would keep the pipe open for 30s.
+        let body = format!(
+            "sleep 30 &\necho $! > {}\ncat <<'EOF'\n{}\nEOF",
+            pid_file.display(),
+            result(json!({}))
+        );
+        let cli = fake_cli(dir.path(), &body);
+        let (_tx, rx) = watch::channel(Shutdown::Run);
+        let outcome = timeout(Duration::from_secs(5), cli.run(in_dir(dir.path()), rx))
+            .await
+            .expect("pipe reads are bounded")
+            .unwrap();
+        assert_eq!(outcome.output["summary"], "ok");
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!is_alive(grandchild), "stray grandchild was not killed");
     }
 
     #[tokio::test]
     async fn fake_cli_output_is_parsed() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("fake-claude");
-        let body = format!("#!/bin/sh\ncat <<'EOF'\n{}\nEOF\n", result(json!({})));
-        std::fs::write(&script, body).unwrap();
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        let cli = ClaudeCli { program: script };
+        let body = format!("cat <<'EOF'\n{}\nEOF", result(json!({})));
+        let cli = fake_cli(dir.path(), &body);
         let (_tx, rx) = watch::channel(Shutdown::Run);
-        let request = SessionRequest {
-            cwd: dir.path().to_path_buf(),
-            ..request()
-        };
-        let outcome = cli.run(request, rx).await.unwrap();
+        let outcome = cli.run(in_dir(dir.path()), rx).await.unwrap();
         assert_eq!(outcome.output["summary"], "ok");
     }
 }
