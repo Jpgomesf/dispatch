@@ -133,7 +133,8 @@ pub enum Notice {
 pub enum Shutdown {
     #[default]
     Run,
-    /// First signal or kill switch: start nothing new, ask running sessions to end (SIGTERM).
+    /// First signal or kill switch: start nothing new, end running sessions with the stop
+    /// sequence (SIGINT, then SIGTERM, then SIGKILL).
     Graceful,
     /// Second signal: kill running sessions (SIGKILL).
     Force,
@@ -164,6 +165,8 @@ pub struct ClaudeCli {
     /// How long to wait for stdout/stderr to close after `claude` exits before killing
     /// whatever is left in its process group.
     pub pipe_grace: Duration,
+    /// Between the steps of the stop sequence (SIGINT, SIGTERM, SIGKILL).
+    pub stop_grace: Duration,
 }
 
 impl Default for ClaudeCli {
@@ -171,6 +174,7 @@ impl Default for ClaudeCli {
         ClaudeCli {
             program: PathBuf::from("claude"),
             pipe_grace: Duration::from_secs(5),
+            stop_grace: Duration::from_secs(20),
         }
     }
 }
@@ -203,14 +207,68 @@ pub fn build_args(request: &SessionRequest) -> Vec<String> {
     args
 }
 
-/// Signal every process in the session's group (the child leads a group of its own), so
-/// subprocesses `claude` started are stopped with it.
-fn signal_group(group: Option<u32>, signal: libc::c_int) {
-    if let Some(group) = group.and_then(|p| libc::pid_t::try_from(p).ok()) {
-        // SAFETY: plain kill(2) on the process group we created; no memory is shared.
+/// Signal `claude` alone, or its whole process group (it leads a group of its own), so
+/// subprocesses it started are stopped with it.
+fn send_signal(pid: Option<u32>, signal: libc::c_int, whole_group: bool) {
+    if let Some(pid) = pid.and_then(|p| libc::pid_t::try_from(p).ok()) {
+        let target = if whole_group { -pid } else { pid };
+        // SAFETY: plain kill(2) on the process (group) we started; no memory is shared.
         unsafe {
-            libc::kill(-group, signal);
+            libc::kill(target, signal);
         }
+    }
+}
+
+fn signal_group(group: Option<u32>, signal: libc::c_int) {
+    send_signal(group, signal, true);
+}
+
+/// How a session is ended: SIGINT to `claude` first (it ends the turn cleanly), then SIGTERM
+/// to its process group, then SIGKILL, `grace` apart. SIGTERM alone would leave the turn
+/// unfinished.
+#[derive(Debug)]
+struct StopSequence {
+    pid: Option<u32>,
+    grace: Duration,
+    started: bool,
+    /// The next signal to the group, and when.
+    next: Option<(Instant, libc::c_int)>,
+}
+
+impl StopSequence {
+    fn new(pid: Option<u32>, grace: Duration) -> Self {
+        StopSequence {
+            pid,
+            grace,
+            started: false,
+            next: None,
+        }
+    }
+
+    fn begin(&mut self) {
+        if !self.started {
+            self.started = true;
+            send_signal(self.pid, libc::SIGINT, false);
+            self.next = Some((Instant::now() + self.grace, libc::SIGTERM));
+        }
+    }
+
+    fn escalate(&mut self) {
+        if let Some((_, signal)) = self.next {
+            signal_group(self.pid, signal);
+            self.next =
+                (signal == libc::SIGTERM).then(|| (Instant::now() + self.grace, libc::SIGKILL));
+        }
+    }
+
+    fn kill(&mut self) {
+        self.started = true;
+        signal_group(self.pid, libc::SIGKILL);
+        self.next = None;
+    }
+
+    fn due(&self) -> Option<Instant> {
+        self.next.map(|(at, _)| at)
     }
 }
 
@@ -313,12 +371,14 @@ impl Session for ClaudeCli {
         let mut last_event = Instant::now();
         let mut stream = Stream::default();
         let mut stop = None;
+        let mut stopping = StopSequence::new(group, self.stop_grace);
         let mut exited: Option<String> = None;
         let mut stdout_open = true;
         let mut pipe_deadline: Option<Instant> = None;
         let mut watching_shutdown = true;
         while exited.is_none() || stdout_open {
             let running = exited.is_none() && stop.is_none();
+            let escalation = stopping.due().filter(|_| exited.is_none());
             tokio::select! {
                 line = lines.recv(), if stdout_open => match line {
                     Some(line) => {
@@ -331,11 +391,14 @@ impl Session for ClaudeCli {
                 },
                 () = sleep_until(deadline), if running => {
                     stop = Some(Stop::Timeout(limits.timeout));
-                    signal_group(group, libc::SIGTERM);
+                    stopping.begin();
                 }
                 () = sleep_until(last_event + limits.idle_timeout), if running => {
                     stop = Some(Stop::Idle(limits.idle_timeout));
-                    signal_group(group, libc::SIGTERM);
+                    stopping.begin();
+                }
+                () = sleep_until(escalation.unwrap_or_else(Instant::now)), if escalation.is_some() => {
+                    stopping.escalate();
                 }
                 status = child.wait(), if exited.is_none() => {
                     exited = Some(match status {
@@ -360,11 +423,11 @@ impl Session for ClaudeCli {
                         Shutdown::Run => {}
                         Shutdown::Graceful => {
                             stop.get_or_insert(Stop::Interrupted);
-                            signal_group(group, libc::SIGTERM);
+                            stopping.begin();
                         }
                         Shutdown::Force => {
                             stop.get_or_insert(Stop::Interrupted);
-                            signal_group(group, libc::SIGKILL);
+                            stopping.kill();
                         }
                     }
                 }

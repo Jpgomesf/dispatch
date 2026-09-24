@@ -368,8 +368,8 @@ async fn cmd_card<S: Session>(runner: Runner<S>, card_ref: &str, workspace: Opti
     }
 }
 
-/// First SIGINT/SIGTERM: start nothing new and SIGTERM running sessions. Second: SIGKILL
-/// them. Third: exit immediately.
+/// First SIGINT/SIGTERM: start nothing new and end running sessions with the stop sequence
+/// (SIGINT, SIGTERM, SIGKILL). Second: SIGKILL them. Third: exit immediately.
 fn install_signal_handlers(shutdown: Arc<watch::Sender<Shutdown>>) {
     let (Ok(mut interrupt), Ok(mut terminate)) = (
         signal(SignalKind::interrupt()),
