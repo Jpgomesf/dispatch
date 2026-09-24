@@ -1,13 +1,13 @@
 .PHONY: lint typecheck test check
 
 lint:
-	uv run --extra dev ruff check .
-	uv run --extra dev ruff format --check .
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
 
 typecheck:
-	uv run --extra dev mypy
+	cargo check --all-targets
 
 test:
-	uv run --extra dev pytest -q
+	cargo test
 
 check: lint typecheck test

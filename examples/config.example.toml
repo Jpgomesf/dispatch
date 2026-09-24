@@ -1,17 +1,19 @@
 # Copy to ~/.config/claude-harness/config.toml and replace every placeholder.
 outreach_file = "~/.config/claude-harness/outreach.md"   # optional, default shown
+# state_dir = "~/.local/state/claude-harness"            # optional, default shown
 
 [heartbeat]
 interval = "10m"          # parsed duration: s/m/h
 model = "sonnet"
 effort = "medium"
 max_budget_usd = 1.0      # per tick
-max_cards_per_tick = 1
+max_cards_per_tick = 1    # new cards queued per triage
 
 [card]
 model = "claude-opus-5-5"
 effort = "high"
 max_budget_usd = 20.0     # per card
+max_parallel = 2          # card sessions at once; each card gets its own git worktree
 
 [sources]                 # what the heartbeat watches; free-form strings the skill interprets
 slack_channels = ["C0000000000"]
@@ -23,12 +25,5 @@ name = "example-app"
 path = "~/code/example-app"
 match = ["EX-", "example-app"]
 
-[send]
-mode = "allowlist"        # all | allowlist | draft_only
-slack_channels = ["C0000000000"]
-slack_users = ["U0000000000"]
-email_domains = []        # e.g. ["example.com"]
-max_per_hour = 6
-
-[tools]
-deny = []                 # extra tool names/prefixes the runner always denies
+# Who may be messaged is not configured here: use Claude Code permission rules
+# (e.g. deny "mcp__*__send_message") and your outreach.md. See docs/machine-setup.md.

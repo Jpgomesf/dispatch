@@ -56,8 +56,9 @@ all open questions for the same person.
 ## 4. Send, and handle denial
 
 Use the messaging tools available (discover them; do not assume a vendor). The
-runner enforces the send policy. If a send is denied with **"Not allowed to send
-here — create a draft instead."**:
+user's Claude Code permission rules (and any hooks they configured) decide which
+sends are allowed. If a send is denied — a permission denial or a hook blocking
+the call, whatever its wording:
 
 - create the same message with the equivalent draft tool (Slack
   `slack_send_message_draft`, Gmail `create_draft`, or the tool's draft variant);
