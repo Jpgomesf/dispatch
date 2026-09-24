@@ -22,7 +22,7 @@ use crate::results::{
     discussion_schema, triage_schema,
 };
 use crate::session::{
-    Control, Ended, Mode, Notice, Session, SessionReport, SessionRequest, Shutdown,
+    Control, Ended, Limits, Mode, Notice, Session, SessionReport, SessionRequest, Shutdown,
 };
 use crate::state::{CardState, CardStatus};
 use crate::store::{AttemptEnd, CLAIM_LEASE, CLAIM_RENEW, Claim, Store};
@@ -185,6 +185,19 @@ impl<S: Session> Runner<S> {
         self.paths.state_dir.clone()
     }
 
+    /// The mode's wall-clock timeout and the shared session limits.
+    fn limits(&self, mode: Mode) -> Limits {
+        let timeout = match mode {
+            Mode::Triage => self.config.triage.timeout,
+            Mode::Card => self.config.card.timeout,
+            Mode::Discussion => self.config.discussion.timeout,
+        };
+        Limits {
+            timeout,
+            idle_timeout: self.config.sessions.idle_timeout,
+        }
+    }
+
     fn request(
         &self,
         mode: Mode,
@@ -194,6 +207,7 @@ impl<S: Session> Runner<S> {
         output_schema: serde_json::Value,
     ) -> SessionRequest {
         SessionRequest {
+            limits: self.limits(mode),
             mode,
             prompt,
             model: model.to_string(),

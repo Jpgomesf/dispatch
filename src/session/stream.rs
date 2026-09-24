@@ -3,15 +3,22 @@
 //! with a `result` event carrying `subtype`, `is_error`, `structured_output` and
 //! `total_cost_usd`. Pure logic, so it is tested with scripted lines.
 
+use std::time::Duration;
+
 use serde_json::Value;
 
 use super::{Ended, Notice, SessionReport};
+use crate::durations::format_duration;
 
 /// Why the runner stopped a session before it ended by itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stop {
     /// Kill switch or signal.
     Interrupted,
+    /// The wall-clock limit passed.
+    Timeout(Duration),
+    /// No stream event for this long.
+    Idle(Duration),
 }
 
 /// What one line changed.
@@ -67,8 +74,15 @@ impl Stream {
         if let Some(output) = self.result.as_ref().and_then(valid_output) {
             return Ended::Output(output.clone());
         }
-        if let Some(Stop::Interrupted) = stop {
-            return Ended::Interrupted;
+        match stop {
+            Some(Stop::Interrupted) => return Ended::Interrupted,
+            Some(Stop::Timeout(limit)) => {
+                return Ended::Timeout(format!("no result within {}", format_duration(limit)));
+            }
+            Some(Stop::Idle(limit)) => {
+                return Ended::Stuck(format!("no stream event for {}", format_duration(limit)));
+            }
+            None => {}
         }
         match &self.result {
             Some(result) if is_error(result) => Ended::ApiError(error_detail(result)),
@@ -208,6 +222,28 @@ mod tests {
         assert!(
             matches!(finished.ended, Ended::Output(_)),
             "a finished result wins over the stop"
+        );
+    }
+
+    #[test]
+    fn limits_end_as_timeout_or_stuck() {
+        let hours = Duration::from_secs(3 * 3600);
+        assert_eq!(
+            run(&[init()], Some(Stop::Timeout(hours))).ended,
+            Ended::Timeout("no result within 3h".into())
+        );
+        let idle = Duration::from_secs(15 * 60);
+        assert_eq!(
+            run(&[init()], Some(Stop::Idle(idle))).ended,
+            Ended::Stuck("no stream event for 15m".into())
+        );
+        let error = result(json!({"is_error": true, "structured_output": null}));
+        assert!(
+            matches!(
+                run(&[init(), error], Some(Stop::Timeout(hours))).ended,
+                Ended::Timeout(_)
+            ),
+            "the stop explains a result the stop itself caused"
         );
     }
 }

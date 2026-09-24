@@ -293,6 +293,38 @@ async fn every_session_is_recorded_as_an_attempt() {
 }
 
 #[tokio::test]
+async fn each_mode_gets_its_timeout_and_the_shared_idle_limit() {
+    let mut env = test_env();
+    env.config.triage.timeout = MINUTE * 20;
+    env.config.card.timeout = MINUTE * 180;
+    env.config.discussion.timeout = MINUTE * 60;
+    env.config.sessions.idle_timeout = MINUTE * 15;
+    let session = FakeSession::sequence(vec![
+        ok(triage_output(&[])),
+        ok(card_output("EX-1", "done")),
+        ok(discussion_output("EX-9", "replied")),
+    ]);
+    let (runner, _) = make_runner(&env, session);
+    runner.triage(vec![]).await.unwrap();
+    runner.run_card("EX-1", None).await.unwrap().unwrap();
+    runner.run_discussion(discussion("t1")).await.unwrap();
+    let timeouts: Vec<(Duration, Duration)> = runner
+        .session()
+        .calls()
+        .iter()
+        .map(|c| (c.request.limits.timeout, c.request.limits.idle_timeout))
+        .collect();
+    assert_eq!(
+        timeouts,
+        [
+            (MINUTE * 20, MINUTE * 15),
+            (MINUTE * 180, MINUTE * 15),
+            (MINUTE * 60, MINUTE * 15)
+        ]
+    );
+}
+
+#[tokio::test]
 async fn recover_closes_attempts_a_stopped_runner_left_open() {
     let env = test_env();
     let (runner, _) = make_runner(&env, FakeSession::sequence(vec![]));

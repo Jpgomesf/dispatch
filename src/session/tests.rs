@@ -17,6 +17,20 @@ fn request() -> SessionRequest {
         cwd: PathBuf::from("/tmp/example/state"),
         plugin_dir: Some(PathBuf::from("/tmp/example/plugin")),
         output_schema: json!({"type": "object"}),
+        limits: Limits {
+            timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(10),
+        },
+    }
+}
+
+fn limited(dir: &Path, timeout: u64, idle_timeout: u64) -> SessionRequest {
+    SessionRequest {
+        limits: Limits {
+            timeout: Duration::from_millis(timeout),
+            idle_timeout: Duration::from_millis(idle_timeout),
+        },
+        ..in_dir(dir)
     }
 }
 
@@ -226,6 +240,51 @@ async fn graceful_shutdown_terminates_the_whole_process_group() {
         !is_alive(read_pid(&pid_file)),
         "background sleep was left running"
     );
+}
+
+#[tokio::test]
+async fn the_wall_clock_timeout_ends_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    // Busy with events all along: only the wall clock can end it.
+    let body = format!(
+        "{}\nwhile true; do echo '{{\"type\":\"system\"}}'; sleep 0.05; done",
+        print(&[init_line()])
+    );
+    let cli = fake_cli(dir.path(), &body);
+    let (control, _shutdown, _notices) = new_control();
+    let report = timeout(
+        Duration::from_secs(5),
+        cli.run(limited(dir.path(), 1_500, 10_000), control),
+    )
+    .await
+    .expect("ended by the timeout");
+    assert!(matches!(report.ended, Ended::Timeout(_)), "{report:?}");
+    assert_eq!(report.session_id.as_deref(), Some("session-example"));
+}
+
+#[tokio::test]
+async fn the_watchdog_ends_a_silent_session_and_events_keep_one_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let silent = format!("{}\nsleep 30", print(&[init_line()]));
+    let cli = fake_cli(dir.path(), &silent);
+    let (control, _shutdown, _notices) = new_control();
+    let report = timeout(
+        Duration::from_secs(5),
+        cli.run(limited(dir.path(), 10_000, 300), control),
+    )
+    .await
+    .expect("ended by the watchdog");
+    assert!(matches!(report.ended, Ended::Stuck(_)), "{report:?}");
+
+    // Six events 500ms apart outlast a 2s idle limit only because each resets it.
+    let chatty = format!(
+        "for i in 1 2 3 4 5 6; do echo '{{\"type\":\"system\"}}'; sleep 0.5; done\n{}",
+        print(&[result_line(json!({}))])
+    );
+    let cli = fake_cli(dir.path(), &chatty);
+    let (control, _shutdown, _notices) = new_control();
+    let report = cli.run(limited(dir.path(), 10_000, 2_000), control).await;
+    assert_eq!(report.ended, Ended::Output(json!({"summary": "ok"})));
 }
 
 #[tokio::test]

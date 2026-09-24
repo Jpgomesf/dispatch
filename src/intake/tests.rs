@@ -143,7 +143,9 @@ async fn linear_idles_until_its_key_appears() {
         .cursor("example-app", "intake:linear:work")
         .unwrap()
         .unwrap();
-    assert_eq!(cursor, "2026-01-15T09:30:00.000Z");
+    // The clock follows real time here: "now", give or take a busy test machine.
+    let cursor = crate::store::parse_time(&cursor).unwrap();
+    assert!((cursor - now()).num_seconds() < 5, "{cursor}");
 
     assert_eq!(poll_once(&ctx, SourceKind::Linear).await, Ok(1));
     assert_eq!(

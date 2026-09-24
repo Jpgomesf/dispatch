@@ -54,6 +54,16 @@ pub struct SessionRequest {
     /// Passed as `--plugin-dir` when set.
     pub plugin_dir: Option<PathBuf>,
     pub output_schema: Value,
+    pub limits: Limits,
+}
+
+/// What keeps a session bounded; the runner ends it gracefully past either limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limits {
+    /// Wall-clock limit (start-to-close).
+    pub timeout: Duration,
+    /// No stream event for this long means the session is stuck.
+    pub idle_timeout: Duration,
 }
 
 /// How a session ended, judged from the stream and the process, never from what the agent
@@ -68,6 +78,10 @@ pub enum Ended {
     InvalidOutput(String),
     /// The process ended without a `result`.
     Crash(String),
+    /// Stopped at the wall-clock timeout.
+    Timeout(String),
+    /// Stopped by the inactivity watchdog.
+    Stuck(String),
     /// Stopped by the kill switch or a signal.
     Interrupted,
 }
@@ -77,9 +91,11 @@ impl Ended {
     pub fn output(&self) -> Result<Value, String> {
         match self {
             Ended::Output(output) => Ok(output.clone()),
-            Ended::ApiError(detail) | Ended::InvalidOutput(detail) | Ended::Crash(detail) => {
-                Err(detail.clone())
-            }
+            Ended::ApiError(detail)
+            | Ended::InvalidOutput(detail)
+            | Ended::Crash(detail)
+            | Ended::Timeout(detail)
+            | Ended::Stuck(detail) => Err(detail.clone()),
             Ended::Interrupted => Err(INTERRUPTED.into()),
         }
     }
@@ -292,6 +308,9 @@ impl Session for ClaudeCli {
         let (mut lines, read_out) = read_lines(stdout);
         let (stderr, mut read_err) = drain(stderr);
 
+        let limits = &request.limits;
+        let deadline = Instant::now() + limits.timeout;
+        let mut last_event = Instant::now();
         let mut stream = Stream::default();
         let mut stop = None;
         let mut exited: Option<String> = None;
@@ -299,15 +318,25 @@ impl Session for ClaudeCli {
         let mut pipe_deadline: Option<Instant> = None;
         let mut watching_shutdown = true;
         while exited.is_none() || stdout_open {
+            let running = exited.is_none() && stop.is_none();
             tokio::select! {
                 line = lines.recv(), if stdout_open => match line {
                     Some(line) => {
+                        last_event = Instant::now();
                         if let Some(notice) = stream.observe(&line).notice {
                             let _ = notices.send(notice);
                         }
                     }
                     None => stdout_open = false,
                 },
+                () = sleep_until(deadline), if running => {
+                    stop = Some(Stop::Timeout(limits.timeout));
+                    signal_group(group, libc::SIGTERM);
+                }
+                () = sleep_until(last_event + limits.idle_timeout), if running => {
+                    stop = Some(Stop::Idle(limits.idle_timeout));
+                    signal_group(group, libc::SIGTERM);
+                }
                 status = child.wait(), if exited.is_none() => {
                     exited = Some(match status {
                         Ok(status) => status.to_string(),
@@ -330,11 +359,11 @@ impl Session for ClaudeCli {
                     match level {
                         Shutdown::Run => {}
                         Shutdown::Graceful => {
-                            stop = Some(Stop::Interrupted);
+                            stop.get_or_insert(Stop::Interrupted);
                             signal_group(group, libc::SIGTERM);
                         }
                         Shutdown::Force => {
-                            stop = Some(Stop::Interrupted);
+                            stop.get_or_insert(Stop::Interrupted);
                             signal_group(group, libc::SIGKILL);
                         }
                     }

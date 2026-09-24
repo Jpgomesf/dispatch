@@ -24,6 +24,19 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs_f64(value * seconds_per_unit))
 }
 
+/// The largest whole unit: `3h`, `15m`, `90s` (sub-second parts are dropped).
+#[must_use]
+pub fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds > 0 && seconds.is_multiple_of(3600) {
+        format!("{}h", seconds / 3600)
+    } else if seconds > 0 && seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// `\d+(\.\d+)?`
 fn is_decimal(text: &str) -> bool {
     let mut parts = text.split('.');
@@ -57,6 +70,14 @@ mod tests {
                 Ok(Duration::from_secs_f64(seconds)),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn formats_in_the_largest_whole_unit() {
+        let cases = [(10_800, "3h"), (900, "15m"), (90, "90s"), (0, "0s")];
+        for (seconds, text) in cases {
+            assert_eq!(format_duration(Duration::from_secs(seconds)), text);
         }
     }
 

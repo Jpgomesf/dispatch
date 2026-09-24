@@ -57,6 +57,9 @@ pub struct TriageConfig {
     pub effort: Effort,
     pub max_budget_usd: f64,
     pub max_cards_per_tick: u32,
+    /// Wall-clock limit of one triage session.
+    #[serde(deserialize_with = "duration_from_str")]
+    pub timeout: Duration,
     pub objective: String,
 }
 
@@ -68,6 +71,7 @@ impl Default for TriageConfig {
             effort: Effort::Medium,
             max_budget_usd: 1.0,
             max_cards_per_tick: 1,
+            timeout: Duration::from_secs(20 * 60),
             objective: TRIAGE_OBJECTIVE.into(),
         }
     }
@@ -82,6 +86,9 @@ pub struct CardConfig {
     pub max_budget_usd: f64,
     /// Card and discussion sessions running at the same time under `heartbeat`.
     pub max_parallel: u32,
+    /// Wall-clock limit of one card attempt.
+    #[serde(deserialize_with = "duration_from_str")]
+    pub timeout: Duration,
     /// `{ref}` is replaced by the card ref.
     pub objective: String,
 }
@@ -93,6 +100,7 @@ impl Default for CardConfig {
             effort: Effort::High,
             max_budget_usd: 20.0,
             max_parallel: 2,
+            timeout: Duration::from_secs(3 * 60 * 60),
             objective: CARD_OBJECTIVE.into(),
         }
     }
@@ -102,6 +110,9 @@ impl Default for CardConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DiscussionConfig {
+    /// Wall-clock limit of one discussion session.
+    #[serde(deserialize_with = "duration_from_str")]
+    pub timeout: Duration,
     /// `{ref}` is replaced by the discussion ref.
     pub objective: String,
 }
@@ -109,7 +120,25 @@ pub struct DiscussionConfig {
 impl Default for DiscussionConfig {
     fn default() -> Self {
         Self {
+            timeout: Duration::from_secs(60 * 60),
             objective: DISCUSSION_OBJECTIVE.into(),
+        }
+    }
+}
+
+/// Limits every session shares.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SessionsConfig {
+    /// No stream event for this long means the session is stuck.
+    #[serde(deserialize_with = "duration_from_str")]
+    pub idle_timeout: Duration,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -156,6 +185,7 @@ pub struct Config {
     pub triage: TriageConfig,
     pub card: CardConfig,
     pub discussion: DiscussionConfig,
+    pub sessions: SessionsConfig,
     pub sources: SourcesConfig,
     pub intake: IntakeConfig,
     pub workspaces: Vec<Workspace>,
@@ -171,6 +201,7 @@ impl Default for Config {
             triage: TriageConfig::default(),
             card: CardConfig::default(),
             discussion: DiscussionConfig::default(),
+            sessions: SessionsConfig::default(),
             sources: SourcesConfig::default(),
             intake: IntakeConfig::default(),
             workspaces: Vec::new(),
@@ -337,6 +368,11 @@ match = ["EX-"]
                 .objective
                 .contains("discussion about {ref}")
         );
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(config.triage.timeout, minutes(20));
+        assert_eq!(config.card.timeout, minutes(180));
+        assert_eq!(config.discussion.timeout, minutes(60));
+        assert_eq!(config.sessions.idle_timeout, minutes(15));
         assert_eq!(
             config.state_dir,
             expand_user(Path::new("~/.local/state/dispatch"))
@@ -392,6 +428,10 @@ match = ["EX-"]
             "[card]\nobjective = \"  \"",
             "[discussion]\nobjective = \"\"",
             "[discussion]\nmodel = \"sonnet\"",
+            "[discussion]\ntimeout = \"soon\"",
+            "[card]\ntimeout = \"0s\"",
+            "[sessions]\nidle_timeout = \"-1m\"",
+            "[sessions]\nunknown = 1",
         ] {
             let raw = format!("name = \"example-app\"\n{body}");
             assert!(Config::from_toml(&raw).is_err(), "{raw}");
@@ -443,6 +483,17 @@ jql = "project = EX"
         assert_eq!(intake.linear.projects, ["Example App"]);
         assert_eq!(intake.linear.api_url, LINEAR_API_URL);
         assert_eq!(intake.jira.jql, "project = EX");
+    }
+
+    #[test]
+    fn session_limits_are_configurable() {
+        let raw = "name = \"ex\"\n[triage]\ntimeout = \"5m\"\n[card]\ntimeout = \"2h\"\n\
+                   [discussion]\ntimeout = \"30m\"\n[sessions]\nidle_timeout = \"10m\"\n";
+        let config = Config::from_toml(raw).unwrap();
+        assert_eq!(config.triage.timeout, Duration::from_secs(300));
+        assert_eq!(config.card.timeout, Duration::from_secs(7200));
+        assert_eq!(config.discussion.timeout, Duration::from_secs(1800));
+        assert_eq!(config.sessions.idle_timeout, Duration::from_secs(600));
     }
 
     #[test]
