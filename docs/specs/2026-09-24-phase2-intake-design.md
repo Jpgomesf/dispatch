@@ -93,6 +93,27 @@ Enforcement:
 - Skill (soft): `discussion` events never go into `cards_to_work`; the skill may
   offer to take the ticket if it gets assigned.
 
+## Taking part in discussions (the harness must not get in the way)
+
+The assignee rule gates *doing work* (branch, code, PR), never *talking*.
+
+- Mentions of me and direct replies to me bypass `allow_senders` and every
+  other intake filter.
+- The runner never gates replies or comments; only the skill and the user's
+  Claude Code permissions decide whether a reply is sent or drafted.
+- Discussion events are keyed per comment/message, so follow-ups in the same
+  thread are new events, never deduplicated away.
+- Triage may return `discussions_to_run: [{ "ref": str, "thread": str, "question": str }]`
+  for mentions that need investigation. The runner starts a **discussion session**
+  per item: `[card]` model/effort/budget, a detached worktree of the matching
+  workspace (read, run, test), JSON context `{now, runner, ref, thread, question,
+  workspace, workspaces, outreach_file}`, prompt
+  `/claude-harness:workflow discussion <ref>`. It never creates a branch, commits
+  or opens a PR; it ends by replying (or drafting) through `outreach` and returns
+  `DiscussionResult { ref, status: replied|drafted|skipped|failed, summary }`.
+- Discussion sessions share `max_parallel` with cards and are claimed with
+  `discussion:<source>:<comment id>`.
+
 ## Store: `harness.db` (SQLite, machine-wide)
 
 One file shared by every runner on the machine: `~/.local/state/claude-harness/harness.db`
