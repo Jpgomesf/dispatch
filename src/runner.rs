@@ -1,6 +1,7 @@
 //! Sessions: triage, cards and discussions, each one `claude` process. Scheduling (when they
 //! start, batching of intake events, parallelism) lives in `dispatch`.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::pin;
@@ -15,7 +16,7 @@ use crate::config::{Config, Effort, UnknownWorkspace, Workspace};
 use crate::intake::secrets::{EnvLookup, Secrets, process_env};
 use crate::intake::{CardScope, Event, IntakeContext, card_scope};
 use crate::paths::Paths;
-use crate::prompts::{card_prompt, discussion_prompt, triage_prompt};
+use crate::prompts::{INTAKE_CURSOR_PREFIX, card_prompt, discussion_prompt, triage_prompt};
 use crate::results::{
     CardOutcome, CardResult, DiscussionResult, DiscussionToRun, TriageResult, card_schema,
     discussion_schema, triage_schema,
@@ -76,12 +77,6 @@ impl From<CardOutcome> for CardStatus {
             CardOutcome::Failed => CardStatus::Failed,
         }
     }
-}
-
-/// A triage session's outcome and the events it was given (empty for a sweep).
-pub struct Triaged {
-    pub result: Option<TriageResult>,
-    pub events: Vec<i64>,
 }
 
 impl<S: Session> Runner<S> {
@@ -482,9 +477,8 @@ impl<S: Session> Runner<S> {
 
     /// One triage session over `events` (empty: a fallback sweep). Cursors are persisted as
     /// soon as it returns.
-    pub async fn triage(&self, events: Vec<Event>) -> Triaged {
-        let ids = events.iter().map(|e| e.id).collect();
-        let result = match self.try_triage(&events).await {
+    pub async fn triage(&self, events: Vec<Event>) -> Option<TriageResult> {
+        match self.try_triage(&events).await {
             Ok((result, cost_usd)) => {
                 let detail = format!(
                     "events={} handled={} cards={} discussions={}{} — {}",
@@ -502,10 +496,6 @@ impl<S: Session> Runner<S> {
                 self.emit("triage", "failed", &one_line(&error));
                 None
             }
-        };
-        Triaged {
-            result,
-            events: ids,
         }
     }
 
@@ -537,11 +527,26 @@ impl<S: Session> Runner<S> {
             .map_err(|e| e.0)?;
         let result: TriageResult = serde_json::from_value(outcome.output)
             .map_err(|e| format!("invalid triage result: {e}"))?;
-        let (runner, cursors) = (self.name().to_string(), result.cursors.clone());
-        self.store
+        // The pollers' own cursors are never the skill's to change.
+        let cursors: BTreeMap<String, String> = result
+            .cursors
+            .iter()
+            .filter(|(key, _)| !key.starts_with(INTAKE_CURSOR_PREFIX))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let runner = self.name().to_string();
+        let saved = self
+            .store
             .call(move |s| s.set_cursors(&runner, &cursors))
-            .await
-            .map_err(|e| format!("store: {e}"))?;
+            .await;
+        // The session already acted (maybe replied); failing the batch would repeat that.
+        if let Err(error) = saved {
+            self.emit(
+                "triage",
+                "failed",
+                &one_line(&format!("cursors not saved — store: {error}")),
+            );
+        }
         Ok((result, outcome.cost_usd))
     }
 

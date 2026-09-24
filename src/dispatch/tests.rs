@@ -221,7 +221,7 @@ async fn respects_max_cards_and_skips_in_progress() {
 async fn failed_triage_reports_failure() {
     let env = test_env();
     let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![fail("budget exceeded")]));
-    assert!(runner.triage(vec![]).await.result.is_none());
+    assert!(runner.triage(vec![]).await.is_none());
     assert!(lines_of(&lines)[0].contains("triage failed budget exceeded"));
 }
 
@@ -230,7 +230,7 @@ async fn invalid_structured_output_is_a_failure() {
     let env = test_env();
     let session = FakeSession::sequence(vec![ok(json!({"unexpected": true}))]);
     let (runner, lines) = make_runner(&env, session);
-    assert!(runner.triage(vec![]).await.result.is_none());
+    assert!(runner.triage(vec![]).await.is_none());
     assert!(lines_of(&lines)[0].contains("triage failed invalid triage result"));
 }
 
@@ -673,4 +673,61 @@ async fn discussions_share_max_parallel_with_cards() {
             .iter()
             .any(|l| l.contains("discussion drafted EX-9"))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicked_triage_returns_its_events_to_new() {
+    let env = test_env();
+    let session = FakeSession::new(|_| panic!("triage task blew up"));
+    let (runner, _) = make_runner(&env, session);
+    let store = env.store();
+    let Ok(crate::store::Enqueued::Inserted(id)) =
+        store.enqueue("example-app", &manual_event("1"), now())
+    else {
+        panic!("not inserted");
+    };
+    runner.heartbeat(TEN_MINUTES, true).await;
+    assert_eq!(store.event_status(id).unwrap().as_deref(), Some("new"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_card_that_ends_without_a_status_keeps_holding_its_dependents() {
+    let mut env = test_env();
+    env.config.triage.max_cards_per_tick = 5;
+    let triage = triage_output(&[("EX-1", &[]), ("EX-2", &["EX-1"])]);
+    let session = FakeSession::routed(vec![ok(triage)], |r| ok(card_output(r, "done")));
+    let (runner, lines) = make_runner(&env, session);
+    // Another runner works EX-1: this runner skips it and records nothing.
+    env.store()
+        .claim("card:EX-1", "other-app", now(), crate::store::CLAIM_LEASE)
+        .unwrap();
+    runner.schedule(TEN_MINUTES, true).await;
+    assert!(runner.session().card_call("EX-1").is_none());
+    assert!(
+        runner.session().card_call("EX-2").is_none(),
+        "EX-1 is not done: {:?}",
+        lines_of(&lines)
+    );
+    assert!(
+        lines_of(&lines)
+            .iter()
+            .any(|l| l.contains("card skipped EX-1 — held by other-app"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn triage_cannot_overwrite_intake_cursors() {
+    let env = test_env();
+    let mut triage = triage_output(&[]);
+    triage["cursors"] = json!({"intake:linear:work": "rewound", "slack:C0000000001": "c2"});
+    let (runner, _) = make_runner(&env, FakeSession::sequence(vec![ok(triage)]));
+    let seeded = std::collections::BTreeMap::from([(
+        "intake:linear:work".to_string(),
+        "2026-01-15T09:30:00.000Z".to_string(),
+    )]);
+    runner.store().set_cursors(runner.name(), &seeded).unwrap();
+    runner.heartbeat(TEN_MINUTES, true).await;
+    let cursors = runner.store().load_state(runner.name()).unwrap().cursors;
+    assert_eq!(cursors["intake:linear:work"], "2026-01-15T09:30:00.000Z");
+    assert_eq!(cursors["slack:C0000000001"], "c2");
 }

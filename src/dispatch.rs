@@ -9,8 +9,9 @@ use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::intake;
+use crate::results::TriageResult;
 use crate::results::{CardToWork, DiscussionToRun};
-use crate::runner::{Runner, Triaged, one_line};
+use crate::runner::{Runner, one_line};
 use crate::session::Session;
 use crate::state::{CardStatus, State};
 
@@ -49,7 +50,8 @@ async fn wait_triage<T>(handle: &mut Option<JoinHandle<T>>) -> Result<T, JoinErr
 }
 
 enum Wake {
-    Triaged(Option<Triaged>),
+    /// `None`: the triage failed or its task panicked.
+    Triaged(Option<TriageResult>),
     SessionDone(Id),
     Tick,
 }
@@ -90,7 +92,12 @@ struct Loop {
     discussions: VecDeque<DiscussionToRun>,
     sessions: JoinSet<()>,
     running: HashMap<Id, Slot>,
-    triage: Option<JoinHandle<Triaged>>,
+    triage: Option<JoinHandle<Option<TriageResult>>>,
+    /// Event ids handed to the running triage; finished from here whatever the task returns.
+    in_flight: Vec<i64>,
+    /// Every card started in this loop. One that ended without a recorded status (refused,
+    /// held by another runner) keeps holding its dependents instead of looking external.
+    started_cards: HashSet<String>,
     triaged: bool,
     sweep_failures: u32,
     next_sweep: Instant,
@@ -213,6 +220,7 @@ impl<S: Session> Runner<S> {
                 Slot::Card(card_ref) => Some(card_ref.clone()),
                 Slot::Discussion(_) => None,
             }))
+            .chain(work.started_cards.iter().cloned())
             .collect();
         let mut index = 0;
         while index < work.queue.len() && work.running.len() < max_parallel {
@@ -224,6 +232,7 @@ impl<S: Session> Runner<S> {
             let workspace = self.config.workspace_for(&card.card_ref).cloned();
             let me = self.clone();
             let card_ref = card.card_ref.clone();
+            work.started_cards.insert(card_ref.clone());
             let handle = work.sessions.spawn(async move {
                 me.run_card_in(&card.card_ref, workspace, &card.blocked_by)
                     .await;
@@ -246,8 +255,9 @@ impl<S: Session> Runner<S> {
             match self.store().call(move |s| s.take_batch(&runner)).await {
                 Ok(events) => events,
                 Err(error) => {
+                    // The window reopens on a later tick; a due sweep still runs now.
                     self.emit("triage", "failed", &one_line(&format!("store: {error}")));
-                    return;
+                    Vec::new()
                 }
             }
         } else {
@@ -256,19 +266,33 @@ impl<S: Session> Runner<S> {
         if events.is_empty() && !sweep_due {
             return;
         }
+        work.in_flight = events.iter().map(|e| e.id).collect();
         let me = self.clone();
         work.triage = Some(tokio::spawn(async move { me.triage(events).await }));
     }
 
-    async fn finish_triage(&self, work: &mut Loop, triaged: Option<Triaged>, interval: Duration) {
+    /// Batched events become `done` on success, else go back to `new`. A store failure leaves
+    /// them `batched` until the next start (`recover`), with one line.
+    async fn finish_events(&self, ids: Vec<i64>, succeeded: bool) {
+        let runner = self.name().to_string();
+        let finished = self
+            .store()
+            .call(move |s| s.finish_batch(&runner, &ids, succeeded))
+            .await;
+        if let Err(error) = finished {
+            self.emit("triage", "failed", &one_line(&format!("store: {error}")));
+        }
+    }
+
+    async fn finish_triage(
+        &self,
+        work: &mut Loop,
+        result: Option<TriageResult>,
+        interval: Duration,
+    ) {
         work.triage = None;
         work.triaged = true;
-        let Some(Triaged { result, events }) = triaged else {
-            // The triage task panicked; treat it as a failed sweep.
-            work.sweep_failures += 1;
-            work.next_sweep = Instant::now() + backoff_delay(work.sweep_failures, interval);
-            return;
-        };
+        let events = std::mem::take(&mut work.in_flight);
         let succeeded = result.is_some();
         if events.is_empty() {
             work.sweep_failures = if succeeded {
@@ -280,14 +304,7 @@ impl<S: Session> Runner<S> {
         } else {
             // Every batched event is done once triage succeeds, whether or not `handled`
             // names it (a discussion it started is enough); on failure all go back to `new`.
-            let runner = self.name().to_string();
-            let finished = self
-                .store()
-                .call(move |s| s.finish_batch(&runner, &events, succeeded))
-                .await;
-            if let Err(error) = finished {
-                self.emit("triage", "failed", &one_line(&format!("store: {error}")));
-            }
+            self.finish_events(events, succeeded).await;
             let batching = &mut work.batching;
             batching.failures = if succeeded { 0 } else { batching.failures + 1 };
             batching.retry_at =
@@ -324,6 +341,8 @@ impl<S: Session> Runner<S> {
             sessions: JoinSet::new(),
             running: HashMap::new(),
             triage: None,
+            in_flight: Vec::new(),
+            started_cards: HashSet::new(),
             triaged: false,
             sweep_failures: 0,
             next_sweep: Instant::now(),
@@ -363,7 +382,7 @@ impl<S: Session> Runner<S> {
             let triage_idle = work.triage.is_none() && triage_allowed;
             let window = work.batching.window_closes;
             let event = tokio::select! {
-                joined = wait_triage(&mut work.triage) => Wake::Triaged(joined.ok()),
+                joined = wait_triage(&mut work.triage) => Wake::Triaged(joined.ok().flatten()),
                 Some(done) = work.sessions.join_next_with_id(), if !work.sessions.is_empty() => {
                     Wake::SessionDone(match done {
                         Ok((id, ())) => id,
@@ -377,7 +396,7 @@ impl<S: Session> Runner<S> {
                 _ = shutdown.changed() => Wake::Tick,
             };
             match event {
-                Wake::Triaged(triaged) => self.finish_triage(&mut work, triaged, interval).await,
+                Wake::Triaged(result) => self.finish_triage(&mut work, result, interval).await,
                 Wake::SessionDone(id) => {
                     work.running.remove(&id);
                 }
@@ -386,16 +405,12 @@ impl<S: Session> Runner<S> {
         }
 
         sources.abort_all();
-        if let Some(handle) = work.triage.take()
-            && let Ok(triaged) = handle.await
-            && !triaged.events.is_empty()
-        {
-            let (runner, ids) = (self.name().to_string(), triaged.events);
-            let succeeded = triaged.result.is_some();
-            let _ = self
-                .store()
-                .call(move |s| s.finish_batch(&runner, &ids, succeeded))
-                .await;
+        if let Some(handle) = work.triage.take() {
+            let succeeded = handle.await.is_ok_and(|result| result.is_some());
+            let ids = std::mem::take(&mut work.in_flight);
+            if !ids.is_empty() {
+                self.finish_events(ids, succeeded).await;
+            }
         }
         while work.sessions.join_next().await.is_some() {}
         if self.killed() {
