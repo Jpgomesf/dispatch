@@ -6,7 +6,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 use crate::config::SLACK_APP_ID;
-use crate::intake::notifications::tests::{fixture_db, fixture_plist};
+use crate::intake::notifications::tests::{fixture_db, fixture_plist, insert_record};
 use crate::intake::secrets::tests::write_secrets;
 use crate::testing::{TestEnv, now, test_env, tokio_clock};
 
@@ -223,20 +223,17 @@ async fn notifications_are_stored_and_wake_the_dispatcher() {
 
     let conn = rusqlite::Connection::open(&env.paths.notifications_db).unwrap();
     let data = fixture_plist("Example Person", Some("#example-channel"), "second");
-    conn.execute(
-        "INSERT INTO record (rec_id, app_id, data) VALUES (2, 1, ?1)",
-        [data],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO record (rec_id, app_id, data) VALUES (3, 1, x'00')",
-        [],
-    )
-    .unwrap();
+    insert_record(&conn, 2, 2, SLACK_APP_ID, &data, 2.0);
+    insert_record(&conn, 3, 3, SLACK_APP_ID, b"\x00", 3.0);
     assert_eq!(poll_once(&ctx, SourceKind::Notifications).await, Ok(1));
     tokio::time::timeout(Duration::from_secs(1), ctx.wake.notified())
         .await
         .expect("dispatcher woken");
+    assert_eq!(
+        poll_once(&ctx, SourceKind::Notifications).await,
+        Ok(0),
+        "nothing new"
+    );
     let lines = lines.lock().unwrap().clone();
     assert_eq!(lines.len(), 1);
     assert!(

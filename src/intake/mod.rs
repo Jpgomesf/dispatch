@@ -249,10 +249,10 @@ async fn poll_jira(ctx: &IntakeContext, secrets: &Secrets) -> Result<Batch, Poll
 }
 
 async fn poll_notifications(ctx: &IntakeContext) -> Result<Batch, PollError> {
-    let key = cursor_key(SourceKind::Notifications, "rec_id");
+    let key = cursor_key(SourceKind::Notifications, "delivered");
     let cursor = load_cursor(ctx, key.clone())
         .await?
-        .and_then(|text| text.parse::<i64>().ok());
+        .and_then(|text| text.parse::<f64>().ok());
     let db = ctx.paths.notifications_db.clone();
     let config = ctx.config.intake.notifications.clone();
     let names = ctx.config.intake.mention_names.clone();

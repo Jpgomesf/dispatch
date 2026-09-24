@@ -5,6 +5,11 @@
 //! delivered_date, presented, style, snooze_fire_date)` ⋈ `app(app_id, identifier, badge)`.
 //! `data` is a binary plist: `{app, date, req: {titl, subt, body, ...}, ...}`; dates are
 //! seconds since 2001-01-01 (Core Data reference date).
+//!
+//! `rec_id` is a plain `INTEGER PRIMARY KEY` (no AUTOINCREMENT): when the newest rows are
+//! deleted (read notifications are cleared) their ids are reused. So the cursor is
+//! `delivered_date` (sub-microsecond, so `>` loses nothing in practice) and the dedup key is the
+//! record's `uuid`.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -92,9 +97,22 @@ fn apple_time(seconds: f64) -> Option<DateTime<Utc>> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawRecord {
     pub rec_id: i64,
+    pub uuid: Vec<u8>,
     pub app: String,
     pub data: Vec<u8>,
-    pub delivered: Option<f64>,
+    /// `delivered_date` (Core Data seconds); 0 when missing.
+    pub delivered: f64,
+}
+
+impl RawRecord {
+    /// Stable per notification, unlike `rec_id`.
+    #[must_use]
+    pub fn external_id(&self) -> String {
+        if self.uuid.is_empty() {
+            return format!("rec-{}", self.rec_id);
+        }
+        self.uuid.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 /// SQLite URI for a read-only open; `?` / `#` / `%` in the path must be escaped.
@@ -117,29 +135,33 @@ fn open_read_only(db: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// The newest `rec_id`: a first run starts from here instead of replaying history.
-pub fn latest_rec_id(db: &Path) -> rusqlite::Result<i64> {
+/// The newest `delivered_date`: a first run starts from here instead of replaying history.
+pub fn latest_delivered(db: &Path) -> rusqlite::Result<f64> {
     let conn = open_read_only(db)?;
-    conn.query_row("SELECT COALESCE(MAX(rec_id), 0) FROM record", [], |r| {
-        r.get(0)
-    })
+    conn.query_row(
+        "SELECT COALESCE(MAX(delivered_date), 0.0) FROM record",
+        [],
+        |r| r.get(0),
+    )
 }
 
-/// Records with `rec_id > after`, oldest first, every app (the caller filters, so the
-/// cursor also moves past other apps' records).
-pub fn records_after(db: &Path, after: i64) -> rusqlite::Result<Vec<RawRecord>> {
+/// Records delivered after `since`, oldest first, every app (the caller filters, so
+/// the cursor also moves past other apps' records).
+pub fn records_since(db: &Path, since: f64) -> rusqlite::Result<Vec<RawRecord>> {
     let conn = open_read_only(db)?;
     let mut statement = conn.prepare(
-        "SELECT r.rec_id, a.identifier, r.data, r.delivered_date
+        "SELECT r.rec_id, r.uuid, a.identifier, r.data, COALESCE(r.delivered_date, 0.0)
          FROM record r JOIN app a ON a.app_id = r.app_id
-         WHERE r.rec_id > ?1 ORDER BY r.rec_id LIMIT ?2",
+         WHERE COALESCE(r.delivered_date, 0.0) > ?1
+         ORDER BY r.delivered_date, r.rec_id LIMIT ?2",
     )?;
-    let rows = statement.query_map([after, MAX_ROWS_PER_POLL], |row| {
+    let rows = statement.query_map(rusqlite::params![since, MAX_ROWS_PER_POLL], |row| {
         Ok(RawRecord {
             rec_id: row.get(0)?,
-            app: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            data: row.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
-            delivered: row.get(3)?,
+            uuid: row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
+            app: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            data: row.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+            delivered: row.get(4)?,
         })
     })?;
     rows.collect()
@@ -174,14 +196,14 @@ pub fn to_event(
     mention_names: &[String],
     now: DateTime<Utc>,
 ) -> IncomingEvent {
-    let delivered = record
-        .delivered
+    let delivered = Some(record.delivered)
+        .filter(|seconds| *seconds > 0.0)
         .and_then(apple_time)
         .or(notification.date)
         .unwrap_or(now);
     IncomingEvent {
         source: SOURCE.into(),
-        external_id: record.rec_id.to_string(),
+        external_id: record.external_id(),
         kind: EventKind::Message,
         mentions_me: mentions_me(mention_names, notification),
         sender: (!notification.title.is_empty()).then(|| notification.title.clone()),
@@ -201,28 +223,29 @@ pub fn to_event(
 pub struct Poll {
     pub events: Vec<IncomingEvent>,
     pub skipped: Vec<String>,
-    pub cursor: i64,
+    /// Newest `delivered_date` seen.
+    pub cursor: f64,
 }
 
 pub fn poll(
     db: &Path,
     config: &NotificationsConfig,
     mention_names: &[String],
-    cursor: Option<i64>,
+    cursor: Option<f64>,
     now: DateTime<Utc>,
 ) -> rusqlite::Result<Poll> {
-    let Some(after) = cursor else {
+    let Some(since) = cursor else {
         return Ok(Poll {
-            cursor: latest_rec_id(db)?,
+            cursor: latest_delivered(db)?,
             ..Poll::default()
         });
     };
     let mut result = Poll {
-        cursor: after,
+        cursor: since,
         ..Poll::default()
     };
-    for record in records_after(db, after)? {
-        result.cursor = result.cursor.max(record.rec_id);
+    for record in records_since(db, since)? {
+        result.cursor = result.cursor.max(record.delivered);
         if !config.apps.contains(&record.app) {
             continue;
         }
@@ -281,7 +304,38 @@ pub(crate) mod tests {
         bytes
     }
 
-    /// A notification DB with the real schema (column names verified on macOS).
+    /// Fixture uuid: 16 bytes, the tag in the last one.
+    pub(crate) fn uuid(tag: u8) -> Vec<u8> {
+        let mut bytes = vec![0xab; 15];
+        bytes.push(tag);
+        bytes
+    }
+
+    /// Insert one record delivered at `790000000 + delivered` seconds.
+    pub(crate) fn insert_record(
+        conn: &Connection,
+        rec_id: i64,
+        tag: u8,
+        app: &str,
+        data: &[u8],
+        delivered: f64,
+    ) {
+        conn.execute("INSERT OR IGNORE INTO app (identifier) VALUES (?1)", [app])
+            .unwrap();
+        let app_id: i64 = conn
+            .query_row("SELECT app_id FROM app WHERE identifier = ?1", [app], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO record (rec_id, app_id, uuid, data, delivered_date) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![rec_id, app_id, uuid(tag), data, 790_000_000.0 + delivered],
+        )
+        .unwrap();
+    }
+
+    /// A notification DB with the real schema (column names verified on macOS). Record `n`
+    /// has uuid tag `n` and is delivered `n` seconds after the fixture epoch.
     pub(crate) fn fixture_db(dir: &Path, records: &[(i64, &str, Vec<u8>)]) -> PathBuf {
         let path = dir.join("db");
         let conn = Connection::open(&path).unwrap();
@@ -293,18 +347,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         for (rec_id, app, data) in records {
-            conn.execute("INSERT OR IGNORE INTO app (identifier) VALUES (?1)", [app])
-                .unwrap();
-            let app_id: i64 = conn
-                .query_row("SELECT app_id FROM app WHERE identifier = ?1", [app], |r| {
-                    r.get(0)
-                })
-                .unwrap();
-            conn.execute(
-                "INSERT INTO record (rec_id, app_id, data, delivered_date) VALUES (?1, ?2, ?3, 790000000.0)",
-                rusqlite::params![rec_id, app_id, data],
-            )
-            .unwrap();
+            let tag = u8::try_from(*rec_id).unwrap();
+            insert_record(&conn, *rec_id, tag, app, data, *rec_id as f64);
         }
         path
     }
@@ -315,6 +359,10 @@ pub(crate) mod tests {
             match_: match_.iter().map(|s| s.to_string()).collect(),
             ..NotificationsConfig::default()
         }
+    }
+
+    fn external_id(tag: u8) -> String {
+        format!("{}{tag:02x}", "ab".repeat(15))
     }
 
     #[test]
@@ -379,7 +427,7 @@ pub(crate) mod tests {
         let db = fixture_db(dir.path(), &[(7, SLACK_APP_ID, data)]);
         let first = poll(&db, &config(&[]), &[], None, crate::testing::now()).unwrap();
         assert!(first.events.is_empty());
-        assert_eq!(first.cursor, 7);
+        assert_eq!(first.cursor, 790_000_007.0);
     }
 
     #[test]
@@ -418,17 +466,20 @@ pub(crate) mod tests {
             &db,
             &config(&["#example-channel"]),
             &names,
-            Some(0),
+            Some(0.0),
             crate::testing::now(),
         )
         .unwrap();
-        assert_eq!(result.cursor, 5, "the cursor passes every record");
+        assert_eq!(
+            result.cursor, 790_000_005.0,
+            "the cursor passes every record"
+        );
         let ids: Vec<&str> = result
             .events
             .iter()
             .map(|e| e.external_id.as_str())
             .collect();
-        assert_eq!(ids, ["1", "5"]);
+        assert_eq!(ids, [external_id(1), external_id(5)]);
         assert!(result.events[0].mentions_me);
         assert!(!result.events[1].mentions_me);
         assert_eq!(result.events[0].sender.as_deref(), Some("Example Person"));
@@ -447,7 +498,40 @@ pub(crate) mod tests {
             crate::testing::now(),
         )
         .unwrap();
-        assert!(again.events.is_empty());
+        assert!(again.events.is_empty() && again.skipped.is_empty());
+    }
+
+    #[test]
+    fn reused_rec_ids_are_not_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = fixture_plist("Example Person", None, "first");
+        let db = fixture_db(
+            dir.path(),
+            &[(1, SLACK_APP_ID, first.clone()), (2, SLACK_APP_ID, first)],
+        );
+        let seen = poll(&db, &config(&[]), &[], Some(0.0), crate::testing::now()).unwrap();
+        assert_eq!(seen.events.len(), 2);
+        // The newest record is cleared and SQLite hands its rec_id to the next notification.
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("DELETE FROM record WHERE rec_id = 2", [])
+            .unwrap();
+        let next = fixture_plist("Example Person", None, "next");
+        insert_record(&conn, 2, 99, SLACK_APP_ID, &next, 9.0);
+        let later = poll(
+            &db,
+            &config(&[]),
+            &[],
+            Some(seen.cursor),
+            crate::testing::now(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = later
+            .events
+            .iter()
+            .map(|e| e.external_id.as_str())
+            .collect();
+        assert_eq!(ids, [external_id(99)], "a new uuid, so a new event");
+        assert_eq!(later.cursor, 790_000_009.0);
     }
 
     #[test]
@@ -465,9 +549,10 @@ pub(crate) mod tests {
     fn long_bodies_are_previewed() {
         let record = RawRecord {
             rec_id: 9,
+            uuid: vec![],
             app: SLACK_APP_ID.into(),
             data: vec![],
-            delivered: None,
+            delivered: 0.0,
         };
         let notification = Notification {
             title: String::new(),
@@ -478,6 +563,7 @@ pub(crate) mod tests {
         let event = to_event(&record, &notification, &[], crate::testing::now());
         assert_eq!(event.payload["body"].as_str().unwrap().len(), 500);
         assert_eq!(event.sender, None);
+        assert_eq!(event.external_id, "rec-9");
         assert_eq!(event.occurred_at, crate::testing::now());
     }
 }
