@@ -1,21 +1,37 @@
-# Copy to ~/.config/claude-harness/config.toml and replace every placeholder.
+# Copy to ~/.config/dispatch/config.toml and replace every placeholder.
 # One runner (one config, one service) per project; every runner needs its own `name`.
 name = "example-app"          # required; unique per machine; used in claims, branches, labels
-outreach_file = "~/.config/claude-harness/outreach.md"   # optional, default shown
-# state_dir = "~/.local/state/claude-harness"            # optional, default shown
+# plugin_dir = "~/rust-projects/dispatch/plugin"   # optional starter pack; defaults to the repo's plugin/ when present
+outreach_file = "~/.config/dispatch/outreach.md"   # optional, default shown
+# state_dir = "~/.local/state/dispatch"            # optional, default shown
 
-[triage]                      # was [heartbeat]; started by intake events and by this timer
+[triage]                      # started by intake events and by this timer
 interval = "30m"              # fallback sweep when no events arrive; parsed duration: s/m/h
 model = "sonnet"
 effort = "medium"
 max_budget_usd = 1.0          # per triage session
 max_cards_per_tick = 1        # new cards queued per triage
+timeout = "20m"               # wall-clock cap per triage session
+# objective = "Check the new activity below (or sweep your sources if `events` is empty) and decide what deserves attention: respond, draft, ignore, pick up assigned work as cards, or investigate mentions."
 
-[card]                        # also used by discussion sessions
+[card]                        # model, effort and budget also apply to discussion sessions
 model = "claude-opus-5-5"
 effort = "high"
-max_budget_usd = 20.0         # per card or discussion
+max_budget_usd = 20.0         # per session (one card attempt or one discussion)
 max_parallel = 2              # card + discussion sessions at once; each gets its own git worktree
+timeout = "3h"                # wall-clock cap per card attempt
+max_attempts = 3              # attempts per card; then it is escalated to you through triage
+# objective = "Work card {ref} to completion in this workspace."
+
+[discussion]                  # model, effort and budget come from [card]
+timeout = "1h"                # wall-clock cap per discussion session
+# objective = "You were mentioned in a discussion about {ref}. Investigate the question and respond in the thread."
+
+[sessions]                    # every session: triage, card and discussion
+idle_timeout = "15m"          # no stream output this long = stuck
+start_stagger = "30s"         # spacing between session starts (+ jitter)
+loop_threshold = 10           # identical tool calls within the last 2x this = stuck; 0 disables
+required_mcp = []             # MCP servers every session must have connected, e.g. ["claude.ai Slack"]
 
 [sources]                     # what the fallback sweep reads; free-form strings the skill interprets
 slack_channels = ["C0000000000"]
