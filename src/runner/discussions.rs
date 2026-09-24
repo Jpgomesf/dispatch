@@ -83,12 +83,24 @@ impl<S: Session> Runner<S> {
             }
         };
         let now = self.now();
-        let next = outcome::next(outcome, &queued.chain, self.config.card.max_attempts, now);
+        let next = outcome::next(
+            outcome,
+            None,
+            &queued.chain,
+            self.config.card.max_attempts,
+            now,
+        );
         let retry = match next {
             Next::Retry { at } => {
                 let mut chain = queued.chain;
                 if outcome.counts() {
-                    chain.insert(0, Prior { outcome });
+                    chain.insert(
+                        0,
+                        Prior {
+                            outcome,
+                            new_commits: None,
+                        },
+                    );
                 }
                 Some(QueuedDiscussion {
                     discussion: queued.discussion,
@@ -156,7 +168,8 @@ impl<S: Session> Runner<S> {
                 (r.status.into(), r.summary.clone())
             });
         if let Ok((id, _)) = attempt {
-            self.end_attempt(id, outcome, &report, &summary, None).await;
+            self.end_attempt(id, self.attempt_end(outcome, &report, &summary))
+                .await;
         }
         (outcome, summary, result, report)
     }

@@ -299,6 +299,49 @@ async fn every_session_is_recorded_as_an_attempt() {
 }
 
 #[tokio::test]
+async fn attempts_that_add_no_commits_twice_in_a_row_need_a_person() {
+    let mut env = test_env();
+    env.config.card.max_attempts = 9;
+    init_repo(&env.config.workspaces[0].path);
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    // Only the first attempt commits; every attempt reports itself blocked.
+    let session = FakeSession::new(move |request| {
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            commit(&request.cwd, "progress");
+        }
+        ok(card_output("EX-1", "blocked"))
+    });
+    let (runner, lines) = make_runner(&env, session);
+    let workspace = env.config.workspaces.first().cloned();
+    for _ in 0..3 {
+        runner.run_card_in("EX-1", workspace.clone(), &[]).await;
+    }
+
+    let store = env.store();
+    let mut attempts = store.attempts("example-app", Some("EX-1"), -1).unwrap();
+    attempts.reverse();
+    let commits: Vec<Option<u32>> = attempts.iter().map(|a| a.new_commits).collect();
+    assert_eq!(commits, [Some(1), Some(0), Some(0)]);
+    let cwd = std::path::Path::new(&attempts[0].cwd);
+    assert!(
+        cwd.starts_with(env.paths.worktrees_dir()),
+        "measured on the card's own worktree"
+    );
+    let card = store.card("example-app", "EX-1").unwrap().unwrap();
+    assert_eq!(card.status, CardStatus::NeedsHuman);
+    assert_eq!(card.reason.as_deref(), Some("no_progress"));
+    let lines = lines_of(&lines);
+    assert!(
+        lines[1].starts_with("2026-01-15T09:30:00Z card blocked EX-1"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[2].ends_with("; needs_human (no_progress)"),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
 async fn each_mode_gets_its_timeout_and_the_shared_idle_limit() {
     let mut env = test_env();
     env.config.triage.timeout = MINUTE * 20;

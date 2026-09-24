@@ -291,7 +291,7 @@ impl<S: Session> Runner<S> {
             Ok(stranded) => {
                 for (card_ref, attempt) in stranded {
                     let next = self
-                        .settle_card(&card_ref, attempt, Outcome::Crash, None)
+                        .settle_card(&card_ref, attempt, Outcome::Crash, None, None)
                         .await;
                     let detail = format!("{card_ref} — {STOPPED_MID_SESSION}{}", describe(&next));
                     self.emit("card", Outcome::Crash.as_str(), &detail);
@@ -353,24 +353,22 @@ impl<S: Session> Runner<S> {
         }
     }
 
-    /// Close an attempt row with how the session ended. Best effort: the session already ran,
-    /// so a store failure costs only the record (one line).
-    async fn end_attempt(
-        &self,
-        id: i64,
-        outcome: Outcome,
-        report: &SessionReport,
-        summary: &str,
-        blocked_on: Option<String>,
-    ) {
-        let end = AttemptEnd {
+    /// How an attempt ended, as recorded; callers add `blocked_on` and `new_commits`.
+    fn attempt_end(&self, outcome: Outcome, report: &SessionReport, summary: &str) -> AttemptEnd {
+        AttemptEnd {
             outcome: outcome.as_str().to_string(),
             summary: one_line(summary),
-            blocked_on,
+            blocked_on: None,
             session_id: report.session_id.clone(),
             cost_usd: report.cost_usd,
+            new_commits: None,
             ended_at: self.now(),
-        };
+        }
+    }
+
+    /// Close an attempt row with how the session ended. Best effort: the session already ran,
+    /// so a store failure costs only the record (one line).
+    async fn end_attempt(&self, id: i64, end: AttemptEnd) {
         if let Err(error) = self.store.call(move |s| s.end_attempt(id, &end)).await {
             self.emit(
                 "store",
@@ -498,7 +496,8 @@ impl<S: Session> Runner<S> {
         let (outcome, summary, result) = judge(&report.ended, "triage", |r: &TriageResult| {
             (Outcome::Ok, r.summary.clone())
         });
-        self.end_attempt(id, outcome, &report, &summary, None).await;
+        self.end_attempt(id, self.attempt_end(outcome, &report, &summary))
+            .await;
         let result = result.ok_or((outcome, summary))?;
         // The pollers' own cursors are never the skill's to change.
         let cursors: BTreeMap<String, String> = result

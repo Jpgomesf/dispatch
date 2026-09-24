@@ -66,6 +66,35 @@ pub fn test_env() -> TestEnv {
     env
 }
 
+fn git(path: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Example")
+        .env("GIT_AUTHOR_EMAIL", "dev@example.com")
+        .env("GIT_COMMITTER_NAME", "Example")
+        .env("GIT_COMMITTER_EMAIL", "dev@example.com")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{args:?}: {output:?}");
+}
+
+/// A git repository with one commit.
+pub fn init_repo(path: &Path) {
+    std::fs::create_dir_all(path).unwrap();
+    git(path, &["init", "-q"]);
+    std::fs::write(path.join("README.md"), "example\n").unwrap();
+    git(path, &["add", "README.md"]);
+    git(path, &["commit", "-qm", "init"]);
+}
+
+/// An empty commit on whatever `path` has checked out.
+pub fn commit(path: &Path, message: &str) {
+    git(path, &["commit", "-q", "--allow-empty", "-m", message]);
+}
+
 pub fn write_plugin(root: &Path) {
     let manifest = root.join("plugin/.claude-plugin/plugin.json");
     std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();

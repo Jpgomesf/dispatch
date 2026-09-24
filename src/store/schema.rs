@@ -47,19 +47,20 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE cards ADD COLUMN retry_at TEXT;
     ALTER TABLE cards ADD COLUMN reason TEXT;
     CREATE TABLE attempts (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        runner     TEXT NOT NULL,
-        mode       TEXT NOT NULL,
-        ref        TEXT NOT NULL,
-        attempt    INTEGER NOT NULL,
-        cwd        TEXT NOT NULL,
-        started_at TEXT NOT NULL,
-        ended_at   TEXT,
-        outcome    TEXT,
-        summary    TEXT,
-        blocked_on TEXT,
-        session_id TEXT,
-        cost_usd   REAL
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        runner      TEXT NOT NULL,
+        mode        TEXT NOT NULL,
+        ref         TEXT NOT NULL,
+        attempt     INTEGER NOT NULL,
+        cwd         TEXT NOT NULL,
+        started_at  TEXT NOT NULL,
+        ended_at    TEXT,
+        outcome     TEXT,
+        summary     TEXT,
+        blocked_on  TEXT,
+        session_id  TEXT,
+        cost_usd    REAL,
+        new_commits INTEGER
     );
     CREATE INDEX attempts_by_ref ON attempts (runner, ref, id);
     ",

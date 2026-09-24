@@ -122,8 +122,12 @@ pub fn history_lines(store: &Store, runner: &str, reference: Option<&str>) -> Re
             .cost_usd
             .map(|c| format!(" cost=${c:.2}"))
             .unwrap_or_default();
+        let commits = attempt
+            .new_commits
+            .map(|n| format!(" new_commits={n}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "{} {outcome} {} → {ended}{cost}",
+            "{} {outcome} {} → {ended}{cost}{commits}",
             attempt_label(attempt),
             time(attempt.started_at)
         ));
@@ -174,6 +178,7 @@ mod tests {
                     blocked_on: Some("a product decision".into()),
                     session_id: Some("session-1".into()),
                     cost_usd: Some(1.5),
+                    new_commits: Some(0),
                     ended_at: now(),
                 },
             )
@@ -250,7 +255,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "card EX-1 #1 blocked 2026-01-15T09:30:00Z → 2026-01-15T09:30:00Z cost=$1.50",
+                "card EX-1 #1 blocked 2026-01-15T09:30:00Z → 2026-01-15T09:30:00Z cost=$1.50 new_commits=0",
                 "  waiting for an answer",
                 "  blocked on: a product decision",
                 "  resume: cd '/tmp/example app/worktree' && claude --resume session-1",

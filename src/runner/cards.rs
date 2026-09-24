@@ -150,11 +150,18 @@ impl<S: Session> Runner<S> {
             Ok(checkout) => checkout,
             Err(error) => {
                 // No session ran; the card follows the rules for a crash, so it is retried.
-                let next = self.settle_card(card_ref, None, Outcome::Crash, None).await;
+                let next = self
+                    .settle_card(card_ref, None, Outcome::Crash, None, None)
+                    .await;
                 let detail = format!("{card_ref} — {}{}", one_line(&error), describe(&next));
                 self.emit("card", Outcome::Crash.as_str(), &detail);
                 return None;
             }
+        };
+        // Progress is judged from the worktree, never from what the agent says.
+        let head_before = match &workspace {
+            Some(w) => worktree::head(w, &checkout).await,
+            None => None,
         };
         let prompt = card_prompt(
             card_ref,
@@ -178,16 +185,26 @@ impl<S: Session> Runner<S> {
                 SessionReport::ended(crate::session::Ended::Crash(error)),
             ),
         };
+        let new_commits = match (&workspace, head_before) {
+            (Some(w), Some(before)) => match worktree::head(w, &checkout).await {
+                Some(after) => worktree::commits_between(&checkout, &before, &after).await,
+                None => None,
+            },
+            _ => None,
+        };
         let (outcome, summary, result) = judge(&report.ended, "card", |r: &CardResult| {
             (r.status.into(), r.summary.clone())
         });
         if let Some(id) = id {
-            let blocked_on = result.as_ref().and_then(|r| r.blocked_on.clone());
-            self.end_attempt(id, outcome, &report, &summary, blocked_on)
-                .await;
+            let mut end = self.attempt_end(outcome, &report, &summary);
+            end.blocked_on = result.as_ref().and_then(|r| r.blocked_on.clone());
+            end.new_commits = new_commits;
+            self.end_attempt(id, end).await;
         }
         let pr_url = result.as_ref().and_then(|r| r.pr_url.clone());
-        let next = self.settle_card(card_ref, id, outcome, pr_url).await;
+        let next = self
+            .settle_card(card_ref, id, outcome, new_commits, pr_url)
+            .await;
         let detail = format!(
             "{card_ref}{} — {}{}",
             cost(report.cost_usd),
@@ -209,6 +226,7 @@ impl<S: Session> Runner<S> {
         card_ref: &str,
         current: Option<i64>,
         outcome: Outcome,
+        new_commits: Option<u32>,
         pr_url: Option<String>,
     ) -> Result<Next, String> {
         let (runner, card_ref, now) = (self.name().to_string(), card_ref.to_string(), self.now());
@@ -219,7 +237,7 @@ impl<S: Session> Runner<S> {
                     .card(&runner, &card_ref)?
                     .unwrap_or_else(|| CardState::new(CardStatus::InProgress, now));
                 let chain = s.card_chain(&runner, &card_ref, current, card.attempts)?;
-                let next = outcome::next(outcome, &chain, max_attempts, now);
+                let next = outcome::next(outcome, new_commits, &chain, max_attempts, now);
                 apply(&mut card, outcome, next, now);
                 if pr_url.is_some() {
                     card.pr_url = pr_url;

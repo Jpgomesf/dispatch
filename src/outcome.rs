@@ -9,7 +9,9 @@
 //! | `blocked` | none: eligible again when triage lists it |
 //! | `interrupted` (kill switch, signal) | retry when the runner runs again; not counted |
 //!
-//! Counted attempts are capped at `max_attempts`; past it the card is `needs_human`.
+//! Counted attempts are capped at `max_attempts`; past it the card is `needs_human`. Two
+//! counted attempts in a row that end unfinished with no new commits on the card's worktree
+//! are `needs_human` too (`no_progress`): progress is judged from git, not from the agent.
 
 use std::time::Duration;
 
@@ -136,12 +138,15 @@ impl Outcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Prior {
     pub outcome: Outcome,
+    /// Commits it added to the worktree's HEAD; `None` when there is no worktree to measure.
+    pub new_commits: Option<u32>,
 }
 
 /// Why a card waits for a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     MaxAttempts,
+    NoProgress,
     Failed,
 }
 
@@ -150,6 +155,7 @@ impl Reason {
     pub fn as_str(self) -> &'static str {
         match self {
             Reason::MaxAttempts => "max_attempts",
+            Reason::NoProgress => "no_progress",
             Reason::Failed => "failed",
         }
     }
@@ -182,12 +188,26 @@ fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
 /// What follows `outcome`, given the counted attempts before it in this run (`chain`, newest
 /// first) and the cap.
 #[must_use]
-pub fn next(outcome: Outcome, chain: &[Prior], max_attempts: u32, now: DateTime<Utc>) -> Next {
+pub fn next(
+    outcome: Outcome,
+    new_commits: Option<u32>,
+    chain: &[Prior],
+    max_attempts: u32,
+    now: DateTime<Utc>,
+) -> Next {
     if outcome.is_finished() {
         return Next::Finished;
     }
     if !outcome.counts() {
         return Next::Retry { at: now };
+    }
+    let stalled = |commits: Option<u32>| commits == Some(0);
+    if stalled(new_commits)
+        && chain
+            .first()
+            .is_some_and(|prior| stalled(prior.new_commits))
+    {
+        return Next::NeedsHuman(Reason::NoProgress);
     }
     let counted = u32::try_from(chain.len())
         .unwrap_or(u32::MAX)
@@ -212,7 +232,13 @@ mod tests {
     use crate::testing::now;
 
     fn chain(outcomes: &[Outcome]) -> Vec<Prior> {
-        outcomes.iter().map(|&outcome| Prior { outcome }).collect()
+        outcomes
+            .iter()
+            .map(|&outcome| Prior {
+                outcome,
+                new_commits: None,
+            })
+            .collect()
     }
 
     fn minutes(m: i64) -> DateTime<Utc> {
@@ -244,13 +270,22 @@ mod tests {
             Outcome::InvalidOutput,
         ] {
             assert!(outcome.is_transient());
-            assert_eq!(next(outcome, &[], 3, now()), Next::Retry { at: minutes(1) });
             assert_eq!(
-                next(outcome, &chain(&[Outcome::Crash]), 3, now()),
+                next(outcome, None, &[], 3, now()),
+                Next::Retry { at: minutes(1) }
+            );
+            assert_eq!(
+                next(outcome, None, &chain(&[Outcome::Crash]), 3, now()),
                 Next::Retry { at: minutes(2) }
             );
             assert_eq!(
-                next(outcome, &chain(&[Outcome::Crash, Outcome::Stuck]), 3, now()),
+                next(
+                    outcome,
+                    None,
+                    &chain(&[Outcome::Crash, Outcome::Stuck]),
+                    3,
+                    now()
+                ),
                 Next::NeedsHuman(Reason::MaxAttempts)
             );
         }
@@ -259,23 +294,75 @@ mod tests {
     #[test]
     fn an_agent_failure_retries_once() {
         assert_eq!(
-            next(Outcome::Failed, &[], 5, now()),
+            next(Outcome::Failed, None, &[], 5, now()),
             Next::Retry { at: minutes(1) }
         );
         let again = chain(&[Outcome::Timeout, Outcome::Failed]);
         assert_eq!(
-            next(Outcome::Failed, &again, 5, now()),
+            next(Outcome::Failed, None, &again, 5, now()),
             Next::NeedsHuman(Reason::Failed)
         );
     }
 
     #[test]
     fn blocked_waits_for_triage_and_counts() {
-        assert_eq!(next(Outcome::Blocked, &[], 3, now()), Next::Blocked);
+        assert_eq!(next(Outcome::Blocked, None, &[], 3, now()), Next::Blocked);
         let twice = chain(&[Outcome::Blocked, Outcome::Blocked]);
         assert_eq!(
-            next(Outcome::Blocked, &twice, 3, now()),
+            next(Outcome::Blocked, None, &twice, 3, now()),
             Next::NeedsHuman(Reason::MaxAttempts)
+        );
+    }
+
+    #[test]
+    fn two_unfinished_attempts_in_a_row_without_commits_are_no_progress() {
+        let idle = |outcome| Prior {
+            outcome,
+            new_commits: Some(0),
+        };
+        let busy = Prior {
+            outcome: Outcome::Timeout,
+            new_commits: Some(3),
+        };
+        let unknown = Prior {
+            outcome: Outcome::Timeout,
+            new_commits: None,
+        };
+        let no_progress = Next::NeedsHuman(Reason::NoProgress);
+        for outcome in [Outcome::Timeout, Outcome::Blocked, Outcome::Failed] {
+            assert_eq!(
+                next(outcome, Some(0), &[idle(Outcome::Crash)], 9, now()),
+                no_progress
+            );
+        }
+        assert_ne!(
+            next(Outcome::Timeout, Some(0), &[busy], 9, now()),
+            no_progress
+        );
+        assert_ne!(
+            next(Outcome::Timeout, Some(2), &[idle(Outcome::Crash)], 9, now()),
+            no_progress
+        );
+        assert_ne!(next(Outcome::Timeout, Some(0), &[], 9, now()), no_progress);
+        assert_ne!(
+            next(Outcome::Timeout, None, &[unknown], 9, now()),
+            no_progress,
+            "without a worktree nothing is measured"
+        );
+        assert_eq!(
+            next(Outcome::Done, Some(0), &[idle(Outcome::Crash)], 9, now()),
+            Next::Finished
+        );
+        assert_eq!(
+            next(
+                Outcome::Interrupted,
+                Some(0),
+                &[idle(Outcome::Crash)],
+                9,
+                now()
+            ),
+            Next::Retry { at: now() },
+            "an interruption is not an attempt at the work"
         );
     }
 
@@ -284,7 +371,7 @@ mod tests {
         assert!(!Outcome::Interrupted.counts());
         let full = chain(&[Outcome::Crash, Outcome::Crash, Outcome::Crash]);
         assert_eq!(
-            next(Outcome::Interrupted, &full, 3, now()),
+            next(Outcome::Interrupted, None, &full, 3, now()),
             Next::Retry { at: now() }
         );
     }
@@ -299,7 +386,7 @@ mod tests {
             Outcome::Drafted,
             Outcome::Skipped,
         ] {
-            assert_eq!(next(outcome, &full, 3, now()), Next::Finished);
+            assert_eq!(next(outcome, None, &full, 3, now()), Next::Finished);
         }
     }
 

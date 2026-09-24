@@ -28,6 +28,8 @@ pub struct Attempt {
     pub blocked_on: Option<String>,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
+    /// Commits the attempt added to its worktree's HEAD; `None` without a worktree.
+    pub new_commits: Option<u32>,
 }
 
 /// How an attempt ended.
@@ -38,11 +40,12 @@ pub struct AttemptEnd {
     pub blocked_on: Option<String>,
     pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
+    pub new_commits: Option<u32>,
     pub ended_at: DateTime<Utc>,
 }
 
 const COLUMNS: &str = "id, mode, ref, attempt, cwd, started_at, ended_at, outcome, summary, \
-                       blocked_on, session_id, cost_usd";
+                       blocked_on, session_id, cost_usd, new_commits";
 
 fn attempt_from(row: &Row<'_>) -> rusqlite::Result<Attempt> {
     let started_at: String = row.get(5)?;
@@ -60,6 +63,7 @@ fn attempt_from(row: &Row<'_>) -> rusqlite::Result<Attempt> {
         blocked_on: row.get(9)?,
         session_id: row.get(10)?,
         cost_usd: row.get(11)?,
+        new_commits: row.get(12)?,
     })
 }
 
@@ -112,7 +116,7 @@ impl Store {
         self.write(false, |tx| {
             tx.execute(
                 "UPDATE attempts SET ended_at = ?2, outcome = ?3, summary = ?4, blocked_on = ?5,
-                     session_id = COALESCE(?6, session_id), cost_usd = ?7
+                     session_id = COALESCE(?6, session_id), cost_usd = ?7, new_commits = ?8
                  WHERE id = ?1",
                 params![
                     id,
@@ -121,7 +125,8 @@ impl Store {
                     end.summary,
                     end.blocked_on,
                     end.session_id,
-                    end.cost_usd
+                    end.cost_usd,
+                    end.new_commits
                 ],
             )
             .map(|_| ())
@@ -157,22 +162,28 @@ impl Store {
         before: Option<i64>,
         run: u32,
     ) -> Result<Vec<Prior>> {
-        let outcomes: Vec<String> = self.read(|c| {
+        let rows: Vec<(String, Option<u32>)> = self.read(|c| {
             let mut statement = c.prepare(
-                "SELECT outcome FROM attempts
+                "SELECT outcome, new_commits FROM attempts
                  WHERE runner = ?1 AND mode = 'card' AND ref = ?2 AND outcome IS NOT NULL
                      AND (?3 IS NULL OR id < ?3)
                  ORDER BY id DESC",
             )?;
             statement
-                .query_map(params![runner, card_ref, before], |row| row.get(0))?
+                .query_map(params![runner, card_ref, before], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
                 .collect()
         })?;
-        Ok(outcomes
-            .iter()
-            .filter_map(|text| Outcome::parse(text))
-            .filter(|outcome| outcome.counts())
-            .map(|outcome| Prior { outcome })
+        Ok(rows
+            .into_iter()
+            .filter_map(|(text, new_commits)| {
+                Outcome::parse(&text).map(|outcome| Prior {
+                    outcome,
+                    new_commits,
+                })
+            })
+            .filter(|prior| prior.outcome.counts())
             .take(usize::try_from(run).unwrap_or(usize::MAX))
             .collect())
     }
@@ -219,6 +230,7 @@ mod tests {
             blocked_on: None,
             session_id: Some("session-1".into()),
             cost_usd: Some(0.25),
+            new_commits: Some(1),
             ended_at: now(),
         }
     }
@@ -261,6 +273,7 @@ mod tests {
         assert_eq!(latest.outcome.as_deref(), Some("done"));
         assert_eq!(latest.session_id.as_deref(), Some("session-1"));
         assert_eq!(latest.cost_usd, Some(0.25));
+        assert_eq!(latest.new_commits, Some(1));
         assert_eq!(latest.cwd, "/tmp/example/worktree");
         assert_eq!(ex1[0].mode, "discussion", "newest first");
         assert_eq!(store.attempts("alpha", None, 2).unwrap().len(), 2);
