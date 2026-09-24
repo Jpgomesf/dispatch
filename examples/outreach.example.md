@@ -51,11 +51,13 @@ Morgan Blake only when a blocker is older than 2 working days, and always as a d
 
 ## Auto-send vs always draft
 
-Auto-send (still subject to the runner's `[send]` policy):
+Auto-send (still subject to your Claude Code permission rules):
 
 - Status replies in #example-app about cards and PRs, with links.
 - Clarifying questions to Alex Rivera and Priya Natarajan about a card's spec.
 - Follow-ups on questions already asked in the same thread.
+- Answers to questions I am asked in a thread or ticket I take part in, when
+  they only state facts with evidence (no commitments).
 
 Always draft:
 

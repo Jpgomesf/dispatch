@@ -1,29 +1,60 @@
 # Copy to ~/.config/claude-harness/config.toml and replace every placeholder.
+# One runner (one config, one service) per project; every runner needs its own `name`.
+name = "example-app"          # required; unique per machine; used in claims, branches, labels
 outreach_file = "~/.config/claude-harness/outreach.md"   # optional, default shown
 # state_dir = "~/.local/state/claude-harness"            # optional, default shown
 
-[heartbeat]
-interval = "10m"          # parsed duration: s/m/h
+[triage]                      # was [heartbeat]; started by intake events and by this timer
+interval = "30m"              # fallback sweep when no events arrive; parsed duration: s/m/h
 model = "sonnet"
 effort = "medium"
-max_budget_usd = 1.0      # per tick
-max_cards_per_tick = 1    # new cards queued per triage
+max_budget_usd = 1.0          # per triage session
+max_cards_per_tick = 1        # new cards queued per triage
 
-[card]
+[card]                        # also used by discussion sessions
 model = "claude-opus-5-5"
 effort = "high"
-max_budget_usd = 20.0     # per card
-max_parallel = 2          # card sessions at once; each card gets its own git worktree
+max_budget_usd = 20.0         # per card or discussion
+max_parallel = 2              # card + discussion sessions at once; each gets its own git worktree
 
-[sources]                 # what the heartbeat watches; free-form strings the skill interprets
+[sources]                     # what the fallback sweep reads; free-form strings the skill interprets
 slack_channels = ["C0000000000"]
-tracker = "linear"        # linear | jira | other
+tracker = "linear"            # linear | jira | other
 tracker_query = "assignee:me state:Todo label:agent"
 
-[[workspaces]]            # where card work happens; the workflow skill picks by match
+[intake]
+batch_window = "60s"          # collect events this long before one triage session
+allow_senders = []            # optional sender allowlist (display names / emails); empty = no filter
+                              # mentions of me and direct replies to me always pass
+
+[intake.notifications]        # macOS only; needs Full Disk Access (docs/machine-setup.md)
+enabled = true
+poll = "5s"
+apps = ["com.tinyspeck.slackmacgap"]
+match = ["#example-channel", "Example Co"]   # substrings of title/subtitle routing a notification
+                                             # to this runner; empty = every notification of `apps`
+
+[intake.linear]
+enabled = false
+api_key_env = "LINEAR_API_KEY"   # personal API key; name of the variable, never the key
+poll = "60s"
+projects = ["Example App"]       # optional narrowing; assignee = me is always enforced
+teams = []
+labels = []
+
+[intake.jira]
+enabled = false
+base_url = "https://example.atlassian.net"
+email_env = "JIRA_EMAIL"
+token_env = "JIRA_API_TOKEN"
+poll = "60s"
+jql = "project = EX"             # optional narrowing; runner always ANDs assignee = currentUser()
+
+[[workspaces]]                # where card and discussion work happens; the workflow skill picks by match
 name = "example-app"
 path = "~/code/example-app"
 match = ["EX-", "example-app"]
 
 # Who may be messaged is not configured here: use Claude Code permission rules
 # (e.g. deny "mcp__*__send_message") and your outreach.md. See docs/machine-setup.md.
+# Secrets (API keys) never go here: see examples/secrets.env.example.
