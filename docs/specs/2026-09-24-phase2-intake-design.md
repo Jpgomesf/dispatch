@@ -57,7 +57,7 @@ command stays `harness heartbeat [--interval] [--once]`; only the session mode
 
 As implemented: every source defaults to `enabled = false`; `teams` accepts team
 keys or names; `jql` is validated at load (balanced parentheses outside quotes, no
-`ORDER BY`) so `AND (<jql>)` cannot widen the scope; `allow_senders` entries match
+`ORDER BY`, no `\` outside quotes) so `AND (<jql>)` cannot widen the scope; `allow_senders` entries match
 case-insensitively as substrings of the sender. `mention_names` is an addition: a
 notification whose title, subtitle or body contains one is a mention of me
 (`mentions_me`); macOS notifications carry no structured mention flag.
@@ -209,12 +209,17 @@ Runner passes `runner` (its `name`) in every JSON context. The `workflow` skill:
 
 - **Notification watcher.** Reads the macOS notification DB read-only
   (`~/Library/Group Containers/group.com.apple.usernoted/db2/db`, `record` ⋈ `app`),
-  rows with `rec_id` greater than the cursor. Decodes the `data` binary plist
-  (`plist` crate) to title / subtitle / body / date. Narrow parser module with
-  fixture tests; an unexpected shape is a loud error for that record (skipped,
-  cursor advances, one stdout line), never a silent drop of the whole source.
-  External id = `rec_id`. Payload carries only title, subtitle, body preview, app,
-  delivered date.
+  rows with `delivered_date` greater than the cursor. Decodes the `data` binary
+  plist (`plist` crate) to title / subtitle / body / date. Narrow parser module
+  with fixture tests; an unexpected shape is a loud error for that record
+  (skipped, cursor advances, one stdout line), never a silent drop of the whole
+  source. External id = the record's `uuid` (hex). Payload carries only title,
+  subtitle, body preview, app, delivered date.
+  **Changed from `rec_id`** as cursor and external id: `rec_id` is a plain
+  `INTEGER PRIMARY KEY` without AUTOINCREMENT, so when the newest records are
+  cleared (read notifications) SQLite reuses their ids, and a `rec_id` cursor would
+  silently drop the next notifications. Every record has a unique 16-byte `uuid`
+  and a `delivered_date` (verified with counts only).
   Verified schema (macOS, read-only `.schema` only): `record(rec_id, app_id, uuid,
   data, request_date, request_last_date, delivered_date, presented, style,
   snooze_fire_date)`, `app(app_id, identifier, badge)`. The plist is
@@ -235,9 +240,10 @@ Runner passes `runner` (its `name`) in every JSON context. The `workflow` skill:
   for work, `<key>#<comment id>` for discussion; an ADF `mention` of my
   `accountId` (`/rest/api/3/myself`) sets `mentions_me`.
 - **Cursors.** A source's first poll only sets its cursor (now, or the newest
-  `rec_id`): history is never replayed; the fallback sweep covers what is already
-  open. A cursor moves to the newest timestamp fetched (including filtered items)
-  and only after the events are stored; dedup absorbs any overlap.
+  `delivered_date`): history is never replayed; the fallback sweep covers what is
+  already open. A cursor moves to the newest timestamp fetched (including filtered
+  items) and only after the events are stored; dedup absorbs any overlap. Triage
+  results cannot overwrite these `intake:*` cursors.
 - **`harness enqueue <source> <text>`**: manual `message` event (payload
   `{body}`) for this runner, for testing and scripts.
 
@@ -262,7 +268,13 @@ under `--once`.
   become `done`; on failure they return to `new` (retry with backoff).
 - On success every batched event becomes `done`, whether or not `handled` names
   it (an event may only have produced a `discussions_to_run` entry). A failed
-  batch waits for the later of the 30s-doubling backoff and a new batch window.
+  batch (including a panicked triage task) waits for the later of the
+  30s-doubling backoff and a new batch window. Cursors the skill returns are
+  saved best effort: a store failure there prints one line but does not fail
+  the batch, which would repeat replies already sent.
+- A queued card that ends without a recorded status (refused by the assignee
+  check, or held by another runner) keeps holding cards `blocked_by` it for the
+  rest of the loop, instead of looking like an external dependency.
 - The fallback sweep (`events: []`) has its own timer: `[triage] interval` after
   the previous sweep, independent of event triages (an event triage handles only
   its events, so it does not replace a sweep). One triage runs at a time.
