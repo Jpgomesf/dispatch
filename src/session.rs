@@ -43,7 +43,8 @@ pub struct SessionRequest {
     pub effort: Effort,
     pub max_budget_usd: f64,
     pub cwd: PathBuf,
-    pub plugin_dir: PathBuf,
+    /// Passed as `--plugin-dir` when set.
+    pub plugin_dir: Option<PathBuf>,
     pub output_schema: Value,
 }
 
@@ -97,7 +98,7 @@ impl Default for ClaudeCli {
 }
 
 pub fn build_args(request: &SessionRequest) -> Vec<String> {
-    vec![
+    let mut args: Vec<String> = vec![
         "-p".into(),
         request.prompt.clone(),
         "--output-format".into(),
@@ -116,9 +117,11 @@ pub fn build_args(request: &SessionRequest) -> Vec<String> {
         request.effort.as_str().into(),
         "--max-budget-usd".into(),
         request.max_budget_usd.to_string(),
-        "--plugin-dir".into(),
-        request.plugin_dir.display().to_string(),
-    ]
+    ];
+    if let Some(plugin_dir) = &request.plugin_dir {
+        args.extend(["--plugin-dir".into(), plugin_dir.display().to_string()]);
+    }
+    args
 }
 
 /// Parse the final `{"type": "result", ...}` object printed by `--output-format json`.
@@ -292,7 +295,7 @@ mod tests {
             effort: Effort::Medium,
             max_budget_usd: 1.5,
             cwd: PathBuf::from("/tmp/example/state"),
-            plugin_dir: PathBuf::from("/tmp/example/plugin"),
+            plugin_dir: Some(PathBuf::from("/tmp/example/plugin")),
             output_schema: json!({"type": "object"}),
         }
     }
@@ -330,6 +333,11 @@ mod tests {
             ..request()
         };
         assert!(build_args(&whole).contains(&"20".to_string()));
+        let no_plugin = SessionRequest {
+            plugin_dir: None,
+            ..request()
+        };
+        assert!(!build_args(&no_plugin).contains(&"--plugin-dir".to_string()));
     }
 
     fn result(overrides: Value) -> String {

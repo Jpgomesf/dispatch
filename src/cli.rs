@@ -153,20 +153,30 @@ fn load(path: &Path, allow_missing: bool) -> Result<Config, String> {
     load_config(path)
 }
 
+/// Which plugin sessions load, and whether a plugin dir that is set actually holds a plugin.
+/// No plugin dir is fine: the user's own skills and plugins load either way.
+fn plugin_report(plugin_dir: Option<&Path>) -> (String, bool) {
+    match plugin_dir {
+        None => (
+            "none (no plugin_dir in config and no plugin/ in the build checkout)".into(),
+            true,
+        ),
+        Some(dir) if dir.join(".claude-plugin/plugin.json").is_file() => {
+            (format!("{} (ok)", dir.display()), true)
+        }
+        Some(dir) => (
+            format!("{} (MISSING .claude-plugin/plugin.json)", dir.display()),
+            false,
+        ),
+    }
+}
+
 fn cmd_check(paths: &Paths, config: &Config) -> i32 {
-    let plugin_ok = paths
-        .plugin_dir
-        .join(".claude-plugin/plugin.json")
-        .is_file();
+    let (plugin, plugin_ok) = plugin_report(paths.plugin_dir.as_deref());
     let kill = if paths.kill_switch().exists() {
         "SET"
     } else {
         "off"
-    };
-    let plugin = if plugin_ok {
-        "ok"
-    } else {
-        "MISSING plugin.json"
     };
     // `check` changes nothing: a store that does not exist yet is created by the first run.
     let store = if !paths.db.exists() {
@@ -194,7 +204,7 @@ fn cmd_check(paths: &Paths, config: &Config) -> i32 {
     println!("kill switch:  {} ({kill})", paths.kill_switch().display());
     println!("outreach:     {}", paths.outreach_file.display());
     println!("worktrees:    {}", paths.worktrees_dir().display());
-    println!("plugin dir:   {} ({plugin})", paths.plugin_dir.display());
+    println!("plugin dir:   {plugin}");
     for kind in SourceKind::enabled(&config.intake) {
         println!(
             "source:       {} ({})",

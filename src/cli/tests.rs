@@ -43,12 +43,24 @@ async fn check_reports_paths() {
 }
 
 #[tokio::test]
-async fn check_fails_without_plugin() {
+async fn check_fails_when_the_configured_plugin_is_missing() {
     let env = test_env();
     assert_eq!(
         run_with(&env, &["check"], no_session()).await.0,
         EXIT_FAILED
     );
+}
+
+#[test]
+fn plugin_is_optional() {
+    let dir = tempfile::tempdir().unwrap();
+    let (none, ok) = plugin_report(None);
+    assert!(ok && none.starts_with("none"), "{none}");
+    let (missing, ok) = plugin_report(Some(dir.path()));
+    assert!(!ok && missing.contains("MISSING"), "{missing}");
+    write_plugin(dir.path());
+    let (present, ok) = plugin_report(Some(&dir.path().join("plugin")));
+    assert!(ok && present.ends_with("(ok)"), "{present}");
 }
 
 #[tokio::test]

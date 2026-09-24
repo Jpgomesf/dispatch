@@ -35,8 +35,19 @@ pub fn db_path(env_value: Option<&str>) -> PathBuf {
         _ => expand_user(Path::new(DEFAULT_DB)),
     }
 }
+
 /// The repo's own plugin; `cargo install --path .` bakes in the checkout it was built from.
 pub const REPO_PLUGIN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin");
+
+/// The plugin sessions load with `--plugin-dir`: config `plugin_dir`, else `repo_plugin` when
+/// that directory exists, else none (the user's own skills and plugins still load).
+#[must_use]
+pub fn resolve_plugin_dir(configured: Option<&Path>, repo_plugin: &Path) -> Option<PathBuf> {
+    match configured {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => repo_plugin.is_dir().then(|| repo_plugin.to_path_buf()),
+    }
+}
 
 /// `--config`, else `$DISPATCH_CONFIG`, else `~/.config/dispatch/config.toml`.
 pub fn resolve_config_path(cli_value: Option<&Path>, env_value: Option<&str>) -> PathBuf {
@@ -55,7 +66,8 @@ pub struct Paths {
     pub runner: String,
     pub state_dir: PathBuf,
     pub outreach_file: PathBuf,
-    pub plugin_dir: PathBuf,
+    /// `None`: no `--plugin-dir` is passed.
+    pub plugin_dir: Option<PathBuf>,
     pub db: PathBuf,
     pub secrets: PathBuf,
     pub notifications_db: PathBuf,
@@ -71,10 +83,10 @@ impl Paths {
             notifications_db: notifications::default_db(),
             state_dir: config.state_dir.clone(),
             outreach_file: config.outreach_file.clone(),
-            plugin_dir: config
-                .plugin_dir
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(REPO_PLUGIN_DIR)),
+            plugin_dir: resolve_plugin_dir(
+                config.plugin_dir.as_deref(),
+                Path::new(REPO_PLUGIN_DIR),
+            ),
         }
     }
 
@@ -111,19 +123,21 @@ mod tests {
     }
 
     #[test]
-    fn plugin_dir_defaults_to_repo_plugin() {
+    fn plugin_dir_defaults_to_repo_plugin_when_present() {
         let resolved = Paths::resolve(
             Path::new("c.toml"),
             &Config::default(),
             &EnvPaths::default(),
         );
-        assert_eq!(resolved.plugin_dir, PathBuf::from(REPO_PLUGIN_DIR));
-        assert!(
-            resolved
-                .plugin_dir
-                .join(".claude-plugin/plugin.json")
-                .is_file()
-        );
+        let repo_plugin = PathBuf::from(REPO_PLUGIN_DIR);
+        let expected = repo_plugin.is_dir().then_some(repo_plugin);
+        assert_eq!(resolved.plugin_dir, expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("plugin");
+        assert_eq!(resolve_plugin_dir(None, &absent), None, "no plugin: none");
+        std::fs::create_dir_all(&absent).unwrap();
+        assert_eq!(resolve_plugin_dir(None, &absent), Some(absent.clone()));
     }
 
     #[test]
@@ -131,7 +145,11 @@ mod tests {
         let config =
             Config::from_toml("name = \"ex\"\nplugin_dir = \"/opt/example/plugin\"").unwrap();
         let resolved = Paths::resolve(Path::new("c.toml"), &config, &EnvPaths::default());
-        assert_eq!(resolved.plugin_dir, PathBuf::from("/opt/example/plugin"));
+        assert_eq!(
+            resolved.plugin_dir,
+            Some(PathBuf::from("/opt/example/plugin")),
+            "configured: used even when missing, so check reports it"
+        );
     }
 
     #[test]
