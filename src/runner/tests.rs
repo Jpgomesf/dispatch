@@ -21,6 +21,48 @@ fn seed(runner: &Runner<FakeSession>, change: impl FnOnce(&mut State)) {
     runner.store().update(change).unwrap();
 }
 
+#[tokio::test]
+async fn card_already_in_progress_is_not_started_again() {
+    let env = test_env();
+    let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![]));
+    seed(&runner, |s| {
+        s.set_card("EX-1", CardStatus::InProgress, now(), None)
+    });
+    assert!(runner.run_card("EX-1", None).await.unwrap().is_none());
+    assert!(runner.session().calls().is_empty());
+    assert_eq!(status_of(&runner, "EX-1"), Some(CardStatus::InProgress));
+    assert!(lines_of(&lines)[0].contains("card skipped EX-1 — already in progress"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_state_skips_scheduling_instead_of_assuming_empty() {
+    let mut env = test_env();
+    env.config.heartbeat.max_cards_per_tick = 5;
+    let state_file = env.paths.state_file();
+    let triage = heartbeat_output(&[("EX-1", &[]), ("EX-2", &["EX-1"])]);
+    // EX-1 corrupts state.json while it runs; with an empty-state fallback EX-2's blocker
+    // would look external and EX-2 would start.
+    let session = FakeSession::routed(vec![ok(triage)], move |r| {
+        std::fs::write(&state_file, "{not json").unwrap();
+        ok(card_output(r, "done"))
+    });
+    let (runner, lines) = make_runner(&env, session);
+    runner.schedule(TEN_MINUTES, true).await;
+    assert!(runner.session().card_call("EX-1").is_some());
+    assert!(runner.session().card_call("EX-2").is_none());
+    let lines = lines_of(&lines);
+    let skipped = lines
+        .iter()
+        .filter(|l| l.contains("scheduling skipped"))
+        .count();
+    assert_eq!(skipped, 1, "one line per distinct error: {lines:?}");
+    let text = std::fs::read_to_string(env.paths.state_file()).unwrap();
+    assert!(
+        text.starts_with("{not json"),
+        "never overwritten with empty state"
+    );
+}
+
 #[test]
 fn backoff_doubles_and_caps_at_interval() {
     assert_eq!(backoff_delay(0, TEN_MINUTES), TEN_MINUTES);

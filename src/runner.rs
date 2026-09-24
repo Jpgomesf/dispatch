@@ -219,19 +219,33 @@ impl<S: Session> Runner<S> {
         workspace: Option<Workspace>,
     ) -> Option<CardResult> {
         let started = (self.clock)();
-        let marked = self
+        let owned_ref = card_ref.to_string();
+        // Compare-and-set under the state lock: never start a card that is already running.
+        let claimed = self
             .store
-            .update(|state| state.set_card(card_ref, CardStatus::InProgress, started, None));
-        let worked = match marked {
-            Ok(()) => self.work_card(card_ref, workspace.as_ref()).await,
+            .update_async(move |state| {
+                if state.in_progress(&owned_ref) {
+                    return false;
+                }
+                state.set_card(&owned_ref, CardStatus::InProgress, started, None);
+                true
+            })
+            .await;
+        let worked = match claimed {
+            Ok(true) => self.work_card(card_ref, workspace.as_ref()).await,
+            Ok(false) => {
+                self.emit(
+                    "card",
+                    "skipped",
+                    &format!("{card_ref} — already in progress"),
+                );
+                return None;
+            }
             Err(error) => Err(format!("state: {error:#}")),
         };
         match worked {
             Err(error) => {
-                let now = (self.clock)();
-                let _ = self
-                    .store
-                    .update(|state| state.set_card(card_ref, CardStatus::Failed, now, None));
+                let _ = self.record_card(card_ref, CardStatus::Failed, None).await;
                 self.emit(
                     "card",
                     "failed",
@@ -240,13 +254,9 @@ impl<S: Session> Runner<S> {
                 None
             }
             Ok((result, outcome, checkout)) => {
-                let now = (self.clock)();
                 let status = card_status(result.status);
                 let pr_url = result.pr_url.clone();
-                if let Err(error) = self
-                    .store
-                    .update(|state| state.set_card(card_ref, status, now, pr_url))
-                {
+                if let Err(error) = self.record_card(card_ref, status, pr_url).await {
                     self.emit("card", "failed", &format!("{card_ref} — state: {error:#}"));
                     return None;
                 }
@@ -259,6 +269,19 @@ impl<S: Session> Runner<S> {
                 Some(result)
             }
         }
+    }
+
+    async fn record_card(
+        &self,
+        card_ref: &str,
+        status: CardStatus,
+        pr_url: Option<String>,
+    ) -> anyhow::Result<()> {
+        let now = (self.clock)();
+        let card_ref = card_ref.to_string();
+        self.store
+            .update_async(move |state| state.set_card(&card_ref, status, now, pr_url))
+            .await
     }
 
     async fn work_card(
@@ -315,7 +338,11 @@ impl<S: Session> Runner<S> {
     }
 
     async fn try_triage(&self) -> Result<(HeartbeatResult, SessionOutcome), String> {
-        let state = self.store.load().map_err(|e| format!("state: {e:#}"))?;
+        let state = self
+            .store
+            .load_async()
+            .await
+            .map_err(|e| format!("state: {e:#}"))?;
         let prompt = heartbeat_prompt(&self.config, &self.paths, &state.cursors, (self.clock)());
         let hb = &self.config.heartbeat;
         let request = self.request(
@@ -331,16 +358,18 @@ impl<S: Session> Runner<S> {
             .map_err(|e| e.0)?;
         let result: HeartbeatResult = serde_json::from_value(outcome.output.clone())
             .map_err(|e| format!("invalid heartbeat result: {e}"))?;
+        let cursors = result.cursors.clone();
         self.store
-            .update(|state| state.cursors.extend(result.cursors.clone()))
+            .update_async(move |state| state.cursors.extend(cursors))
+            .await
             .map_err(|e| format!("state: {e:#}"))?;
         Ok((result, outcome))
     }
 
     /// Cards left `in_progress` by a crashed run become `failed`, so triage can pick them up.
-    pub fn release_stale_cards(&self) {
+    pub async fn release_stale_cards(&self) {
         let now = (self.clock)();
-        let _ = self.store.update(|state| {
+        let released = self.store.update_async(move |state| {
             let stale: Vec<String> = state
                 .cards
                 .keys()
@@ -351,11 +380,14 @@ impl<S: Session> Runner<S> {
                 state.set_card(&card_ref, CardStatus::Failed, now, None);
             }
         });
+        if let Err(error) = released.await {
+            self.emit("heartbeat", "failed", &format!("state: {error:#}"));
+        }
     }
 
     pub async fn heartbeat(&self, interval: Duration, once: bool) {
         if !self.should_stop() {
-            self.release_stale_cards();
+            self.release_stale_cards().await;
         }
         self.schedule(interval, once).await;
     }
@@ -368,8 +400,8 @@ impl<S: Session> Runner<S> {
         queue: &mut Vec<CardToWork>,
         listed: Vec<CardToWork>,
         running: &HashSet<String>,
+        state: &State,
     ) {
-        let state = self.store.load().unwrap_or_default();
         let limit = self.config.heartbeat.max_cards_per_tick as usize;
         let mut seen = HashSet::new();
         let mut added = 0;
@@ -392,17 +424,20 @@ impl<S: Session> Runner<S> {
         *queue = next;
     }
 
+    fn has_free_slot(&self, queue: &[CardToWork], running: &HashMap<Id, String>) -> bool {
+        !queue.is_empty()
+            && running.len() < self.config.card.max_parallel as usize
+            && !self.should_stop()
+    }
+
     fn start_ready(
         &self,
         queue: &mut Vec<CardToWork>,
         cards: &mut JoinSet<()>,
         running: &mut HashMap<Id, String>,
+        state: &State,
     ) {
         let max_parallel = self.config.card.max_parallel as usize;
-        if queue.is_empty() || running.len() >= max_parallel || self.should_stop() {
-            return;
-        }
-        let state = self.store.load().unwrap_or_default();
         let batch: HashSet<String> = queue
             .iter()
             .map(|c| c.card_ref.clone())
@@ -411,7 +446,7 @@ impl<S: Session> Runner<S> {
         let batch: HashSet<&str> = batch.iter().map(String::as_str).collect();
         let mut index = 0;
         while index < queue.len() && running.len() < max_parallel {
-            if !is_ready(&queue[index], &state, &batch) {
+            if !is_ready(&queue[index], state, &batch) {
                 index += 1;
                 continue;
             }
@@ -423,6 +458,25 @@ impl<S: Session> Runner<S> {
                 me.run_card_in(&card_ref, workspace).await;
             });
             running.insert(handle.id(), card.card_ref);
+        }
+    }
+
+    /// State for a scheduling decision. On failure, prints one line (once per distinct error,
+    /// since the loop retries every few seconds) and returns `None` so the caller skips.
+    async fn load_for_scheduling(&self, last_error: &mut Option<String>) -> Option<State> {
+        match self.store.load_async().await {
+            Ok(state) => {
+                *last_error = None;
+                Some(state)
+            }
+            Err(error) => {
+                let message = one_line(&format!("state: {error:#}; scheduling skipped"));
+                if last_error.as_deref() != Some(message.as_str()) {
+                    self.emit("heartbeat", "failed", &message);
+                    *last_error = Some(message);
+                }
+                None
+            }
         }
     }
 
@@ -438,6 +492,7 @@ impl<S: Session> Runner<S> {
         let mut failures = 0u32;
         let mut next_triage = Instant::now();
         let mut shutdown = self.shutdown.subscribe();
+        let mut state_error: Option<String> = None;
 
         loop {
             if self.should_stop() {
@@ -449,7 +504,12 @@ impl<S: Session> Runner<S> {
                 let me = self.clone();
                 triage = Some(tokio::spawn(async move { me.triage().await }));
             }
-            self.start_ready(&mut queue, &mut cards, &mut running);
+            if self.has_free_slot(&queue, &running) {
+                // An unreadable state file skips this tick's scheduling; never an empty state.
+                if let Some(state) = self.load_for_scheduling(&mut state_error).await {
+                    self.start_ready(&mut queue, &mut cards, &mut running, &state);
+                }
+            }
             if once && triaged && triage.is_none() && cards.is_empty() {
                 break;
             }
@@ -472,9 +532,11 @@ impl<S: Session> Runner<S> {
                     triaged = true;
                     failures = if result.is_some() { 0 } else { failures + 1 };
                     next_triage = Instant::now() + backoff_delay(failures, interval);
-                    if let Some(result) = result {
+                    if let Some(result) = result
+                        && let Some(state) = self.load_for_scheduling(&mut state_error).await
+                    {
                         let busy: HashSet<String> = running.values().cloned().collect();
-                        self.merge_queue(&mut queue, result.cards_to_work, &busy);
+                        self.merge_queue(&mut queue, result.cards_to_work, &busy, &state);
                     }
                 }
                 Event::CardDone(id) => {
