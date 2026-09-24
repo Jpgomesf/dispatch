@@ -78,7 +78,7 @@ fn readiness_rules() {
     let mut state = State::default();
     state.set_card("EX-1", CardStatus::Done, now(), None);
     state.set_card("EX-2", CardStatus::Failed, now(), None);
-    let batch: HashSet<&str> = ["EX-5"].into();
+    let batch: HashSet<String> = ["EX-5".to_string()].into();
     let card = |blocked_by: &[&str]| CardToWork {
         card_ref: "EX-9".into(),
         blocked_by: blocked_by.iter().map(|s| s.to_string()).collect(),

@@ -17,7 +17,7 @@ use crate::prompts::{card_prompt, heartbeat_prompt};
 use crate::results::{
     CardOutcome, CardResult, CardToWork, HeartbeatResult, card_schema, heartbeat_schema,
 };
-use crate::session::{Session, SessionOutcome, SessionRequest, Shutdown};
+use crate::session::{Session, SessionRequest, Shutdown};
 use crate::state::{CardStatus, State, StateStore};
 use crate::worktree;
 
@@ -30,6 +30,7 @@ pub type Output = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Delay before the next triage: the interval after a success, else 30s doubling per
 /// consecutive failure, capped at the interval.
+#[must_use]
 pub fn backoff_delay(failures: u32, interval: Duration) -> Duration {
     if failures == 0 {
         return interval;
@@ -67,29 +68,31 @@ fn one_line(text: &str) -> String {
     joined.chars().take(300).collect()
 }
 
-fn cost(outcome: &SessionOutcome) -> String {
-    outcome
-        .cost_usd
+fn cost(cost_usd: Option<f64>) -> String {
+    cost_usd
         .map(|c| format!(" cost=${c:.2}"))
         .unwrap_or_default()
 }
 
-fn card_status(outcome: CardOutcome) -> CardStatus {
-    match outcome {
-        CardOutcome::Done => CardStatus::Done,
-        CardOutcome::Blocked => CardStatus::Blocked,
-        CardOutcome::Failed => CardStatus::Failed,
+impl From<CardOutcome> for CardStatus {
+    fn from(outcome: CardOutcome) -> Self {
+        match outcome {
+            CardOutcome::Done => CardStatus::Done,
+            CardOutcome::Blocked => CardStatus::Blocked,
+            CardOutcome::Failed => CardStatus::Failed,
+        }
     }
 }
 
 /// Every `blocked_by` ref is done in state, or unknown to state and not part of the current
 /// batch (queued or running) — an external dependency the runner cannot track.
-pub fn is_ready(card: &CardToWork, state: &State, batch: &HashSet<&str>) -> bool {
+#[must_use]
+pub fn is_ready(card: &CardToWork, state: &State, batch: &HashSet<String>) -> bool {
     card.blocked_by
         .iter()
         .all(|blocker| match state.status(blocker) {
             Some(status) => status == CardStatus::Done,
-            None => !batch.contains(blocker.as_str()),
+            None => !batch.contains(blocker),
         })
 }
 
@@ -143,10 +146,12 @@ impl<S: Session> Runner<S> {
         self.shutdown.clone()
     }
 
+    #[must_use]
     pub fn killed(&self) -> bool {
         self.paths.kill_switch().exists()
     }
 
+    #[must_use]
     pub fn should_stop(&self) -> bool {
         *self.shutdown.borrow() != Shutdown::Run || self.killed()
     }
@@ -253,14 +258,14 @@ impl<S: Session> Runner<S> {
                 );
                 None
             }
-            Ok((result, outcome, checkout)) => {
-                let status = card_status(result.status);
+            Ok((result, cost_usd, checkout)) => {
+                let status = result.status.into();
                 let pr_url = result.pr_url.clone();
                 if let Err(error) = self.record_card(card_ref, status, pr_url).await {
                     self.emit("card", "failed", &format!("{card_ref} — state: {error:#}"));
                     return None;
                 }
-                let detail = format!("{card_ref}{} — {}", cost(&outcome), result.summary);
+                let detail = format!("{card_ref}{} — {}", cost(cost_usd), result.summary);
                 self.emit("card", result.status.as_str(), &detail);
                 if let (CardOutcome::Done, Some(workspace)) = (result.status, &workspace) {
                     // Best effort: a dirty worktree is kept for a person to look at.
@@ -288,7 +293,7 @@ impl<S: Session> Runner<S> {
         &self,
         card_ref: &str,
         workspace: Option<&Workspace>,
-    ) -> Result<(CardResult, SessionOutcome, PathBuf), String> {
+    ) -> Result<(CardResult, Option<f64>, PathBuf), String> {
         let checkout = match workspace {
             Some(w) => worktree::card_checkout(w, card_ref, &self.paths.worktrees_dir()).await?,
             None => self.state_dir(),
@@ -312,19 +317,19 @@ impl<S: Session> Runner<S> {
             .run(request, self.shutdown.subscribe())
             .await
             .map_err(|e| e.0)?;
-        let result: CardResult = serde_json::from_value(outcome.output.clone())
+        let result: CardResult = serde_json::from_value(outcome.output)
             .map_err(|e| format!("invalid card result: {e}"))?;
-        Ok((result, outcome, checkout))
+        Ok((result, outcome.cost_usd, checkout))
     }
 
     pub async fn triage(&self) -> Option<HeartbeatResult> {
         match self.try_triage().await {
-            Ok((result, outcome)) => {
+            Ok((result, cost_usd)) => {
                 let detail = format!(
                     "handled={} cards={}{} — {}",
                     result.handled.len(),
                     result.cards_to_work.len(),
-                    cost(&outcome),
+                    cost(cost_usd),
                     result.summary
                 );
                 self.emit("heartbeat", "ok", &detail);
@@ -337,7 +342,7 @@ impl<S: Session> Runner<S> {
         }
     }
 
-    async fn try_triage(&self) -> Result<(HeartbeatResult, SessionOutcome), String> {
+    async fn try_triage(&self) -> Result<(HeartbeatResult, Option<f64>), String> {
         let state = self
             .store
             .load_async()
@@ -356,14 +361,14 @@ impl<S: Session> Runner<S> {
             .run(request, self.shutdown.subscribe())
             .await
             .map_err(|e| e.0)?;
-        let result: HeartbeatResult = serde_json::from_value(outcome.output.clone())
+        let result: HeartbeatResult = serde_json::from_value(outcome.output)
             .map_err(|e| format!("invalid heartbeat result: {e}"))?;
         let cursors = result.cursors.clone();
         self.store
             .update_async(move |state| state.cursors.extend(cursors))
             .await
             .map_err(|e| format!("state: {e:#}"))?;
-        Ok((result, outcome))
+        Ok((result, outcome.cost_usd))
     }
 
     /// Cards left `in_progress` by a crashed run become `failed`, so triage can pick them up.
@@ -443,7 +448,6 @@ impl<S: Session> Runner<S> {
             .map(|c| c.card_ref.clone())
             .chain(running.values().cloned())
             .collect();
-        let batch: HashSet<&str> = batch.iter().map(String::as_str).collect();
         let mut index = 0;
         while index < queue.len() && running.len() < max_parallel {
             if !is_ready(&queue[index], state, &batch) {
