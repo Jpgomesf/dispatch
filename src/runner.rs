@@ -21,7 +21,7 @@ use crate::results::{
     CardOutcome, CardResult, DiscussionResult, DiscussionToRun, TriageResult, card_schema,
     discussion_schema, triage_schema,
 };
-use crate::session::{Session, SessionRequest, Shutdown};
+use crate::session::{Mode, Session, SessionRequest, Shutdown};
 use crate::state::{CardState, CardStatus};
 use crate::store::{CLAIM_LEASE, CLAIM_RENEW, Claim, Store};
 use crate::worktree;
@@ -182,12 +182,14 @@ impl<S: Session> Runner<S> {
 
     fn request(
         &self,
+        mode: Mode,
         prompt: String,
         (model, effort, max_budget_usd): (&str, Effort, f64),
         cwd: PathBuf,
         output_schema: serde_json::Value,
     ) -> SessionRequest {
         SessionRequest {
+            mode,
             prompt,
             model: model.to_string(),
             effort,
@@ -388,6 +390,7 @@ impl<S: Session> Runner<S> {
         );
         let card = &self.config.card;
         let request = self.request(
+            Mode::Card,
             prompt,
             (&card.model, card.effort, card.max_budget_usd),
             checkout.clone(),
@@ -459,6 +462,7 @@ impl<S: Session> Runner<S> {
         );
         let card = &self.config.card;
         let request = self.request(
+            Mode::Discussion,
             prompt,
             (&card.model, card.effort, card.max_budget_usd),
             checkout.clone(),
@@ -515,6 +519,7 @@ impl<S: Session> Runner<S> {
         );
         let triage = &self.config.triage;
         let request = self.request(
+            Mode::Triage,
             prompt,
             (&triage.model, triage.effort, triage.max_budget_usd),
             self.state_dir(),

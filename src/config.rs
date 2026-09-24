@@ -15,6 +15,15 @@ pub use intake::{
 pub const DEFAULT_CONFIG_DIR: &str = "~/.config/dispatch";
 pub const DEFAULT_STATE_DIR: &str = "~/.local/state/dispatch";
 
+/// What each session is asked to do; the JSON context block follows it. `{ref}` is replaced by
+/// the card or discussion ref.
+pub const TRIAGE_OBJECTIVE: &str = "Check the new activity below (or sweep your sources if \
+`events` is empty) and decide what deserves attention: respond, draft, ignore, pick up \
+assigned work as cards, or investigate mentions.";
+pub const CARD_OBJECTIVE: &str = "Work card {ref} to completion in this workspace.";
+pub const DISCUSSION_OBJECTIVE: &str = "You were mentioned in a discussion about {ref}. \
+Investigate the question and respond in the thread.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -48,6 +57,7 @@ pub struct TriageConfig {
     pub effort: Effort,
     pub max_budget_usd: f64,
     pub max_cards_per_tick: u32,
+    pub objective: String,
 }
 
 impl Default for TriageConfig {
@@ -58,10 +68,12 @@ impl Default for TriageConfig {
             effort: Effort::Medium,
             max_budget_usd: 1.0,
             max_cards_per_tick: 1,
+            objective: TRIAGE_OBJECTIVE.into(),
         }
     }
 }
 
+/// Card sessions; discussion sessions use the same model, effort and budget.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CardConfig {
@@ -70,6 +82,8 @@ pub struct CardConfig {
     pub max_budget_usd: f64,
     /// Card and discussion sessions running at the same time under `heartbeat`.
     pub max_parallel: u32,
+    /// `{ref}` is replaced by the card ref.
+    pub objective: String,
 }
 
 impl Default for CardConfig {
@@ -79,6 +93,23 @@ impl Default for CardConfig {
             effort: Effort::High,
             max_budget_usd: 20.0,
             max_parallel: 2,
+            objective: CARD_OBJECTIVE.into(),
+        }
+    }
+}
+
+/// Discussion sessions (model, effort and budget come from `[card]`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiscussionConfig {
+    /// `{ref}` is replaced by the discussion ref.
+    pub objective: String,
+}
+
+impl Default for DiscussionConfig {
+    fn default() -> Self {
+        Self {
+            objective: DISCUSSION_OBJECTIVE.into(),
         }
     }
 }
@@ -124,6 +155,7 @@ pub struct Config {
     pub plugin_dir: Option<PathBuf>,
     pub triage: TriageConfig,
     pub card: CardConfig,
+    pub discussion: DiscussionConfig,
     pub sources: SourcesConfig,
     pub intake: IntakeConfig,
     pub workspaces: Vec<Workspace>,
@@ -138,6 +170,7 @@ impl Default for Config {
             plugin_dir: None,
             triage: TriageConfig::default(),
             card: CardConfig::default(),
+            discussion: DiscussionConfig::default(),
             sources: SourcesConfig::default(),
             intake: IntakeConfig::default(),
             workspaces: Vec::new(),
@@ -170,6 +203,15 @@ impl Config {
         }
         if self.card.max_parallel == 0 {
             return Err("card.max_parallel must be >= 1".into());
+        }
+        for (key, objective) in [
+            ("triage.objective", &self.triage.objective),
+            ("card.objective", &self.card.objective),
+            ("discussion.objective", &self.discussion.objective),
+        ] {
+            if objective.trim().is_empty() {
+                return Err(format!("{key} must not be empty"));
+            }
         }
         self.intake.validate()?;
         self.outreach_file = expand_user(&self.outreach_file);
@@ -284,6 +326,17 @@ match = ["EX-"]
         assert_eq!(config.card.effort, Effort::High);
         assert_eq!(config.card.max_budget_usd, 20.0);
         assert_eq!(config.card.max_parallel, 2);
+        assert_eq!(config.triage.objective, TRIAGE_OBJECTIVE);
+        assert_eq!(
+            config.card.objective,
+            "Work card {ref} to completion in this workspace."
+        );
+        assert!(
+            config
+                .discussion
+                .objective
+                .contains("discussion about {ref}")
+        );
         assert_eq!(
             config.state_dir,
             expand_user(Path::new("~/.local/state/dispatch"))
@@ -336,6 +389,9 @@ match = ["EX-"]
             "[intake.jira]\nenabled = true\nbase_url = \"http://example.atlassian.net\"",
             "[intake.jira]\njql = \"project = EX) OR (project = OTHER\"",
             "[intake.notifications]\npoll = \"often\"",
+            "[card]\nobjective = \"  \"",
+            "[discussion]\nobjective = \"\"",
+            "[discussion]\nmodel = \"sonnet\"",
         ] {
             let raw = format!("name = \"example-app\"\n{body}");
             assert!(Config::from_toml(&raw).is_err(), "{raw}");
@@ -387,6 +443,17 @@ jql = "project = EX"
         assert_eq!(intake.linear.projects, ["Example App"]);
         assert_eq!(intake.linear.api_url, LINEAR_API_URL);
         assert_eq!(intake.jira.jql, "project = EX");
+    }
+
+    #[test]
+    fn objectives_are_configurable() {
+        let raw = "name = \"ex\"\n[triage]\nobjective = \"Look around.\"\n\
+                   [card]\nobjective = \"Finish {ref}.\"\n\
+                   [discussion]\nobjective = \"Answer about {ref}.\"\n";
+        let config = Config::from_toml(raw).unwrap();
+        assert_eq!(config.triage.objective, "Look around.");
+        assert_eq!(config.card.objective, "Finish {ref}.");
+        assert_eq!(config.discussion.objective, "Answer about {ref}.");
     }
 
     #[test]

@@ -102,10 +102,7 @@ async fn card_command() {
     let session = FakeSession::sequence(vec![ok(card_output("EX-1", "done"))]);
     let (code, session) = run_with(&env, &["card", "EX-1"], session).await;
     assert_eq!(code, EXIT_OK);
-    assert_eq!(
-        session.first_lines(),
-        ["/claude-harness:workflow card EX-1"]
-    );
+    assert_eq!(session.labels(), ["card EX-1"]);
 }
 
 #[tokio::test]
@@ -169,7 +166,7 @@ async fn heartbeat_once() {
     let args = ["heartbeat", "--once", "--interval", "1m"];
     let (code, session) = run_with(&env, &args, session).await;
     assert_eq!(code, EXIT_OK);
-    assert_eq!(session.first_lines(), ["/claude-harness:workflow triage"]);
+    assert_eq!(session.labels(), ["triage"]);
 }
 
 #[tokio::test]

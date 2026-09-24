@@ -14,9 +14,30 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::config::Effort;
+use crate::prompts::RUNNER_RULES;
+
+/// Which kind of session: decides the objective, the schema and the limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Triage,
+    Card,
+    Discussion,
+}
+
+impl Mode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Triage => "triage",
+            Mode::Card => "card",
+            Mode::Discussion => "discussion",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRequest {
+    pub mode: Mode,
     pub prompt: String,
     pub model: String,
     pub effort: Effort,
@@ -55,8 +76,9 @@ pub trait Session: Send + Sync + 'static {
     ) -> impl Future<Output = Result<SessionOutcome, SessionError>> + Send;
 }
 
-/// `claude -p` in print mode with JSON structured output, auto permission mode and the
-/// dispatch plugin; user/project settings and MCP servers load as in any Claude Code run.
+/// `claude -p` in print mode with JSON structured output, auto permission mode, no permission
+/// prompts (nobody is there to answer) and the runner rules appended to the system prompt;
+/// user/project settings, skills and MCP servers load as in any Claude Code run.
 #[derive(Debug, Clone)]
 pub struct ClaudeCli {
     pub program: PathBuf,
@@ -84,6 +106,10 @@ pub fn build_args(request: &SessionRequest) -> Vec<String> {
         request.output_schema.to_string(),
         "--permission-mode".into(),
         "auto".into(),
+        "--permission-prompts".into(),
+        "none".into(),
+        "--append-system-prompt".into(),
+        RUNNER_RULES.into(),
         "--model".into(),
         request.model.clone(),
         "--effort".into(),
@@ -260,7 +286,8 @@ mod tests {
 
     fn request() -> SessionRequest {
         SessionRequest {
-            prompt: "/claude-harness:workflow heartbeat".into(),
+            mode: Mode::Triage,
+            prompt: "Check the new activity.".into(),
             model: "sonnet".into(),
             effort: Effort::Medium,
             max_budget_usd: 1.5,
@@ -277,13 +304,17 @@ mod tests {
             args,
             [
                 "-p",
-                "/claude-harness:workflow heartbeat",
+                "Check the new activity.",
                 "--output-format",
                 "json",
                 "--json-schema",
                 r#"{"type":"object"}"#,
                 "--permission-mode",
                 "auto",
+                "--permission-prompts",
+                "none",
+                "--append-system-prompt",
+                RUNNER_RULES,
                 "--model",
                 "sonnet",
                 "--effort",

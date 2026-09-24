@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use crate::config::{Config, tests::config_toml};
 use crate::paths::{EnvPaths, Paths};
 use crate::runner::{Clock, Runner};
-use crate::session::{Session, SessionError, SessionOutcome, SessionRequest, Shutdown};
+use crate::session::{Mode, Session, SessionError, SessionOutcome, SessionRequest, Shutdown};
 use crate::store::Store;
 
 pub fn now() -> DateTime<Utc> {
@@ -104,8 +104,21 @@ pub struct Call {
 }
 
 impl Call {
-    pub fn first_line(&self) -> &str {
-        self.request.prompt.lines().next().unwrap_or("")
+    pub fn context(&self) -> Value {
+        crate::prompts::context_of(&self.request.prompt)
+    }
+
+    /// The context's `ref` (empty for triage).
+    pub fn reference(&self) -> String {
+        self.context()["ref"].as_str().unwrap_or("").to_string()
+    }
+
+    /// `triage`, `card EX-1` or `discussion EX-9`.
+    pub fn label(&self) -> String {
+        match self.request.mode {
+            Mode::Triage => "triage".into(),
+            mode => format!("{} {}", mode.as_str(), self.reference()),
+        }
     }
 }
 
@@ -146,20 +159,18 @@ impl FakeSession {
     pub fn routed(triages: Vec<Step>, card: impl Fn(&str) -> Step + Send + Sync + 'static) -> Self {
         let triages = Mutex::new(VecDeque::from(triages));
         FakeSession::new(move |request| {
-            let first = request.prompt.lines().next().unwrap_or("");
-            let command = first
-                .strip_prefix("/claude-harness:workflow ")
-                .unwrap_or("");
-            if let Some(card_ref) = command.strip_prefix("card ") {
-                card(card_ref)
-            } else if let Some(discussion_ref) = command.strip_prefix("discussion ") {
-                ok(discussion_output(discussion_ref, "drafted"))
-            } else {
-                triages
+            let reference = crate::prompts::context_of(&request.prompt)["ref"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            match request.mode {
+                Mode::Card => card(&reference),
+                Mode::Discussion => ok(discussion_output(&reference, "drafted")),
+                Mode::Triage => triages
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .unwrap_or_else(|| ok(triage_output(&[])))
+                    .unwrap_or_else(|| ok(triage_output(&[]))),
             }
         })
     }
@@ -168,16 +179,15 @@ impl FakeSession {
         self.calls.lock().unwrap().clone()
     }
 
-    pub fn first_lines(&self) -> Vec<String> {
-        self.calls()
-            .iter()
-            .map(|c| c.first_line().to_string())
-            .collect()
+    /// Each call's `label()`, in call order.
+    pub fn labels(&self) -> Vec<String> {
+        self.calls().iter().map(Call::label).collect()
     }
 
     pub fn card_call(&self, card_ref: &str) -> Option<Call> {
-        let line = format!("/claude-harness:workflow card {card_ref}");
-        self.calls().into_iter().find(|c| c.first_line() == line)
+        self.calls()
+            .into_iter()
+            .find(|c| c.request.mode == Mode::Card && c.reference() == card_ref)
     }
 }
 

@@ -142,11 +142,8 @@ async fn tick_persists_cursors_and_runs_cards() {
 
     let session = runner.session();
     let triage = &session.calls()[0].request;
-    assert!(
-        triage
-            .prompt
-            .starts_with("/claude-harness:workflow triage\n")
-    );
+    assert_eq!(triage.mode, crate::session::Mode::Triage);
+    assert!(triage.prompt.starts_with(crate::config::TRIAGE_OBJECTIVE));
     assert_eq!(triage.model, "sonnet");
     assert_eq!(triage.cwd, env.paths.state_dir);
     assert_eq!(
@@ -206,15 +203,9 @@ async fn respects_max_cards_and_skips_in_progress() {
     let (runner, _) = make_runner(&env, session);
     seed_card(&runner, "EX-1", CardStatus::InProgress);
     runner.schedule(TEN_MINUTES, true).await;
-    let mut cards = runner.session().first_lines()[1..].to_vec();
+    let mut cards = runner.session().labels()[1..].to_vec();
     cards.sort();
-    assert_eq!(
-        cards,
-        [
-            "/claude-harness:workflow card EX-2",
-            "/claude-harness:workflow card EX-3"
-        ]
-    );
+    assert_eq!(cards, ["card EX-2", "card EX-3"]);
 }
 
 #[tokio::test]
@@ -445,9 +436,9 @@ async fn triage_keeps_ticking_while_cards_run() {
         std::fs::write(kill_switch, "").unwrap();
     });
     runner.heartbeat(TEN_MINUTES, false).await;
-    let lines = runner.session().first_lines();
-    let triages = lines.iter().filter(|l| l.ends_with("triage")).count();
-    let cards = lines.iter().filter(|l| l.contains(" card ")).count();
+    let lines = runner.session().labels();
+    let triages = lines.iter().filter(|l| *l == "triage").count();
+    let cards = lines.iter().filter(|l| l.starts_with("card ")).count();
     assert_eq!(triages, 3, "t=0, 10m, 20m while the card runs: {lines:?}");
     assert_eq!(cards, 1);
     assert_eq!(
@@ -651,16 +642,16 @@ async fn discussions_share_max_parallel_with_cards() {
 
     let session = runner.session();
     assert_eq!(session.max_active.load(Ordering::SeqCst), 1);
-    let firsts = session.first_lines();
+    let firsts = session.labels();
     assert_eq!(
-        firsts.iter().filter(|l| l.contains(" discussion ")).count(),
+        firsts
+            .iter()
+            .filter(|l| l.starts_with("discussion "))
+            .count(),
         1,
         "deduplicated by claim key: {firsts:?}"
     );
-    assert_eq!(
-        firsts[1], "/claude-harness:workflow discussion EX-9",
-        "discussions first"
-    );
+    assert_eq!(firsts[1], "discussion EX-9", "discussions first");
     let triage_at = session.calls()[0].started;
     assert_eq!(session.card_call("EX-1").unwrap().started, triage_at);
     assert_eq!(

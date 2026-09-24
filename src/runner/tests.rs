@@ -196,10 +196,8 @@ async fn discussion_runs_without_an_assignee_check_or_a_workspace() {
     assert_eq!(result.status, crate::results::DiscussionOutcome::Replied);
 
     let call = &runner.session().calls()[0];
-    assert_eq!(
-        call.first_line(),
-        "/claude-harness:workflow discussion EX-9"
-    );
+    assert_eq!(call.label(), "discussion EX-9");
+    assert_eq!(call.request.mode, crate::session::Mode::Discussion);
     assert_eq!(
         call.request.cwd, env.paths.state_dir,
         "no workspace: the state dir"
