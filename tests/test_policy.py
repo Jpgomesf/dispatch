@@ -189,3 +189,21 @@ def test_gate_reads_kill_switch_each_call() -> None:
     assert gate.check("Read", {}).allowed
     flag["stopped"] = True
     assert gate.check("Read", {}).stop
+
+
+@pytest.mark.parametrize(
+    ("tool", "tool_input"),
+    [
+        (GMAIL_SEND, {"draftId": "d1", "to": ["alex@example.com"]}),
+        (GMAIL_REPLY, {"messageId": "m1", "replyAll": True, "to": ["alex@example.com"]}),
+    ],
+)
+def test_allowlisted_to_cannot_mask_real_recipients(tool: str, tool_input: dict[str, Any]) -> None:
+    assert not run(tool, tool_input).allowed
+
+
+@pytest.mark.parametrize(
+    "tool", ["mcp__claude_ai_Gmail__untrash_message", "mcp__claude_ai_Gmail__untrash_thread"]
+)
+def test_untrash_is_not_destructive(tool: str) -> None:
+    assert run(tool, {"messageId": "m1"}).allowed

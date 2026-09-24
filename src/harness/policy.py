@@ -48,7 +48,8 @@ def is_draft_tool(tool_name: str) -> bool:
 def is_destructive_messaging_tool(tool_name: str) -> bool:
     lowered = tool_name.lower()
     is_messaging = any(server in lowered for server in _MESSAGING_SERVERS)
-    return is_messaging and any(word in base_name(lowered) for word in _DESTRUCTIVE_WORDS)
+    words = base_name(lowered).split("_")
+    return is_messaging and any(word in words for word in _DESTRUCTIVE_WORDS)
 
 
 def is_denied_by_config(tool_name: str, deny: tuple[str, ...]) -> bool:
@@ -88,6 +89,10 @@ def slack_target_allowed(tool_input: dict[str, Any], send: SendConfig) -> bool:
 
 
 def email_target_allowed(tool_input: dict[str, Any], send: SendConfig) -> bool:
+    # Gmail ignores `to` when sending a stored draft and adds thread recipients on reply-all,
+    # so the real recipients are not in the input.
+    if tool_input.get("draftId") or tool_input.get("replyAll"):
+        return False
     targets = _targets(tool_input, _EMAIL_TARGET_KEYS)
     allowed = {domain.lower() for domain in send.email_domains}
     return targets is not None and all(_email_domain(t) in allowed for t in targets)
