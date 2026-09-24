@@ -128,7 +128,7 @@ A PreToolUse hook classifies every tool call, subagents included (`can_use_tool`
   target channel/user/email domain is listed; and under `max_per_hour`.
   Otherwise denied with the message *"Not allowed to send here — create a draft
   instead."* so the agent falls back to a draft.
-- **Draft tools**: always allowed.
+- **Draft tools**: always allowed (deleting a draft counts as destructive).
 - **`tools.deny`** entries and destructive messaging tools (trash / delete):
   denied.
 - Kill switch present: every tool denied, session ends.

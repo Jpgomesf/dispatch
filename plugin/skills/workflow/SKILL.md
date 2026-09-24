@@ -22,7 +22,7 @@ first; if it is missing or invalid, return the failure result for the mode
 `status: "failed"`).
 
 - heartbeat: `{now, cursors, sources, workspaces, outreach_file}`
-- card: `{now, ref, workspace, outreach_file}` (`workspace` may be null)
+- card: `{now, ref, workspace, workspaces, outreach_file}` (`workspace` may be null)
 
 `now` is the clock for every time decision (lookback, working hours, follow-ups).
 
@@ -92,8 +92,7 @@ Pipeline for `<ref>`. Each step names its stop condition.
    ref means resume, not restart.
 2. **Resolve the workspace.** Use `workspace` from the context; if null, match
    the ref prefix, team or repo named in the card against `match` in the
-   `[[workspaces]]` of the runner config (`$HARNESS_CONFIG`, default
-   `~/.config/claude-harness/config.toml`; read only). No match, or the path
+   context's `workspaces` list. Never read config files. No match, or the path
    is not a git checkout → `blocked`, `blocked_on: "no workspace for <ref>"`.
    Read the workspace's `CLAUDE.md` / contributing docs: their rules win.
 3. **Gap check.** List what the spec leaves open. Decide what you can default

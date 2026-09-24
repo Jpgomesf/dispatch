@@ -60,7 +60,7 @@ runner enforces the send policy. If a send is denied with **"Not allowed to send
 here — create a draft instead."**:
 
 - create the same message with the equivalent draft tool (Slack
-  `send_message_draft`, Gmail `create_draft`, or the tool's draft variant);
+  `slack_send_message_draft`, Gmail `create_draft`, or the tool's draft variant);
 - do **not** retry the send, switch channel or medium, schedule it, post it as a
   tracker comment, or deliver it through a CLI or HTTP call;
 - record the action as `drafted`.
