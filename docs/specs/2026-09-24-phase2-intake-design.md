@@ -72,6 +72,27 @@ defaults stay `sonnet` / `medium`. Unknown keys are still rejected.
   narrows further.
 - Both authenticate as the key's owner, so "me" is the person whose key it is.
 
+## Work vs discussion events
+
+Every tracker event carries `kind`:
+
+- `work` — the ticket is assigned to me (queries above). May become a card.
+- `discussion` — activity on a ticket I take part in but am not assigned:
+  - Linear: the personal `notifications` feed (mentions, new comments on
+    subscribed issues, replies to my comments), polled with a cursor.
+  - Jira: `watcher = currentUser() AND assignee != currentUser() AND updated > <cursor>`
+    (commenting, reporting or being mentioned makes you a watcher); only comments
+    newer than the cursor, excluding my own.
+  - Triage only: reply, draft or ignore. Never a card.
+
+Enforcement:
+
+- Runner (hard): before claiming a card, it re-checks through the tracker API that
+  the card's assignee is me; otherwise the card is refused with one stdout line,
+  whatever triage returned. Refs from other trackers or without a key are refused.
+- Skill (soft): `discussion` events never go into `cards_to_work`; the skill may
+  offer to take the ticket if it gets assigned.
+
 ## Store: `harness.db` (SQLite, machine-wide)
 
 One file shared by every runner on the machine: `~/.local/state/claude-harness/harness.db`
