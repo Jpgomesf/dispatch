@@ -1,30 +1,30 @@
 ---
 name: workflow
-description: Entry point for claude-harness runs. `triage` handles the intake events (or sweeps Slack and the tracker since the cursors) and returns a TriageResult; `card <ref>` works one tracker card end to end (claim, plan, implement, verify, review, PR, report) and returns a CardResult; `discussion <ref>` investigates a question asked of the user in a thread and answers it, returning a DiscussionResult. Invoked by the harness runner with a JSON context block.
-argument-hint: "triage | card <ref> | discussion <ref>  (followed by a JSON context block)"
-disable-model-invocation: true
+description: Use in an unattended dispatch session to check new activity (Slack, tracker or notification events, or a sweep of your sources when `events` is empty) and decide what deserves attention (respond, draft, ignore, pick up assigned work as cards, investigate mentions); to work a card to completion in its workspace (claim, branch, implement, verify, review, PR, report back); or, when you were mentioned in a discussion, to investigate the question and respond in the thread. Explains the JSON context dispatch passes, including `previous_attempts` and `escalations`, and the TriageResult, CardResult or DiscussionResult to return.
 ---
 
 # Workflow
 
-You run unattended. Nobody answers questions in this session: anything you need
-from a person goes through the `outreach` skill, and the run ends with exactly one
-JSON object (the result shape for the mode). No prose after it.
+How to carry out a dispatch run. The prompt is one objective sentence followed by
+a JSON context block; dispatch's own rules are in your system prompt. You run
+unattended: nobody answers questions in this session, anything you need from a
+person goes through the `outreach` skill, and the run ends with exactly one JSON
+object in the result shape for the run. No prose after it.
 
-Arguments: `$ARGUMENTS`
+## 0. Read the context
 
-## 0. Parse the context
+Tell the run apart by its context, not by the objective's wording (the user can
+change objectives in config):
 
-The prompt holds a mode (`triage`, `card <ref>` or `discussion <ref>`) and a JSON
-context block, either inline in the arguments above or right after the
-invocation. Parse it first; if it is missing or invalid, return the failure
-result for the mode (triage: unchanged cursors, empty lists, `summary` naming the
-problem; card: `status: "failed"`; discussion: `status: "failed"`).
+| Run | Context | Section |
+|---|---|---|
+| triage | `{now, runner, cursors, sources, workspaces, outreach_file, events, escalations}` | Triage |
+| card | `{now, runner, ref, workspace, workspaces, outreach_file, previous_attempts}` | Card |
+| discussion | `{now, runner, ref, thread, question, workspace, workspaces, outreach_file}` | Discussion |
 
-- triage: `{now, runner, cursors, sources, workspaces, outreach_file, events}`
-- card: `{now, runner, ref, workspace, workspaces, outreach_file}` (`workspace` may be null)
-- discussion: `{now, runner, ref, thread, question, workspace, workspaces, outreach_file}`
-  (`workspace` may be null)
+`workspace` may be null. If the context is missing or does not parse, go by the
+objective and return that run's failure result (triage: unchanged cursors, empty
+lists, `summary` naming the problem; card and discussion: `status: "failed"`).
 
 `now` is the clock for every time decision (lookback, working hours, follow-ups,
 claim age). `runner` is this runner's name; it appears in claims, labels,
@@ -45,25 +45,33 @@ branches and PR bodies as `agent:<runner>`.
 - **Guardrails.** Never force-push, rewrite pushed history, push to the default
   branch, delete branches, files, cards, messages or data outside the change you
   are making, or run write statements against a database. Never merge a PR.
-- **Sends go through `outreach`.** Never call a messaging send tool directly. A
-  denied send (Claude Code permissions) means draft; see `outreach`.
+- **Sends go through `outreach`.** Never call a messaging send tool directly.
+  Whether a send is allowed is up to the user's Claude Code permissions; a
+  denied send becomes a draft (see `outreach`).
 - **Reread before any reply.** Right before a Slack or tracker reply, reread the
   thread (or the ticket's comments). If the user, you, or another runner
   (a message or comment from the user's account, or one tagged `agent:<name>`)
   already answered after the triggering message, do not reply: record the item
   as `ignored` with "already answered" in `summary`. Every runner writes as the
   user, so any answer from the user's account counts.
-- **Budget.** The runner caps spend per run. Keep the main context lean: delegate
+- **Budget.** Spend is capped per session. Keep the main context lean: delegate
   reading and searching to subagents and keep their conclusions, not their dumps.
   When the work is clearly larger than one run, finish a coherent slice, open the
   PR for it, and list the remainder in the card comment.
+- **Leave progress where the next session can see it.** Every session is
+  bounded: dispatch ends one that runs past its timeout, prints nothing for too
+  long, or repeats the same tool call, and may start a fresh attempt later.
+  Commit working steps as you go. Do not poll by repeating an identical call;
+  use one command that waits (`gh pr checks --watch`). Wait for your subagents
+  to report before you return: a run that ends while they still work loses
+  their results.
 - **Model tiers for subagents:** `haiku` for quick searches and lookups, `sonnet`
   for review and moderate implementation, `opus` for planning and complex or
   cross-cutting changes.
 
 ## Triage
 
-Cheap triage. No code work in this mode.
+Cheap triage. No code work in this run.
 
 ### 1. Collect items
 
@@ -124,7 +132,26 @@ do not own"). If it gets assigned, a later `work` event brings it in.
   exactly, and any constraint they gave. The discussion session sees only this
   and the thread.
 
-### 3. Fill `blocked_by`
+### 3. Report escalations
+
+`escalations` lists cards dispatch stopped retrying,
+`{ref, reason, attempts, last_summary}`: they hit their attempt limit or stopped
+making progress. The user hears about each one once.
+
+- Tell the user through `outreach` (the user is the recipient; the outreach file
+  says how to reach them for escalations). One message may cover several cards.
+  Per card: the ref and its link, why it stopped (`reason`, `attempts`), what the
+  last attempt got to (`last_summary`, plus the branch or PR when one exists),
+  and the decision or input that would unblock it. Tag it `agent:<runner>`.
+- Before writing, look for an earlier message or draft to the user about the
+  same ref and reason. If there is one, do not repeat it.
+- Record each in `handled` as
+  `{"source": "escalation", "item": "<ref>", "action": "escalated"}`, or
+  `ignored` with "already reported" in `summary` when you skipped a repeat.
+- Put an escalated card back in `cards_to_work` only when something new arrived
+  on it after the escalation (an answer, a spec change, a comment from the user).
+
+### 4. Fill `blocked_by`
 
 For every card in `cards_to_work`: the refs of the cards it depends on, read from
 the tracker's relations: its "blocked by" links, and for a parent card its
@@ -135,19 +162,20 @@ listed ref it has worked or queued is done (refs it never worked count as
 external and do not hold it), and runs independent cards in parallel. The runner
 also re-checks that each card is assigned to the user and refuses it otherwise.
 
-### 4. Advance cursors
+### 5. Advance cursors
 
 Sweep only: advance a cursor only past items you handled. If a source failed
 mid-read, keep its old cursor. Return every cursor you received, changed or not.
 
-### 5. Return
+### 6. Return
 
 ```json
 {"cursors": {"slack:C0000000000": "1700000000.000100", "tracker:linear": "2026-01-01T00:00:00Z"},
- "handled": [{"source": "slack:C0000000000", "item": "<event id, or permalink/id in a sweep>", "action": "replied"}],
+ "handled": [{"source": "slack:C0000000000", "item": "<event id, or permalink/id in a sweep>", "action": "replied"},
+             {"source": "escalation", "item": "EX-120", "action": "escalated"}],
  "cards_to_work": [{"ref": "EX-123", "blocked_by": []}, {"ref": "EX-124", "blocked_by": ["EX-123"]}],
  "discussions_to_run": [{"ref": "EX-200", "thread": "https://tracker.example.com/EX-200#comment-1", "question": "Alex asks whether the export job retries on a 429; answer with the code path."}],
- "summary": "4 items: 1 replied, 1 escalated, 1 card queued, 1 discussion"}
+ "summary": "5 items: 1 replied, 1 escalated, 1 card queued, 1 discussion, 1 escalation reported"}
 ```
 
 `action` is one of `replied | drafted | ignored | escalated`. For an event,
@@ -157,7 +185,7 @@ event appears in `handled` once, except events that only produced a
 
 ## Card
 
-Pipeline for `<ref>`. Each step names its stop condition.
+Work `<ref>` to completion. Each step names its stop condition.
 
 1. **Read the card** with the tracker tools: body (the spec), comments, labels,
    assignee, links, attachments.
@@ -181,42 +209,66 @@ Pipeline for `<ref>`. Each step names its stop condition.
    context's `workspaces` list. Never read config files. No match, or the path
    is not a git checkout → `blocked`, `blocked_on: "no workspace for <ref>"`.
    Read the workspace's `CLAUDE.md` / contributing docs: their rules win.
-4. **Gap check.** List what the spec leaves open. Decide what you can default
+4. **Start from the previous attempts.** `previous_attempts` lists earlier runs
+   of this card, oldest first:
+   `{attempt, outcome, summary, blocked_on, session_id, new_commits}`. Empty
+   means this is the first attempt. Otherwise:
+   - Start from what the last attempt left, not from scratch: the branch
+     `agent/<runner>/<ref-slug>` and its commits, the PR, your card comments,
+     and the checkout itself (dispatch reuses the card's worktree, so run
+     `git status` before switching branches). Do not redo committed work.
+   - Do not repeat an approach that failed. `summary` and `blocked_on` say what
+     went wrong; take a different approach, or, when the obstacle needs a
+     person, ask through `outreach` and return `blocked`.
+   - `timeout` or `stuck`: the attempt ran out of time or went round in circles.
+     Cut the scope: finish a smaller coherent slice and open the PR for it.
+   - `rate_limited`, `api_error` or `crash`: cut off by something outside the
+     work; carry on from where it stopped.
+   - `environment`: the machine lacked something (a tool, an MCP server). If it
+     is still missing, return `blocked` naming it.
+   - `blocked` or `needs_human`: check whether the answer arrived (card
+     comments, the thread you asked in) before asking again.
+   - An attempt without `new_commits` made no progress anyone can see. If the
+     last one added none, change the approach instead of trying it again.
+   - `session_id` is for the user to inspect that run; you do not need it.
+5. **Gap check.** List what the spec leaves open. Decide what you can default
    safely (naming, internal structure) and record those defaults for the PR.
    Anything that changes behavior, interfaces, data or scope and is not in the
    spec → ask via `outreach` (one message, all questions, proposed defaults),
    comment the questions on the card, return `blocked`.
-5. **Branch.** From the up-to-date default branch: `agent/<runner>/<ref-slug>`,
+6. **Branch.** From the up-to-date default branch: `agent/<runner>/<ref-slug>`,
    where `<ref-slug>` is the ref lowercased with every run of characters outside
-   `a-z0-9` replaced by `-` (`EX-123` → `agent/example-app/ex-123`). Small
-   Conventional Commits; run the workspace's lint before each commit.
-6. **Plan** (opus subagent for anything beyond a single-file change): tasks,
+   `a-z0-9` replaced by `-` (`EX-123` → `agent/example-app/ex-123`). On resume,
+   continue on the existing branch. Small Conventional Commits; run the
+   workspace's lint before each commit; push the branch at checkpoints.
+7. **Plan** (opus subagent for anything beyond a single-file change): tasks,
    files, tests per task, and which tasks are independent.
-7. **Implement.** Dispatch independent tasks to parallel subagents (sonnet by
+8. **Implement.** Dispatch independent tasks to parallel subagents (sonnet by
    default, opus for complex ones), dependent tasks in order. Tests first where
    the workspace has tests. Each subagent reports files changed and checks run.
-8. **Verify** with the workspace's own definition of done: `CLAUDE.md`, then
+9. **Verify** with the workspace's own definition of done: `CLAUDE.md`, then
    `make`/`package.json`/`pyproject.toml` targets for typecheck, tests and lint.
    Run them yourself; keep the real output.
-9. **Review:** run `/code-review` on the branch diff; optionally `/simplify`, and
-   `/security-review` when the change touches auth, secrets, input handling or
-   infrastructure. Fix findings you agree with; note ones you reject and why.
-   Re-run step 8 after fixes.
-10. **Stop conditions.** Two failed fixes for the same failure (check, review
-    finding, or runtime error) → stop: push the branch, open the PR as a draft
-    (`gh pr create --draft`) with the failure in the body, escalate via
-    `outreach`, return `blocked`. A required check that cannot run on this
-    machine → draft PR, `blocked_on` names the missing tool.
-11. **PR.** Push the branch (never `--force`), write the body with the
+10. **Review:** run `/code-review` on the branch diff; optionally `/simplify`, and
+    `/security-review` when the change touches auth, secrets, input handling or
+    infrastructure. Fix findings you agree with; note ones you reject and why.
+    Re-run step 9 after fixes.
+11. **Stop conditions.** Two failed fixes for the same failure (check, review
+    finding, or runtime error), counting fixes earlier attempts tried → stop:
+    push the branch, open the PR as a draft (`gh pr create --draft`) with the
+    failure in the body, escalate via `outreach`, return `blocked`. A required
+    check that cannot run on this machine → draft PR, `blocked_on` names the
+    missing tool.
+12. **PR.** Push the branch (never `--force`), write the body with the
     `pr-description` skill (the body names the runner: `agent:<runner>`),
     `gh pr create` (or `gh pr edit` on resume). Link the card (`Closes`/ref per
     tracker convention).
-12. **Finish on the card** (every ending of a run that claimed it in step 2):
+13. **Finish on the card** (every ending of a run that claimed it in step 2):
     remove the `agent:<runner>` label and post the result comment: the PR link,
     one-line summary, defaults you chose, and anything left over (or what is
     blocked and on whom). On `done`, move the card to the tracker's review state
     when one exists. Never close or delete it.
-13. **Return** exactly:
+14. **Return** exactly:
 
 ```json
 {"ref": "EX-123", "status": "done", "pr_url": "https://github.com/example-org/example-app/pull/1",

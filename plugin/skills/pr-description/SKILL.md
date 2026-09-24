@@ -11,8 +11,8 @@ not read the diff first. It supplies what the diff cannot: why the change exists
 what was verified, where to look, and what could break. The description matches
 the shape below or it is not finished.
 
-Invoke as `/claude-harness:pr-description [base]`; `base` defaults to the repo's
-default branch.
+Invoke as `/dispatch:pr-description [base]`, or let it load from context; `base`
+defaults to the repo's default branch.
 
 ## Gather before writing, in this order
 
@@ -86,8 +86,8 @@ stated as facts, not promises.
 **Links** — *when* any exist: `Closes #N` (the exact keyword auto-closes on
 merge), the tracker card, the spec, related PRs.
 
-Footer — the attribution line the repo or harness asks for, if any. *When* a
-claude-harness runner opens the PR, the footer names it: `Opened by agent:<runner>`.
+Footer — the attribution line the repo or the user's settings ask for, if any.
+*When* a dispatch runner opens the PR, the footer names it: `Opened by agent:<runner>`.
 
 ## Verification rules
 

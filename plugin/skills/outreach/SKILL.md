@@ -1,6 +1,6 @@
 ---
 name: outreach
-description: Use whenever a claude-harness run must contact a person — reply to a message, answer in a thread or on a ticket the user takes part in, ask a clarifying question on a card, escalate a blocker, or follow up. Decides whom to contact, on which medium, send vs draft, the message shape, follow-up cadence and escalation order from the user's outreach directory file.
+description: Use whenever you must contact a person on the user's behalf — reply to a message, answer in a thread or on a ticket the user takes part in, ask a clarifying question on a card, escalate a blocker, tell the user about a card dispatch stopped retrying, or follow up. Decides whom to contact, on which medium, send vs draft, the message shape, follow-up cadence and escalation order from the user's outreach directory file.
 argument-hint: "<what is blocked or needs a reply> [card/PR/thread link]"
 ---
 
@@ -13,7 +13,7 @@ and what may be said.
 ## 1. Load the directory
 
 Read `outreach_file` from the run's JSON context (default
-`~/.config/claude-harness/outreach.md`). It defines: the user and their voice,
+`~/.config/dispatch/outreach.md`). It defines: the user and their voice,
 people and roles (with IDs and preferred medium), channels, escalation order,
 working hours and time zones, follow-up cadence, and what may be auto-sent vs
 always drafted.
@@ -81,8 +81,8 @@ assigned to someone else) and is mentioned or replied to there:
 
 Use the messaging tools available (discover them; do not assume a vendor).
 Whether a send is allowed is decided by the user's Claude Code permissions:
-`permissions.deny` / `ask` rules and any `PreToolUse` hooks they configured. The
-harness runner never gates sends. If a send is denied — a permission denial, a
+`permissions.deny` / `ask` rules and any `PreToolUse` hooks they configured.
+dispatch never gates sends. If a send is denied — a permission denial, a
 rule that would need an unavailable approval, or a hook blocking the call,
 whatever its wording:
 
