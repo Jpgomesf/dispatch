@@ -41,7 +41,7 @@ pub fn work_filter(config: &LinearConfig, updated_after: DateTime<Utc>) -> Value
     filter
 }
 
-const WORK_QUERY: &str = "query HarnessWork($filter: IssueFilter!, $after: String) {
+const WORK_QUERY: &str = "query DispatchWork($filter: IssueFilter!, $after: String) {
   issues(filter: $filter, first: 50, after: $after, orderBy: updatedAt) {
     nodes { id identifier title url updatedAt state { name } }
     pageInfo { hasNextPage endCursor }
@@ -49,7 +49,7 @@ const WORK_QUERY: &str = "query HarnessWork($filter: IssueFilter!, $after: Strin
 }";
 
 const DISCUSSION_QUERY: &str =
-    "query HarnessDiscussion($filter: NotificationFilter, $after: String) {
+    "query DispatchDiscussion($filter: NotificationFilter, $after: String) {
   notifications(filter: $filter, first: 50, after: $after) {
     nodes {
       id type createdAt
@@ -69,7 +69,7 @@ const DISCUSSION_QUERY: &str =
   }
 }";
 
-const ASSIGNEE_QUERY: &str = "query HarnessAssignee($id: String!) {
+const ASSIGNEE_QUERY: &str = "query DispatchAssignee($id: String!) {
   issue(id: $id) { identifier assignee { isMe } }
 }";
 
@@ -439,7 +439,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("\"isMe\":{\"eq\":true}"))
-            .and(body_string_contains("HarnessWork"))
+            .and(body_string_contains("DispatchWork"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"data": {"issues": page(json!([issue]))}})),

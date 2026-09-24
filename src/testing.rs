@@ -40,7 +40,7 @@ impl TestEnv {
     pub fn env_paths(&self) -> EnvPaths {
         EnvPaths {
             config: None,
-            db: Some(self.dir.path().join("harness.db").display().to_string()),
+            db: Some(self.dir.path().join("dispatch.db").display().to_string()),
             secrets: Some(self.dir.path().join("secrets.env").display().to_string()),
         }
     }
@@ -68,7 +68,7 @@ pub fn test_env() -> TestEnv {
 pub fn write_plugin(root: &Path) {
     let manifest = root.join("plugin/.claude-plugin/plugin.json");
     std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-    std::fs::write(manifest, r#"{"name": "claude-harness"}"#).unwrap();
+    std::fs::write(manifest, r#"{"name": "dispatch"}"#).unwrap();
 }
 
 pub struct Step {
@@ -204,7 +204,7 @@ impl Session for FakeSession {
         };
         self.active.fetch_sub(1, Ordering::SeqCst);
         if terminated {
-            return Err(SessionError("terminated: harness is stopping".into()));
+            return Err(SessionError("terminated: dispatch is stopping".into()));
         }
         step.output
             .map(|output| SessionOutcome {

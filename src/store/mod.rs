@@ -1,4 +1,4 @@
-//! `harness.db`: the machine-wide SQLite store shared by every runner (events, claims,
+//! `dispatch.db`: the machine-wide SQLite store shared by every runner (events, claims,
 //! cards, cursors). One connection per process, used from the blocking pool.
 
 use std::path::{Path, PathBuf};
@@ -16,8 +16,8 @@ mod schema;
 pub use claims::{CLAIM_LEASE, CLAIM_RENEW, Claim};
 pub use events::Enqueued;
 
-pub const DB_ENV: &str = "HARNESS_DB";
-pub const DEFAULT_DB: &str = "~/.local/state/claude-harness/harness.db";
+pub const DB_ENV: &str = "DISPATCH_DB";
+pub const DEFAULT_DB: &str = "~/.local/state/dispatch/dispatch.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
@@ -163,7 +163,7 @@ pub(crate) mod tests {
 
     pub(crate) fn temp_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("nested/harness.db")).unwrap();
+        let store = Store::open(&dir.path().join("nested/dispatch.db")).unwrap();
         (dir, store)
     }
 
@@ -175,7 +175,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(mode, "wal");
         drop(store);
-        let again = Store::open(&dir.path().join("nested/harness.db")).unwrap();
+        let again = Store::open(&dir.path().join("nested/dispatch.db")).unwrap();
         let versions: Vec<i64> = again
             .read(|c| {
                 let mut statement = c.prepare("SELECT version FROM schema_version")?;

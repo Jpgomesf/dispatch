@@ -265,7 +265,7 @@ pub fn poll(
     Ok(result)
 }
 
-/// Whether the DB is readable at all (Full Disk Access), for `harness check`.
+/// Whether the DB is readable at all (Full Disk Access), for `dispatch check`.
 pub fn probe(db: &Path) -> Result<(), String> {
     open_read_only(db)
         .and_then(|conn| {

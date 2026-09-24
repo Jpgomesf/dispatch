@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn two_runners_contending_for_one_event_store_it_once() {
         let (dir, _store) = temp_store();
-        let path = dir.path().join("nested/harness.db");
+        let path = dir.path().join("nested/dispatch.db");
         let threads: Vec<_> = ["alpha", "beta", "alpha", "beta"]
             .into_iter()
             .map(|runner| {

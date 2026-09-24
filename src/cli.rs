@@ -25,9 +25,9 @@ pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_BAD_CONFIG: i32 = 2;
 
 #[derive(Debug, Parser)]
-#[command(name = "harness", about = "claude-harness runner", version)]
+#[command(name = "dispatch", about = "dispatch runner", version)]
 struct Cli {
-    /// config.toml path (default: $HARNESS_CONFIG or ~/.config/claude-harness/config.toml)
+    /// config.toml path (default: $DISPATCH_CONFIG or ~/.config/dispatch/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -128,7 +128,7 @@ fn open_runner(paths: &Paths) -> Result<(InstanceLock, Store), ()> {
         Ok(Some(lock)) => lock,
         Ok(None) => {
             eprintln!(
-                "another harness heartbeat or card run holds {}; not starting",
+                "another dispatch heartbeat or card run holds {}; not starting",
                 lock_file.display()
             );
             return Err(());

@@ -1,4 +1,4 @@
-# claude-harness — design
+# dispatch — design
 
 A framework around Claude Code for autonomous, long-horizon work on a dedicated
 machine. Started from the CLI in one of two modes:
@@ -17,32 +17,32 @@ tracker, Slack and git are the record.
 > document: the heartbeat session mode is now `triage` (config `[triage]`, default
 > interval `30m`, started by intake events and as a fallback sweep), a third mode
 > `discussion <ref>` exists, `state.json` is replaced by the machine-wide
-> `harness.db`, and the instance lock is per runner name. The sections below are
+> `dispatch.db`, and the instance lock is per runner name. The sections below are
 > corrected where they would otherwise mislead.
 
 ## Scope
 
 In the repo (gittable):
 
-1. **Runner** — Rust crate at the repo root building the `harness` binary (`src/`).
-2. **Skill pack** — a Claude Code plugin named `claude-harness` (`plugin/`).
+1. **Runner** — Rust crate at the repo root building the `dispatch` binary (`src/`).
+2. **Skill pack** — a Claude Code plugin named `dispatch` (`plugin/`).
 3. **Pointers** — `docs/machine-setup.md` lists the machine-level customizations
    the user must provide (auth, MCP connectors, service manager, repo checkouts)
    and points to the tools. It creates none of them.
 
 Out of the repo: every user-specific value (people, channels, workspaces,
-repos, send policy) lives in `~/.config/claude-harness/`. The repo ships
+repos, send policy) lives in `~/.config/dispatch/`. The repo ships
 `examples/` with fictional placeholders only — never real names or IDs.
 
 ## Paths
 
 | What | Default | Override |
 |---|---|---|
-| Config | `~/.config/claude-harness/config.toml` | `--config`, `HARNESS_CONFIG` |
-| Outreach directory | `~/.config/claude-harness/outreach.md` | `config.outreach_file` |
-| State dir | `~/.local/state/claude-harness` | `config.state_dir` |
-| Store (phase 2, machine-wide) | `~/.local/state/claude-harness/harness.db` | `HARNESS_DB` |
-| Secrets (phase 2) | `~/.config/claude-harness/secrets.env` | `HARNESS_SECRETS` |
+| Config | `~/.config/dispatch/config.toml` | `--config`, `DISPATCH_CONFIG` |
+| Outreach directory | `~/.config/dispatch/outreach.md` | `config.outreach_file` |
+| State dir | `~/.local/state/dispatch` | `config.state_dir` |
+| Store (phase 2, machine-wide) | `~/.local/state/dispatch/dispatch.db` | `DISPATCH_DB` |
+| Secrets (phase 2) | `~/.config/dispatch/secrets.env` | `DISPATCH_SECRETS` |
 | Instance lock | `<state_dir>/<name>.lock` | — |
 | Kill switch | `<state_dir>/STOP` (file presence) | — |
 | Card worktrees | `<state_dir>/worktrees/<workspace>/<ref-slug>` | — |
@@ -53,7 +53,7 @@ Phase 1 shape; phase 2 adds a required `name`, renames `[heartbeat]` to
 `[triage]` (interval default `30m`) and adds `[intake]` (see the phase 2 spec).
 
 ```toml
-outreach_file = "~/.config/claude-harness/outreach.md"   # optional, default shown
+outreach_file = "~/.config/dispatch/outreach.md"   # optional, default shown
 
 [heartbeat]
 interval = "10m"          # parsed duration: s/m/h
@@ -79,7 +79,7 @@ path = "~/code/example-app"
 match = ["EX-", "example-app"]
 ```
 
-Optional top-level keys: `state_dir` (default `~/.local/state/claude-harness`),
+Optional top-level keys: `state_dir` (default `~/.local/state/dispatch`),
 `plugin_dir` (default: the `plugin/` of the checkout the binary was built from).
 
 ## Runner
@@ -90,16 +90,16 @@ when everything stops. It neither reads nor sends messages and does not police
 tool calls; that is Claude Code's job (skills, MCP, auto mode, the user's own
 settings and permissions).
 
-CLI (`harness`, global `--config PATH`):
+CLI (`dispatch`, global `--config PATH`):
 
-- `harness heartbeat [--interval 10m] [--once]` — loop; `--once` runs one triage
+- `dispatch heartbeat [--interval 10m] [--once]` — loop; `--once` runs one triage
   and the cards it queues, then exits (for cron/launchd/systemd timers).
-- `harness card <ref> [--workspace NAME]` — work one card.
-- `harness stop` / `harness resume` — create / remove the kill switch.
-- `harness check` — validate config, print resolved paths and plugin path (phase
+- `dispatch card <ref> [--workspace NAME]` — work one card.
+- `dispatch stop` / `dispatch resume` — create / remove the kill switch.
+- `dispatch check` — validate config, print resolved paths and plugin path (phase
   2: also the store, the secrets file and each enabled source's key presence,
   never values). No model call.
-- `harness enqueue <source> <text>` (phase 2) — queue a manual event.
+- `dispatch enqueue <source> <text>` (phase 2) — queue a manual event.
 
 Exit codes: `0` ok; `1` run failed, kill switch present, or plugin missing
 (`check`); `2` bad config, bad arguments or unknown workspace. Output: one line
@@ -121,10 +121,10 @@ claude -p <prompt> --output-format json --json-schema <schema> \
   card with no workspace). User/project settings, permission rules, hooks and
   MCP servers (incl. claude.ai connectors) load as in any Claude Code run.
 - Prompt is the workflow skill invocation plus a JSON context block:
-  - triage (phase 1: `heartbeat`): `/claude-harness:workflow triage` + `{now, runner, cursors, sources, workspaces, outreach_file, events}`
-  - card: `/claude-harness:workflow card <ref>` + `{now, runner, ref, workspace, workspaces, outreach_file}`
+  - triage (phase 1: `heartbeat`): `/dispatch:workflow triage` + `{now, runner, cursors, sources, workspaces, outreach_file, events}`
+  - card: `/dispatch:workflow card <ref>` + `{now, runner, ref, workspace, workspaces, outreach_file}`
     (`workspace.path` is the card's checkout; `workspaces` lists the configured paths)
-  - discussion (phase 2): `/claude-harness:workflow discussion <ref>` + `{now, runner, ref, thread, question, workspace, workspaces, outreach_file}`
+  - discussion (phase 2): `/dispatch:workflow discussion <ref>` + `{now, runner, ref, thread, question, workspace, workspaces, outreach_file}`
 - The runner reads the single JSON result object `claude` prints: `is_error`,
   `subtype` and `errors` for failures, `structured_output` for the result,
   `total_cost_usd` for the output line. A failed run, a missing or non-object
@@ -159,7 +159,7 @@ cards run:
 - **Triage** (the fallback sweep) runs `interval` after the previous sweep
   finished. A failed triage retries after 30s, doubling per consecutive failure,
   capped at the interval. Its cursors are persisted as soon as it returns. Phase
-  2 adds event triages started by a closed batch window (see its Dispatch).
+  2 adds event triages started by a closed batch window (see its Coordinator section).
 - **Queue.** Each triage result replaces the queue: cards it no longer lists are
   dropped, cards already queued keep their place with the fresh `blocked_by`,
   cards running or `in_progress` in state are skipped, and at most
@@ -181,14 +181,14 @@ cards run:
   `done`, the runner runs `git worktree remove` without `--force`, which refuses
   (and keeps the tree) when anything is uncommitted or untracked. A workspace
   that is not a git checkout root is used as is (the skill reports it
-  `blocked`). `harness card` uses the same checkout rule.
+  `blocked`). `dispatch card` uses the same checkout rule.
 - `--once`: one triage, then its cards under the same rules; cards whose
   blockers do not finish in this run are left for the next.
 - A failed session never stops the loop; a failed card is recorded `failed`.
 
 ### Stopping
 
-- **Kill switch** (`harness stop`): checked before every triage and card start
+- **Kill switch** (`dispatch stop`): checked before every triage and card start
   and polled every 5s while waiting. Once present, nothing new starts and
   running sessions are terminated gracefully (SIGTERM to the session's process
   group); the loop exits when they have ended.
@@ -203,13 +203,13 @@ cards run:
 ### Single instance and state
 
 `heartbeat` and `card` take an exclusive, non-blocking lock on
-`<state_dir>/<name>.lock` (phase 1: `harness.lock`) for the life of the process.
+`<state_dir>/<name>.lock` for the life of the process.
 A second one of the same runner exits `1` with a one-line message, so two
 processes never run the same card in one worktree and a starting heartbeat never
 releases another process's live cards. `check`, `stop`, `resume` and `enqueue`
 do not take the lock.
 
-State (phase 2: the `cards` and `cursors` tables of `harness.db`, per runner;
+State (phase 2: the `cards` and `cursors` tables of `dispatch.db`, per runner;
 phase 1's `state.json` is imported once and renamed `state.json.migrated`):
 `cursors`, `cards` (`ref → {status, updated_at, pr_url}`, status
 `in_progress|done|blocked|failed`). Every write is a SQLite transaction and all
@@ -231,14 +231,14 @@ the repo:
 - **Skills:** the `outreach` skill and the user's `outreach.md` decide whom to
   contact, send vs draft, and follow-ups. A denied send becomes a draft and is
   never retried another way.
-- `harness stop` ends every run.
+- `dispatch stop` ends every run.
 
 Quality bar: Rust stable; `cargo fmt`, `cargo clippy --all-targets -D warnings`,
 `cargo test`, wired as `make lint typecheck test`. The `claude` process sits
 behind one `Session` trait, so the scheduler is tested with a scripted fake and
 no model calls.
 
-## Skill pack (`plugin/`, plugin name `claude-harness`)
+## Skill pack (`plugin/`, plugin name `dispatch`)
 
 Self-contained — must not depend on skills installed only on the author's
 machine. May reference Claude Code built-ins (`/code-review`, `/simplify`,

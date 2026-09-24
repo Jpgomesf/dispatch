@@ -12,8 +12,8 @@ pub use intake::{
     IntakeConfig, JiraConfig, LINEAR_API_URL, LinearConfig, NotificationsConfig, SLACK_APP_ID,
 };
 
-pub const DEFAULT_CONFIG_DIR: &str = "~/.config/claude-harness";
-pub const DEFAULT_STATE_DIR: &str = "~/.local/state/claude-harness";
+pub const DEFAULT_CONFIG_DIR: &str = "~/.config/dispatch";
+pub const DEFAULT_STATE_DIR: &str = "~/.local/state/dispatch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -286,11 +286,11 @@ match = ["EX-"]
         assert_eq!(config.card.max_parallel, 2);
         assert_eq!(
             config.state_dir,
-            expand_user(Path::new("~/.local/state/claude-harness"))
+            expand_user(Path::new("~/.local/state/dispatch"))
         );
         assert_eq!(
             config.outreach_file,
-            expand_user(Path::new("~/.config/claude-harness/outreach.md"))
+            expand_user(Path::new("~/.config/dispatch/outreach.md"))
         );
         assert!(!config.state_dir.starts_with("~"));
         assert_eq!(config.triage.interval, Duration::from_secs(30 * 60));

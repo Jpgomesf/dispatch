@@ -2,7 +2,7 @@ use super::*;
 use crate::testing::*;
 
 fn argv(env: &TestEnv, args: &[&str]) -> Vec<OsString> {
-    let mut all: Vec<OsString> = vec!["harness".into(), "--config".into()];
+    let mut all: Vec<OsString> = vec!["dispatch".into(), "--config".into()];
     all.push(env.paths.config.clone().into());
     all.extend(args.iter().map(OsString::from));
     all
@@ -87,7 +87,7 @@ async fn stop_and_resume() {
 #[tokio::test]
 async fn config_from_env() {
     let env = test_env();
-    let args = ["harness", "stop"].map(OsString::from);
+    let args = ["dispatch", "stop"].map(OsString::from);
     let paths = EnvPaths {
         config: Some(env.paths.config.display().to_string()),
         ..env.env_paths()

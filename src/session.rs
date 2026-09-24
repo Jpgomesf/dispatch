@@ -56,7 +56,7 @@ pub trait Session: Send + Sync + 'static {
 }
 
 /// `claude -p` in print mode with JSON structured output, auto permission mode and the
-/// harness plugin; user/project settings and MCP servers load as in any Claude Code run.
+/// dispatch plugin; user/project settings and MCP servers load as in any Claude Code run.
 #[derive(Debug, Clone)]
 pub struct ClaudeCli {
     pub program: PathBuf,
@@ -180,7 +180,7 @@ impl Session for ClaudeCli {
         mut shutdown: watch::Receiver<Shutdown>,
     ) -> Result<SessionOutcome, SessionError> {
         if *shutdown.borrow_and_update() != Shutdown::Run {
-            return Err(SessionError("not started: harness is stopping".into()));
+            return Err(SessionError("not started: dispatch is stopping".into()));
         }
         let mut child = Command::new(&self.program)
             .args(build_args(&request))
@@ -238,7 +238,7 @@ impl Session for ClaudeCli {
         }
         let (stdout, stderr) = (text(&stdout), text(&stderr));
         if terminated {
-            return Err(SessionError("terminated: harness is stopping".into()));
+            return Err(SessionError("terminated: dispatch is stopping".into()));
         }
         outcome_from_stdout(&stdout).map_err(|error| {
             if stdout.trim().is_empty() {

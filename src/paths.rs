@@ -5,9 +5,9 @@ use crate::intake::notifications;
 use crate::intake::secrets::{SECRETS_ENV, secrets_path};
 use crate::store::{DB_ENV, DEFAULT_DB};
 
-pub const CONFIG_ENV: &str = "HARNESS_CONFIG";
+pub const CONFIG_ENV: &str = "DISPATCH_CONFIG";
 
-/// Environment variables that move files: `HARNESS_CONFIG`, `HARNESS_DB`, `HARNESS_SECRETS`.
+/// Environment variables that move files: `DISPATCH_CONFIG`, `DISPATCH_DB`, `DISPATCH_SECRETS`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvPaths {
     pub config: Option<String>,
@@ -26,7 +26,7 @@ impl EnvPaths {
     }
 }
 
-/// `$HARNESS_DB`, else `~/.local/state/claude-harness/harness.db` (machine-wide, shared by
+/// `$DISPATCH_DB`, else `~/.local/state/dispatch/dispatch.db` (machine-wide, shared by
 /// every runner whatever its `state_dir`).
 #[must_use]
 pub fn db_path(env_value: Option<&str>) -> PathBuf {
@@ -38,7 +38,7 @@ pub fn db_path(env_value: Option<&str>) -> PathBuf {
 /// The repo's own plugin; `cargo install --path .` bakes in the checkout it was built from.
 pub const REPO_PLUGIN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin");
 
-/// `--config`, else `$HARNESS_CONFIG`, else `~/.config/claude-harness/config.toml`.
+/// `--config`, else `$DISPATCH_CONFIG`, else `~/.config/dispatch/config.toml`.
 pub fn resolve_config_path(cli_value: Option<&Path>, env_value: Option<&str>) -> PathBuf {
     let raw = match (cli_value, env_value) {
         (Some(cli), _) if !cli.as_os_str().is_empty() => cli.to_path_buf(),
@@ -78,7 +78,7 @@ impl Paths {
         }
     }
 
-    /// Phase 1 state, imported into `harness.db` once and renamed `state.json.migrated`.
+    /// Phase 1 state, imported into `dispatch.db` once and renamed `state.json.migrated`.
     pub fn legacy_state_file(&self) -> PathBuf {
         self.state_dir.join("state.json")
     }
@@ -110,7 +110,7 @@ mod tests {
             PathBuf::from("cli.toml")
         );
         assert_eq!(resolve_config_path(None, Some(env)), PathBuf::from(env));
-        let default = expand_user(Path::new("~/.config/claude-harness/config.toml"));
+        let default = expand_user(Path::new("~/.config/dispatch/config.toml"));
         assert_eq!(resolve_config_path(None, None), default);
         assert_eq!(resolve_config_path(None, Some("")), default);
     }

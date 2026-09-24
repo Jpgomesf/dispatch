@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn two_runners_contending_for_one_card_get_exactly_one_claim() {
         let (dir, _store) = temp_store();
-        let path = dir.path().join("nested/harness.db");
+        let path = dir.path().join("nested/dispatch.db");
         let threads: Vec<_> = (0..8)
             .map(|i| {
                 // Separate connections, like separate runner processes.

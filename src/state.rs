@@ -1,5 +1,5 @@
 //! Card state types, the per-runner instance lock and the phase 1 `state.json` reader
-//! (kept only to import it into `harness.db`).
+//! (kept only to import it into `dispatch.db`).
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -49,7 +49,7 @@ pub struct CardState {
     pub pr_url: Option<String>,
 }
 
-/// One runner's cards and cursors, as loaded from `harness.db` for a scheduling decision.
+/// One runner's cards and cursors, as loaded from `dispatch.db` for a scheduling decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {

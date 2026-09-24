@@ -392,7 +392,7 @@ impl<S: Session> Runner<S> {
                 () = sleep_until(work.next_sweep), if triage_idle => Wake::Tick,
                 () = sleep_until(window.unwrap_or_else(Instant::now)), if triage_idle && window.is_some() => Wake::Tick,
                 () = wake.notified() => Wake::Tick,
-                () = sleep(crate::dispatch::KILL_SWITCH_POLL) => Wake::Tick,
+                () = sleep(KILL_SWITCH_POLL) => Wake::Tick,
                 _ = shutdown.changed() => Wake::Tick,
             };
             match event {

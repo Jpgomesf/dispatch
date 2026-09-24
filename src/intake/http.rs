@@ -17,6 +17,6 @@ pub enum HttpError {
 pub fn client() -> Result<reqwest::Client, HttpError> {
     Ok(reqwest::Client::builder()
         .timeout(TIMEOUT)
-        .user_agent(concat!("claude-harness/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("dispatch/", env!("CARGO_PKG_VERSION")))
         .build()?)
 }

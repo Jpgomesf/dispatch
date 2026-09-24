@@ -1,5 +1,5 @@
 [package]
-name = "claude-harness"
+name = "dispatch"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
@@ -7,11 +7,11 @@ description = "Runner for autonomous, long-horizon Claude Code work (event intak
 publish = false
 
 [lib]
-name = "harness"
+name = "dispatch"
 path = "src/lib.rs"
 
 [[bin]]
-name = "harness"
+name = "dispatch"
 path = "src/main.rs"
 
 [dependencies]

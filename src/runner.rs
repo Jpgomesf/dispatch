@@ -1,5 +1,5 @@
 //! Sessions: triage, cards and discussions, each one `claude` process. Scheduling (when they
-//! start, batching of intake events, parallelism) lives in `dispatch`.
+//! start, batching of intake events, parallelism) lives in `coordinator`.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -38,7 +38,7 @@ pub struct Runner<S> {
     clock: Clock,
     out: Output,
     shutdown: Arc<watch::Sender<Shutdown>>,
-    /// Raised by intake when events are stored, so the dispatcher looks right away.
+    /// Raised by intake when events are stored, so the coordinator looks right away.
     pub(crate) wake: Arc<Notify>,
 }
 

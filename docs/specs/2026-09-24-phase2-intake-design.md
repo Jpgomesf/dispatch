@@ -8,9 +8,9 @@ several runners (one per project) share a machine without stepping on each other
 
 ```
 notification watcher ─┐
-Linear poller ────────┤→ route + filter → harness.db (SQLite) → batch → triage session
+Linear poller ────────┤→ route + filter → dispatch.db (SQLite) → batch → triage session
 Jira poller ──────────┤                      events, claims,              ↓
-harness enqueue ──────┘                      cards, cursors        parallel card sessions
+dispatch enqueue ─────┘                      cards, cursors        parallel card sessions
 ```
 
 The heartbeat stays, as a slow fallback sweep (default `30m`) when no events arrive.
@@ -52,8 +52,8 @@ jql = "project = EX"             # optional narrowing; runner always ANDs assign
 `[heartbeat]` is renamed `[triage]` (it is now started by events as well as the
 timer); `interval` default becomes `30m` (the fallback sweep). Model/effort
 defaults stay `sonnet` / `medium`. Unknown keys are still rejected. The CLI
-command stays `harness heartbeat [--interval] [--once]`; only the session mode
-(`/claude-harness:workflow triage`) and the config section are renamed.
+command stays `dispatch heartbeat [--interval] [--once]`; only the session mode
+(`/dispatch:workflow triage`) and the config section are renamed.
 
 As implemented: every source defaults to `enabled = false`; `teams` accepts team
 keys or names; `jql` is validated at load (balanced parentheses outside quotes, no
@@ -64,15 +64,15 @@ notification whose title, subtitle or body contains one is a mention of me
 
 ## Secrets
 
-- File: `~/.config/claude-harness/secrets.env` (`KEY=value` lines, `#` comments),
-  override with `HARNESS_SECRETS`. Outside the repo; never logged or put in a
+- File: `~/.config/dispatch/secrets.env` (`KEY=value` lines, `#` comments),
+  override with `DISPATCH_SECRETS`. Outside the repo; never logged or put in a
   session context.
 - Re-read on every poll, so keys can be added or rotated while the runner runs.
   A source whose key is missing stays idle with one stdout line (once per state
   change) and starts by itself when the key appears.
 - Refused (source idle, one line) if the file is group/world readable (not `0600`).
 - A real environment variable of the same name wins over the file.
-- `harness check` reports which sources have their keys, never the values.
+- `dispatch check` reports which sources have their keys, never the values.
 
 ## Personal scope (enforced, not configurable)
 
@@ -115,7 +115,7 @@ Enforcement:
 - Skill (soft): `discussion` events never go into `cards_to_work`; the skill may
   offer to take the ticket if it gets assigned.
 
-## Taking part in discussions (the harness must not get in the way)
+## Taking part in discussions (dispatch must not get in the way)
 
 The assignee rule gates *doing work* (branch, code, PR), never *talking*.
 
@@ -130,7 +130,7 @@ The assignee rule gates *doing work* (branch, code, PR), never *talking*.
   per item: `[card]` model/effort/budget, a detached worktree of the matching
   workspace (read, run, test), JSON context `{now, runner, ref, thread, question,
   workspace, workspaces, outreach_file}`, prompt
-  `/claude-harness:workflow discussion <ref>`. It never creates a branch, commits
+  `/dispatch:workflow discussion <ref>`. It never creates a branch, commits
   or opens a PR; it ends by replying (or drafting) through `outreach` and returns
   `DiscussionResult { ref, status: replied|drafted|skipped|failed, summary }`.
 - Discussion sessions share `max_parallel` with cards (queued discussions start
@@ -142,10 +142,10 @@ The assignee rule gates *doing work* (branch, code, PR), never *talking*.
   against `ref`, then `thread`, else none (the session runs in the state dir). The
   detached worktree is `git worktree remove`d (without `--force`) afterwards.
 
-## Store: `harness.db` (SQLite, machine-wide)
+## Store: `dispatch.db` (SQLite, machine-wide)
 
-One file shared by every runner on the machine: `~/.local/state/claude-harness/harness.db`
-(overridable with `HARNESS_DB`). Opened with WAL, `busy_timeout = 5000`,
+One file shared by every runner on the machine: `~/.local/state/dispatch/dispatch.db`
+(overridable with `DISPATCH_DB`). Opened with WAL, `busy_timeout = 5000`,
 `foreign_keys = on`; every write is a transaction; claims use `BEGIN IMMEDIATE`.
 Crate: `rusqlite` (bundled). All DB work runs on the blocking pool.
 
@@ -165,7 +165,7 @@ Migration: on first open a runner imports its `state.json` (if present) into the
 DB and renames it `state.json.migrated`. Nothing is deleted.
 
 As implemented: the default path is fixed (not under `state_dir`) so runners
-with different state dirs still share it; `harness check` never creates it.
+with different state dirs still share it; `dispatch check` never creates it.
 `events` also stores `kind`, `mentions_me`, `sender`, `occurred_at`; its integer
 `id`, as a string, is the event `id` triage sees. Poller cursors live in
 `cursors` under `intake:<source>:<stream>` and are never shown to the skill.
@@ -244,7 +244,7 @@ Runner passes `runner` (its `name`) in every JSON context. The `workflow` skill:
   already open. A cursor moves to the newest timestamp fetched (including filtered
   items) and only after the events are stored; dedup absorbs any overlap. Triage
   results cannot overwrite these `intake:*` cursors.
-- **`harness enqueue <source> <text>`**: manual `message` event (payload
+- **`dispatch enqueue <source> <text>`**: manual `message` event (payload
   `{body}`) for this runner, for testing and scripts.
 
 Pollers are independent tokio tasks; a source failing backs off on its own
@@ -254,7 +254,7 @@ prints one `intake <source> <state>` line when its state changes (`ready`,
 per skipped notification record. Pollers run only in the long-lived loop, not
 under `--once`.
 
-## Dispatch
+## Coordinator
 
 - Slack (via notifications) and other message events are not acted on by the
   runner: they only start triage. The triage session (`[triage]` model/effort,
