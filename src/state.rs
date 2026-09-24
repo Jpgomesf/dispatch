@@ -1,7 +1,9 @@
+//! Card state types, the per-runner instance lock and the phase 1 `state.json` reader
+//! (kept only to import it into `harness.db`).
+
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -16,6 +18,29 @@ pub enum CardStatus {
     Failed,
 }
 
+impl CardStatus {
+    const ALL: [CardStatus; 4] = [
+        CardStatus::InProgress,
+        CardStatus::Done,
+        CardStatus::Blocked,
+        CardStatus::Failed,
+    ];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CardStatus::InProgress => "in_progress",
+            CardStatus::Done => "done",
+            CardStatus::Blocked => "blocked",
+            CardStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<CardStatus> {
+        Self::ALL.into_iter().find(|status| status.as_str() == text)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardState {
     pub status: CardStatus,
@@ -24,6 +49,7 @@ pub struct CardState {
     pub pr_url: Option<String>,
 }
 
+/// One runner's cards and cursors, as loaded from `harness.db` for a scheduling decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
@@ -41,81 +67,10 @@ impl State {
     pub fn in_progress(&self, card_ref: &str) -> bool {
         self.status(card_ref) == Some(CardStatus::InProgress)
     }
-
-    pub fn set_card(
-        &mut self,
-        card_ref: &str,
-        status: CardStatus,
-        now: DateTime<Utc>,
-        pr_url: Option<String>,
-    ) {
-        let card = CardState {
-            status,
-            updated_at: now,
-            pr_url,
-        };
-        self.cards.insert(card_ref.to_string(), card);
-    }
 }
 
-/// `state.json` in the state dir. Reads are lock-free (writes are atomic renames);
-/// read-modify-write goes through `update`, under an exclusive lock on `state.lock`,
-/// so parallel card tasks and other harness processes never lose each other's writes.
-#[derive(Debug, Clone)]
-pub struct StateStore {
-    dir: PathBuf,
-}
-
-impl StateStore {
-    pub fn new(state_dir: &Path) -> StateStore {
-        StateStore {
-            dir: state_dir.to_path_buf(),
-        }
-    }
-
-    pub fn file(&self) -> PathBuf {
-        self.dir.join("state.json")
-    }
-
-    pub fn load(&self) -> Result<State> {
-        load_state(&self.file())
-    }
-
-    pub fn update<R>(&self, change: impl FnOnce(&mut State) -> R) -> Result<R> {
-        std::fs::create_dir_all(&self.dir)
-            .with_context(|| format!("create state dir {}", self.dir.display()))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.dir.join("state.lock"))
-            .context("open state lock")?;
-        lock.lock().context("lock state")?;
-        let mut state = self.load()?;
-        let result = change(&mut state);
-        save_state(&self.file(), &state)?;
-        Ok(result)
-        // `lock` drops here, releasing the lock.
-    }
-
-    /// `load` off the async runtime's worker threads.
-    pub async fn load_async(&self) -> Result<State> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.load()).await?
-    }
-
-    /// `update` on the blocking pool: the lock wait and the fsync never stall async tasks.
-    pub async fn update_async<R: Send + 'static>(
-        &self,
-        change: impl FnOnce(&mut State) -> R + Send + 'static,
-    ) -> Result<R> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || store.update(change)).await?
-    }
-}
-
-/// Held for the life of a process that runs sessions (`heartbeat`, `card`), so two harness
-/// processes never work the same cards or release each other's `in_progress` cards.
+/// Held for the life of a process that runs sessions (`heartbeat`, `card`), so two processes
+/// of one runner never work the same cards or release each other's claims and cards.
 #[derive(Debug)]
 pub struct InstanceLock {
     _file: std::fs::File,
@@ -144,6 +99,7 @@ impl InstanceLock {
     }
 }
 
+/// Phase 1 `state.json`; a missing file is an empty state.
 pub fn load_state(path: &Path) -> Result<State> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
@@ -154,25 +110,9 @@ pub fn load_state(path: &Path) -> Result<State> {
     }
 }
 
-/// Atomic write: temp file in the same dir, fsync, rename over the target.
-pub fn save_state(path: &Path, state: &State) -> Result<()> {
-    let dir = path.parent().context("state path has no parent")?;
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".state-")
-        .suffix(".json")
-        .tempfile_in(dir)?;
-    serde_json::to_writer_pretty(&mut tmp, state)?;
-    tmp.write_all(b"\n")?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::now;
 
     #[test]
     fn missing_state_file_is_empty_state() {
@@ -181,29 +121,6 @@ mod tests {
             load_state(&dir.path().join("state.json")).unwrap(),
             State::default()
         );
-    }
-
-    #[test]
-    fn round_trip_leaves_no_temp_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("nested/state.json");
-        let mut state = State::default();
-        state
-            .cursors
-            .insert("slack:C0000000001".into(), "1700000000.000100".into());
-        state.set_card(
-            "EX-1",
-            CardStatus::Done,
-            now(),
-            Some("https://example.com/pr/1".into()),
-        );
-        save_state(&path, &state).unwrap();
-        assert_eq!(load_state(&path).unwrap(), state);
-        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        assert_eq!(names, vec!["state.json"]);
     }
 
     #[test]
@@ -216,59 +133,22 @@ mod tests {
     }
 
     #[test]
-    fn in_progress() {
-        let mut state = State::default();
-        state.set_card("EX-1", CardStatus::InProgress, now(), None);
-        state.set_card("EX-2", CardStatus::Done, now(), None);
-        assert!(state.in_progress("EX-1"));
-        assert!(!state.in_progress("EX-2"));
-        assert!(!state.in_progress("EX-3"));
+    fn card_status_strings_round_trip() {
+        for status in CardStatus::ALL {
+            assert_eq!(CardStatus::parse(status.as_str()), Some(status));
+            assert_eq!(serde_json::to_value(status).unwrap(), status.as_str());
+        }
+        assert_eq!(CardStatus::parse("maybe"), None);
     }
 
     #[test]
     fn instance_lock_is_exclusive_until_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let lock_file = dir.path().join("harness.lock");
+        let lock_file = dir.path().join("example-app.lock");
         let first = InstanceLock::try_acquire(&lock_file).unwrap();
         assert!(first.is_some());
         assert!(InstanceLock::try_acquire(&lock_file).unwrap().is_none());
         drop(first);
         assert!(InstanceLock::try_acquire(&lock_file).unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn async_update_and_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::new(dir.path());
-        let changed = store
-            .update_async(|s| s.cursors.insert("a".into(), "1".into()).is_none())
-            .await
-            .unwrap();
-        assert!(changed);
-        assert_eq!(store.load_async().await.unwrap().cursors["a"], "1");
-    }
-
-    #[test]
-    fn concurrent_updates_are_not_lost() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = StateStore::new(dir.path());
-        let threads: Vec<_> = (0..8)
-            .map(|i| {
-                let store = store.clone();
-                std::thread::spawn(move || {
-                    for j in 0..10 {
-                        store
-                            .update(|s| {
-                                s.cursors.insert(format!("t{i}-{j}"), "x".into());
-                            })
-                            .unwrap();
-                    }
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread.join().unwrap();
-        }
-        assert_eq!(store.load().unwrap().cursors.len(), 80);
     }
 }

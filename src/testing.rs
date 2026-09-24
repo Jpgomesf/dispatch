@@ -1,4 +1,5 @@
-//! Test fixtures: a scripted fake session and a temp-dir config. No model calls in tests.
+//! Test fixtures: a scripted fake session, a temp-dir config and store, and a clock that
+//! follows tokio's (pausable) time. No model calls and no network in tests.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -13,12 +14,20 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::config::{Config, tests::config_toml};
-use crate::paths::Paths;
-use crate::runner::Runner;
+use crate::paths::{EnvPaths, Paths};
+use crate::runner::{Clock, Runner};
 use crate::session::{Session, SessionError, SessionOutcome, SessionRequest, Shutdown};
+use crate::store::Store;
 
 pub fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 15, 9, 30, 0).unwrap()
+}
+
+/// `now()` plus however much tokio time has passed since the clock was made, so leases and
+/// timestamps move with `start_paused` tests.
+pub fn tokio_clock() -> Clock {
+    let base = Instant::now();
+    Arc::new(move || now() + (Instant::now() - base))
 }
 
 pub struct TestEnv {
@@ -27,13 +36,33 @@ pub struct TestEnv {
     pub paths: Paths,
 }
 
+impl TestEnv {
+    pub fn env_paths(&self) -> EnvPaths {
+        EnvPaths {
+            config: None,
+            db: Some(self.dir.path().join("harness.db").display().to_string()),
+            secrets: Some(self.dir.path().join("secrets.env").display().to_string()),
+        }
+    }
+
+    pub fn store(&self) -> Store {
+        Store::open(&self.paths.db).unwrap()
+    }
+}
+
 pub fn test_env() -> TestEnv {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(&config_path, config_toml(dir.path())).unwrap();
     let config = crate::config::load_config(&config_path).unwrap();
-    let paths = Paths::resolve(&config_path, &config);
-    TestEnv { dir, config, paths }
+    let mut env = TestEnv {
+        paths: Paths::resolve(&config_path, &config, &EnvPaths::default()),
+        dir,
+        config,
+    };
+    env.paths = Paths::resolve(&config_path, &env.config, &env.env_paths());
+    env.paths.notifications_db = env.dir.path().join("notifications.db");
+    env
 }
 
 pub fn write_plugin(root: &Path) {
@@ -113,21 +142,24 @@ impl FakeSession {
         })
     }
 
-    /// Heartbeat steps in order (then quiet ticks); card steps by ref.
-    pub fn routed(
-        heartbeats: Vec<Step>,
-        card: impl Fn(&str) -> Step + Send + Sync + 'static,
-    ) -> Self {
-        let heartbeats = Mutex::new(VecDeque::from(heartbeats));
+    /// Triage steps in order (then quiet ticks); card steps by ref; discussions are drafted.
+    pub fn routed(triages: Vec<Step>, card: impl Fn(&str) -> Step + Send + Sync + 'static) -> Self {
+        let triages = Mutex::new(VecDeque::from(triages));
         FakeSession::new(move |request| {
             let first = request.prompt.lines().next().unwrap_or("");
-            match first.strip_prefix("/claude-harness:workflow card ") {
-                Some(card_ref) => card(card_ref),
-                None => heartbeats
+            let command = first
+                .strip_prefix("/claude-harness:workflow ")
+                .unwrap_or("");
+            if let Some(card_ref) = command.strip_prefix("card ") {
+                card(card_ref)
+            } else if let Some(discussion_ref) = command.strip_prefix("discussion ") {
+                ok(discussion_output(discussion_ref, "drafted"))
+            } else {
+                triages
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .unwrap_or_else(|| ok(heartbeat_output(&[]))),
+                    .unwrap_or_else(|| ok(triage_output(&[])))
             }
         })
     }
@@ -183,7 +215,7 @@ impl Session for FakeSession {
     }
 }
 
-pub fn heartbeat_output(cards: &[(&str, &[&str])]) -> Value {
+pub fn triage_output(cards: &[(&str, &[&str])]) -> Value {
     let cards: Vec<Value> = cards
         .iter()
         .map(|(card_ref, blocked_by)| json!({"ref": card_ref, "blocked_by": blocked_by}))
@@ -192,6 +224,7 @@ pub fn heartbeat_output(cards: &[(&str, &[&str])]) -> Value {
         "cursors": {},
         "handled": [{"source": "slack:C0000000001", "item": "m1", "action": "drafted"}],
         "cards_to_work": cards,
+        "discussions_to_run": [],
         "summary": "one quick reply drafted"
     })
 }
@@ -201,13 +234,31 @@ pub fn card_output(card_ref: &str, status: &str) -> Value {
     json!({"ref": card_ref, "status": status, "pr_url": pr_url, "blocked_on": null, "summary": "implemented"})
 }
 
+pub fn discussion_output(discussion_ref: &str, status: &str) -> Value {
+    json!({"ref": discussion_ref, "status": status, "summary": "answered in thread"})
+}
+
 pub type Lines = Arc<Mutex<Vec<String>>>;
 
 pub fn make_runner(env: &TestEnv, session: FakeSession) -> (Runner<FakeSession>, Lines) {
+    make_named_runner(env, &env.config.name, session)
+}
+
+/// Another runner on the same machine: same store, its own name.
+pub fn make_named_runner(
+    env: &TestEnv,
+    name: &str,
+    session: FakeSession,
+) -> (Runner<FakeSession>, Lines) {
     let lines: Lines = Arc::default();
     let sink = lines.clone();
-    let runner = Runner::new(env.config.clone(), env.paths.clone(), session)
-        .with_clock(Arc::new(now))
+    let mut config = env.config.clone();
+    config.name = name.to_string();
+    let mut paths = env.paths.clone();
+    paths.runner = name.to_string();
+    let runner = Runner::new(config, paths, env.store(), session)
+        .with_clock(tokio_clock())
+        .with_env(Arc::new(|_| None))
         .with_output(Arc::new(move |line| sink.lock().unwrap().push(line)));
     (runner, lines)
 }

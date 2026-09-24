@@ -1,14 +1,18 @@
-//! claude-harness runner: heartbeat triage and card sessions over the `claude` CLI.
+//! claude-harness runner: event intake, triage, card and discussion sessions over the
+//! `claude` CLI, with a machine-wide store shared by every runner.
 
 pub mod cli;
 pub mod config;
+pub mod dispatch;
 pub mod durations;
+pub mod intake;
 pub mod paths;
 pub mod prompts;
 pub mod results;
 pub mod runner;
 pub mod session;
 pub mod state;
+pub mod store;
 pub mod worktree;
 
 #[cfg(test)]
