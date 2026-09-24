@@ -238,3 +238,17 @@ def test_sleep_wakes_on_kill_switch(
 def test_runner_accepts_default_config(tmp_path: Path, paths: Paths) -> None:
     runner = Runner(Config(), paths, FakeSession([]))
     assert not runner.killed()
+
+
+def test_heartbeat_releases_cards_left_in_progress(config_file: Path, paths: Paths) -> None:
+    state = load_state(paths.state_file)
+    state.set_card("EX-1", "in_progress", NOW)
+    save_state(paths.state_file, state)
+    runner, session, _ = make_runner(
+        config_file,
+        paths,
+        [returns(heartbeat_output(["EX-1"])), returns(card_output("EX-1"))],
+    )
+    runner.heartbeat(timedelta(minutes=10), once=True)
+    assert session.requests[1].prompt.split("\n")[0] == "/claude-harness:workflow card EX-1"
+    assert load_state(paths.state_file).cards["EX-1"].status == "done"

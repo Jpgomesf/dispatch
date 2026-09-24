@@ -128,7 +128,17 @@ class Runner:
             ok = self.run_card(ref) is not None and ok
         return ok
 
+    def release_stale_cards(self) -> None:
+        """Cards left in_progress by a crashed run become failed, so triage can pick them up."""
+        state = self._load()
+        stale = [ref for ref in state.cards if state.in_progress(ref)]
+        for ref in stale:
+            state.set_card(ref, "failed", self.clock())
+        if stale:
+            self._save(state)
+
     def heartbeat(self, interval: timedelta, once: bool = False) -> None:
+        self.release_stale_cards()
         failures = 0
         while not self.should_stop():
             failures = 0 if self.tick() else failures + 1
