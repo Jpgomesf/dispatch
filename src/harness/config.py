@@ -37,8 +37,8 @@ class HeartbeatConfig(_Strict):
 
 
 class CardConfig(_Strict):
-    model: str = "opus"
-    effort: Effort = "max"
+    model: str = "claude-opus-5-5"
+    effort: Effort = "high"
     max_budget_usd: float = Field(default=20.0, gt=0)
 
 

@@ -12,8 +12,8 @@ def test_loads_full_config(config_file: Path, tmp_path: Path) -> None:
     config = load_config(config_file)
     assert config.heartbeat.interval_delta == timedelta(minutes=10)
     assert config.heartbeat.max_cards_per_tick == 2
-    assert config.card.model == "opus"
-    assert config.card.effort == "max"
+    assert config.card.model == "claude-opus-5-5"
+    assert config.card.effort == "high"
     assert config.send.max_per_hour == 2
     assert config.workspaces[0].path == tmp_path / "code/example-app"
 
