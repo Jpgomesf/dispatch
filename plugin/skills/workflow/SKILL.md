@@ -39,7 +39,7 @@ first; if it is missing or invalid, return the failure result for the mode
   branch, delete branches, files, cards, messages or data outside the change you
   are making, or run write statements against a database. Never merge a PR.
 - **Sends go through `outreach`.** Never call a messaging send tool directly. A
-  runner denial ("create a draft instead") means draft; see `outreach`.
+  denied send (Claude Code permissions) means draft; see `outreach`.
 - **Budget.** The runner caps spend per run. Keep the main context lean: delegate
   reading and searching to subagents and keep their conclusions, not their dumps.
   When the work is clearly larger than one run, finish a coherent slice, open the
@@ -63,21 +63,29 @@ Cheap triage. No code work in this mode.
    | Class | Examples | Action |
    |---|---|---|
    | quick reply | status question answerable from the tracker, a PR or a repo, cheaply and verifiably | `outreach` reply → `replied` or `drafted` |
-   | needs card | tracker card matching the query whose body is a spec | add ref to `cards_to_work` |
+   | needs card | tracker card matching the query whose body is a spec | add it to `cards_to_work` |
    | needs card, no spec | card without a usable spec; Slack request needing real work | `outreach` asks for a spec or a card → `drafted` / `replied` |
    | blocked-on-me | review request, decision or question only the user can answer | `outreach` escalates to the user → `escalated` |
-   | unblock | an answer to a question you asked on a card marked blocked | add that ref to `cards_to_work` |
+   | unblock | an answer to a question you asked on a card marked blocked | add that card to `cards_to_work` |
    | FYI | announcements, bots, chatter | `ignored` |
 
    When unsure between quick reply and blocked-on-me, choose blocked-on-me.
-3. **Advance cursors** only past items you handled. If a source failed mid-read,
+3. **Fill `blocked_by`** for every card in `cards_to_work`: the refs of the cards
+   it depends on, read from the tracker's relations: its "blocked by" links, and
+   for a parent card its sub-issues (the parent waits for its children; a child
+   never waits for its parent). List only refs whose card is not yet done
+   (done, closed or merged ones are left out); `[]` when there are none. The
+   runner holds a card until every listed ref it has worked or queued is done
+   (refs it never worked count as external and do not hold it), and runs
+   independent cards in parallel.
+4. **Advance cursors** only past items you handled. If a source failed mid-read,
    keep its old cursor. Return every cursor you received, changed or not.
-4. **Return** exactly:
+5. **Return** exactly:
 
 ```json
 {"cursors": {"slack:C0000000000": "1700000000.000100", "tracker:linear": "2026-01-01T00:00:00Z"},
  "handled": [{"source": "slack:C0000000000", "item": "<permalink or id>", "action": "replied"}],
- "cards_to_work": ["EX-123"],
+ "cards_to_work": [{"ref": "EX-123", "blocked_by": []}, {"ref": "EX-124", "blocked_by": ["EX-123"]}],
  "summary": "3 items: 1 replied, 1 escalated, 1 card queued"}
 ```
 
