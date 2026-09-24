@@ -1,6 +1,6 @@
 ---
 name: outreach
-description: Use whenever a claude-harness run must contact a person — reply to a message, ask a clarifying question on a card, escalate a blocker, or follow up. Decides whom to contact, on which medium, send vs draft, the message shape, follow-up cadence and escalation order from the user's outreach directory file.
+description: Use whenever a claude-harness run must contact a person — reply to a message, answer in a thread or on a ticket the user takes part in, ask a clarifying question on a card, escalate a blocker, or follow up. Decides whom to contact, on which medium, send vs draft, the message shape, follow-up cadence and escalation order from the user's outreach directory file.
 argument-hint: "<what is blocked or needs a reply> [card/PR/thread link]"
 ---
 
@@ -26,10 +26,12 @@ the result.
 1. **Whom.** In order: the person who asked (reply where they asked); the owner
    or requester of the card; the role owner the file names for this kind of
    question; the user ("me"). Never contact someone absent from the file except
-   by replying in a thread where they addressed the user.
-2. **Duplicates.** Before writing, check the thread, the card comments and your
-   recent drafts for the same ask. If it is already out and unanswered, this is
-   a follow-up (step 5), not a new message.
+   by replying in a thread where they addressed or mentioned the user.
+2. **Duplicates.** Right before writing, reread the thread, the card comments and
+   your recent drafts. If the user, you, or another runner (the user's account,
+   or a message tagged `agent:<name>`) already answered after the triggering
+   message, stop: report `skipped`. If your ask is already out and unanswered,
+   this is a follow-up (step 6), not a new message.
 3. **Medium.** The person's preferred medium from the file; a thread reply when
    the question came from a thread; a card comment when the question belongs to
    the card's record (a card comment is fine alongside a message, not instead of
@@ -50,34 +52,62 @@ Short, in the user's voice from the file. Four to six lines:
 - the default you will take if there is no answer by a stated time (only a
   default the file or the spec allows).
 
+An answer to someone's question has the same length but a different order: the
+answer first, then the evidence (links, `file:line`, command output), then what
+was not verified.
+
 No apologies, no filler, no promises the file does not allow. One message holds
 all open questions for the same person.
 
-## 4. Send, and handle denial
+## 4. Threads you do not own
 
-Use the messaging tools available (discover them; do not assume a vendor). The
-user's Claude Code permission rules (and any hooks they configured) decide which
-sends are allowed. If a send is denied — a permission denial or a hook blocking
-the call, whatever its wording:
+When the user takes part in a thread (a Slack thread, or comments on a ticket
+assigned to someone else) and is mentioned or replied to there:
+
+- Reply **in that thread**: a Slack thread reply, or a tracker comment answering
+  the specific comment (as a reply to it when the tracker supports threads,
+  otherwise quoting or @-mentioning its author). Never start a new thread, DM or
+  channel post for it unless the asker asked for that.
+- Answer only what was asked, with evidence (links, `file:line`, command
+  output). Do not restate the ticket or give unrequested advice on it.
+- Never change the ticket: no status, assignee, labels, estimate or claim
+  comment, and never open a branch or PR for it. Those belong to its owner.
+- If someone asks the user to do the work, offer to take it once it is assigned
+  to the user; that offer commits the user, so it is always a draft.
+- Addressing the asker by replying is allowed even when they are absent from the
+  outreach file; send vs draft still follows "Send or draft" in step 2.
+
+## 5. Send, and handle denial
+
+Use the messaging tools available (discover them; do not assume a vendor).
+Whether a send is allowed is decided by the user's Claude Code permissions:
+`permissions.deny` / `ask` rules and any `PreToolUse` hooks they configured. The
+harness runner never gates sends. If a send is denied — a permission denial, a
+rule that would need an unavailable approval, or a hook blocking the call,
+whatever its wording:
 
 - create the same message with the equivalent draft tool (Slack
   `slack_send_message_draft`, Gmail `create_draft`, or the tool's draft variant);
+  when the tool has none (most tracker comments), draft it to the user instead,
+  stating where it was meant to go, with the link;
 - do **not** retry the send, switch channel or medium, schedule it, post it as a
   tracker comment, or deliver it through a CLI or HTTP call;
 - record the action as `drafted`.
 
 Never delete, edit or unsend someone else's messages or your earlier ones.
 
-## 5. Follow-up and escalation
+## 6. Follow-up and escalation
 
 Use the file's cadence; if it states none: one follow-up in the same place after
 one working day without an answer, then move one step down the escalation order
 with a link to the original ask. The last step is always the user ("me"), as a
 draft or self-message that states what is blocked and the proposed default.
-Follow-ups due outside the recipient's working hours wait for a later heartbeat
+Follow-ups due outside the recipient's working hours wait for a later triage
 inside them.
 
-## 6. Report back to the caller
+## 7. Report back to the caller
 
-One line per contact: `person | medium | sent|drafted|escalated | link`. The
-workflow maps `sent` to `replied` in the HeartbeatResult.
+One line per contact: `person | medium | sent|drafted|escalated|skipped | link`.
+The workflow maps `sent` to `replied` (TriageResult and DiscussionResult),
+`skipped` to `ignored` in a TriageResult and to `skipped` in a
+DiscussionResult.
