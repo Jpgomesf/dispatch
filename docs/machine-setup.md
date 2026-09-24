@@ -50,31 +50,38 @@ Replace every placeholder with real channel/user IDs, people and repos. These
 files stay out of the repo. Then run `harness check` to validate the config and
 print the resolved paths.
 
-### Send policy trade-off (`[send].mode`)
+### Who may be messaged
 
-- `draft_only` — nothing leaves without you; every message waits as a draft.
-  Safest; the harness only unblocks as fast as you review drafts.
-- `allowlist` (recommended) — sends only to the listed channels, users and email
-  domains, under `max_per_hour`; everything else becomes a draft. Start small and
-  widen it as you trust the output.
-- `all` — sends anywhere the tools reach, rate-limited only. Fastest, and a
-  wrong message goes out under your name. Use only with a strict "always draft"
-  section in `outreach.md`.
+The harness does not gate sends; Claude Code does, with your own settings:
 
-The runner enforces the mode; the model cannot bypass it. `harness stop` creates
-the kill switch that halts all tool use.
+- **Permission rules** (<https://code.claude.com/docs/en/permissions>): in
+  `~/.claude/settings.json`, `permissions.deny` on send tools (e.g.
+  `mcp__*__send_message`, or specific Slack / Gmail send tools) makes every
+  message a draft.
+- **Hooks** (<https://code.claude.com/docs/en/hooks>): a `PreToolUse` command
+  hook can allow sends only to listed channels or domains, or rate-limit them.
+- **`outreach.md`**: says what may be auto-sent to whom; the `outreach` skill
+  drafts everything else, and turns any denied send into a draft.
+
+Start with sends denied and loosen them as you trust the output. `harness stop`
+creates the kill switch: nothing new starts and running sessions are ended.
 
 ## 6. Scheduling
 
 Pick one:
 
+- **Long-running loop (recommended):** `harness heartbeat` under a service
+  manager that restarts it (launchd `KeepAlive`, systemd `Restart=on-failure`).
+  Triage keeps its interval while cards run.
 - **Timer calling one tick:** `harness heartbeat --once` from launchd
-  (`StartInterval` in a LaunchAgent plist, macOS), a systemd `.timer` + `.service`
-  pair (Linux), or cron. The interval in the scheduler replaces `[heartbeat].interval`.
-- **Long-running loop:** `harness heartbeat` under a service manager that
-  restarts it (launchd `KeepAlive`, systemd `Restart=on-failure`).
+  (`StartInterval` in a LaunchAgent plist, macOS) or a systemd `.timer` +
+  `.service` pair (Linux). The interval in the scheduler replaces
+  `[heartbeat].interval`. A tick lasts until its cards finish, and a starting
+  heartbeat marks cards left `in_progress` as failed, so never let two ticks
+  overlap: launchd and systemd do not start a job that is still running; plain
+  cron does, so avoid it.
 
 Either way: run as your user (so it sees your Claude, `gh` and connector auth),
-set `PATH` to include `claude`, `gh` and `uv`, and send stdout to a file or the
+set `PATH` to include `claude`, `gh` and `git`, and send stdout to a file or the
 journal — it is one line per run. Keep the machine awake (e.g. `caffeinate` on
 macOS) if it sleeps.
