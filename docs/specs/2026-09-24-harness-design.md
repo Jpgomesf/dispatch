@@ -13,6 +13,13 @@ Everything runs headless: each run is one `claude -p` process in **auto**
 permission mode. No log subsystem: the runner prints one line per run to stdout; the
 tracker, Slack and git are the record.
 
+> **Phase 2** (`2026-09-24-phase2-intake-design.md`) supersedes parts of this
+> document: the heartbeat session mode is now `triage` (config `[triage]`, default
+> interval `30m`, started by intake events and as a fallback sweep), a third mode
+> `discussion <ref>` exists, `state.json` is replaced by the machine-wide
+> `harness.db`, and the instance lock is per runner name. The sections below are
+> corrected where they would otherwise mislead.
+
 ## Scope
 
 In the repo (gittable):
@@ -33,11 +40,17 @@ repos, send policy) lives in `~/.config/claude-harness/`. The repo ships
 |---|---|---|
 | Config | `~/.config/claude-harness/config.toml` | `--config`, `HARNESS_CONFIG` |
 | Outreach directory | `~/.config/claude-harness/outreach.md` | `config.outreach_file` |
-| State | `~/.local/state/claude-harness/state.json` | `config.state_dir` |
+| State dir | `~/.local/state/claude-harness` | `config.state_dir` |
+| Store (phase 2, machine-wide) | `~/.local/state/claude-harness/harness.db` | `HARNESS_DB` |
+| Secrets (phase 2) | `~/.config/claude-harness/secrets.env` | `HARNESS_SECRETS` |
+| Instance lock | `<state_dir>/<name>.lock` | — |
 | Kill switch | `<state_dir>/STOP` (file presence) | — |
 | Card worktrees | `<state_dir>/worktrees/<workspace>/<ref-slug>` | — |
 
 ## Config (`config.toml`) — serde-validated, unknown keys rejected
+
+Phase 1 shape; phase 2 adds a required `name`, renames `[heartbeat]` to
+`[triage]` (interval default `30m`) and adds `[intake]` (see the phase 2 spec).
 
 ```toml
 outreach_file = "~/.config/claude-harness/outreach.md"   # optional, default shown
@@ -83,12 +96,15 @@ CLI (`harness`, global `--config PATH`):
   and the cards it queues, then exits (for cron/launchd/systemd timers).
 - `harness card <ref> [--workspace NAME]` — work one card.
 - `harness stop` / `harness resume` — create / remove the kill switch.
-- `harness check` — validate config, print resolved paths and plugin path. No
-  model call.
+- `harness check` — validate config, print resolved paths and plugin path (phase
+  2: also the store, the secrets file and each enabled source's key presence,
+  never values). No model call.
+- `harness enqueue <source> <text>` (phase 2) — queue a manual event.
 
 Exit codes: `0` ok; `1` run failed, kill switch present, or plugin missing
 (`check`); `2` bad config, bad arguments or unknown workspace. Output: one line
-per run on stdout (`<UTC time> <heartbeat|card> <status> <detail>`); no logging
+per run on stdout (`<UTC time> <triage|card|discussion|intake|claim> <status>
+<detail>`; phase 1 printed `heartbeat` where phase 2 prints `triage`); no logging
 subsystem.
 
 ### Sessions
@@ -105,9 +121,10 @@ claude -p <prompt> --output-format json --json-schema <schema> \
   card with no workspace). User/project settings, permission rules, hooks and
   MCP servers (incl. claude.ai connectors) load as in any Claude Code run.
 - Prompt is the workflow skill invocation plus a JSON context block:
-  - heartbeat: `/claude-harness:workflow heartbeat` + `{now, cursors, sources, workspaces, outreach_file}`
-  - card: `/claude-harness:workflow card <ref>` + `{now, ref, workspace, workspaces, outreach_file}`
+  - triage (phase 1: `heartbeat`): `/claude-harness:workflow triage` + `{now, runner, cursors, sources, workspaces, outreach_file, events}`
+  - card: `/claude-harness:workflow card <ref>` + `{now, runner, ref, workspace, workspaces, outreach_file}`
     (`workspace.path` is the card's checkout; `workspaces` lists the configured paths)
+  - discussion (phase 2): `/claude-harness:workflow discussion <ref>` + `{now, runner, ref, thread, question, workspace, workspaces, outreach_file}`
 - The runner reads the single JSON result object `claude` prints: `is_error`,
   `subtype` and `errors` for failures, `structured_output` for the result,
   `total_cost_usd` for the output line. A failed run, a missing or non-object
@@ -116,27 +133,33 @@ claude -p <prompt> --output-format json --json-schema <schema> \
 - Structured output (JSON schema) — the contract with the workflow skill:
 
 ```jsonc
-// HeartbeatResult
+// TriageResult (phase 1: HeartbeatResult, without discussions_to_run)
 { "cursors": {"<source id>": "<opaque cursor>"},   // persisted verbatim for the next tick
-  "handled": [{"source": "...", "item": "...", "action": "replied|drafted|ignored|escalated"}],
+  "handled": [{"source": "...", "item": "<event id>", "action": "replied|drafted|ignored|escalated"}],
   "cards_to_work": [{"ref": "<card ref>", "blocked_by": ["<card ref>"]}],  // blockers not yet done
+  "discussions_to_run": [{"ref": "...", "thread": "<permalink>", "question": "..."}],
   "summary": "one line" }
 
 // CardResult
 { "ref": "...", "status": "done|blocked|failed",
   "pr_url": "... | null", "blocked_on": "... | null", "summary": "one line" }
+
+// DiscussionResult (phase 2)
+{ "ref": "...", "status": "replied|drafted|skipped|failed", "summary": "one line" }
 ```
 
 ### Scheduling
 
 `heartbeat` first releases cards left `in_progress` by a crashed run (they
-become `failed`, so triage can queue them again). Then one coordinator loop
-starts triage and card sessions as separate tokio tasks, so triage keeps its
-interval while cards run:
+become `failed`, so triage can queue them again), and in phase 2 also its own
+claims and `batched` events. Then one coordinator loop starts triage, card and
+discussion sessions as separate tokio tasks, so triage keeps its interval while
+cards run:
 
-- **Triage** runs `interval` after the previous triage finished. A failed triage
-  retries after 30s, doubling per consecutive failure, capped at the interval.
-  Its cursors are persisted as soon as it returns.
+- **Triage** (the fallback sweep) runs `interval` after the previous sweep
+  finished. A failed triage retries after 30s, doubling per consecutive failure,
+  capped at the interval. Its cursors are persisted as soon as it returns. Phase
+  2 adds event triages started by a closed batch window (see its Dispatch).
 - **Queue.** Each triage result replaces the queue: cards it no longer lists are
   dropped, cards already queued keep their place with the fresh `blocked_by`,
   cards running or `in_progress` in state are skipped, and at most
@@ -146,7 +169,8 @@ interval while cards run:
   or running): an external dependency the runner cannot track, so it does not
   hold the card. A blocker that ended `blocked` or `failed` holds the card until
   a later run finishes it.
-- **Parallelism.** At most `card.max_parallel` card sessions run at once.
+- **Parallelism.** At most `card.max_parallel` card and discussion sessions run
+  at once.
 - **Checkouts.** Parallel cards in one workspace must not share a checkout. Every
   card whose workspace is the root of a git checkout runs in its own worktree,
   `git worktree add --detach <state_dir>/worktrees/<workspace>/<ref-slug>`,
@@ -179,19 +203,21 @@ interval while cards run:
 ### Single instance and state
 
 `heartbeat` and `card` take an exclusive, non-blocking lock on
-`<state_dir>/harness.lock` for the life of the process. A second one exits `1`
-with a one-line message, so two processes never run the same card in one
-worktree and a starting heartbeat never releases another process's live cards.
-`check`, `stop` and `resume` do not take the lock.
+`<state_dir>/<name>.lock` (phase 1: `harness.lock`) for the life of the process.
+A second one of the same runner exits `1` with a one-line message, so two
+processes never run the same card in one worktree and a starting heartbeat never
+releases another process's live cards. `check`, `stop`, `resume` and `enqueue`
+do not take the lock.
 
-State (`state.json`): `cursors`, `cards` (`ref → {status, updated_at, pr_url}`,
-status `in_progress|done|blocked|failed`). Every read-modify-write holds an
-exclusive lock on `<state_dir>/state.lock`, since parallel card tasks share the
-file; writes are atomic (temp file, fsync, rename), so readers need no lock.
-State I/O runs on the blocking thread pool. A card starts only through a
-compare-and-set to `in_progress` inside that lock: a card already
-`in_progress` is skipped. If `state.json` cannot be read, the scheduler prints
-one line and skips scheduling until it can. It never assumes an empty state.
+State (phase 2: the `cards` and `cursors` tables of `harness.db`, per runner;
+phase 1's `state.json` is imported once and renamed `state.json.migrated`):
+`cursors`, `cards` (`ref → {status, updated_at, pr_url}`, status
+`in_progress|done|blocked|failed`). Every write is a SQLite transaction and all
+store I/O runs on the blocking thread pool. A card starts only after its
+`card:<ref>` claim (`BEGIN IMMEDIATE`, 10 min lease renewed every minute,
+released at the end): a card held by any runner, this one included, is skipped
+with one line. If the store cannot be read, the scheduler prints one line and
+skips scheduling until it can. It never assumes an empty state.
 
 ### Messaging policy lives in Claude Code
 
