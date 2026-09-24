@@ -46,9 +46,48 @@ cp examples/config.example.toml ~/.config/claude-harness/config.toml
 cp examples/outreach.example.md ~/.config/claude-harness/outreach.md
 ```
 
-Replace every placeholder with real channel/user IDs, people and repos. These
-files stay out of the repo. Then run `harness check` to validate the config and
-print the resolved paths.
+Replace every placeholder with real channel/user IDs, people and repos, and
+give the runner a `name`. These files stay out of the repo. Then run
+`harness check` to validate the config, print the resolved paths and report which
+intake sources have their keys.
+
+### Secrets
+
+API keys for the Linear and Jira pollers live in a file outside the repo, never
+in `config.toml`:
+
+```sh
+cp examples/secrets.env.example ~/.config/claude-harness/secrets.env
+chmod 600 ~/.config/claude-harness/secrets.env
+```
+
+The runner refuses a file readable by group or others (the source stays idle
+with one stdout line). Override the path with `HARNESS_SECRETS`. Keys can be
+added or rotated while the runner runs.
+
+- **Linear personal API key:** Linear → Settings → Account → Security & access →
+  Personal API keys (<https://linear.app/settings/account/security>).
+- **Jira API token:** <https://id.atlassian.com/manage-profile/security/api-tokens>;
+  `JIRA_EMAIL` is the Atlassian account email that owns it.
+
+Both act as you: the pollers only see work assigned to you and threads you take
+part in.
+
+### One runner per project
+
+Run one runner per project, each with its own config file and a unique `name`
+(it names the lock, the claims, the `agent:<name>` label and the
+`agent/<name>/...` branches):
+
+```sh
+harness --config ~/.config/claude-harness/example-app.toml check
+```
+
+All runners on the machine share one store (`~/.local/state/claude-harness/harness.db`,
+override `HARNESS_DB`), which keeps two of them off the same card or event. Give
+each its own service (section 7) with its own `--config` or `HARNESS_CONFIG`, and
+narrow each one's intake (`[intake.notifications].match`, Linear `projects`, Jira
+`jql`) to its project.
 
 ### Who may be messaged
 
@@ -66,7 +105,27 @@ The harness does not gate sends; Claude Code does, with your own settings:
 Start with sends denied and loosen them as you trust the output. `harness stop`
 creates the kill switch: nothing new starts and running sessions are ended.
 
-## 6. Scheduling
+## 6. Notification intake (macOS)
+
+The notification watcher reads the macOS notification database read-only, so
+Slack messages wake the runner without a model polling. Skip this section if
+`[intake.notifications]` is disabled.
+
+- **Full Disk Access:** System Settings → Privacy & Security → Full Disk Access;
+  add the `harness` binary (`~/.cargo/bin/harness`) or, for manual runs, the
+  terminal app that starts it. For a service, grant it to the binary the
+  service runs. If access disappears after a rebuild, remove and re-add the
+  entry. The runner prints one stdout line when the database cannot be read.
+- **Slack desktop notifications** (Slack → Settings → Notifications): notify
+  about direct messages, mentions and keywords (add your project keywords under
+  "My keywords"), and turn on notifying on desktop even when you are active on
+  mobile. Allow Slack in System Settings → Notifications.
+- **Focus mode:** Focus modes and Do Not Disturb can hold notifications back.
+  With the Focus you actually use turned on, send yourself a test DM and check
+  that `harness` prints the event (or use `harness enqueue` to test the rest of
+  the path).
+
+## 7. Scheduling
 
 Pick one:
 
@@ -76,7 +135,8 @@ Pick one:
 - **Timer calling one tick:** `harness heartbeat --once` from launchd
   (`StartInterval` in a LaunchAgent plist, macOS) or a systemd `.timer` +
   `.service` pair (Linux). The interval in the scheduler replaces
-  `[heartbeat].interval`. A tick lasts until its cards finish; a tick that
+  `[triage].interval`. Intake events only start triage while a runner is
+  running, so a timer gives up the event-driven wake-up. A tick lasts until its cards finish; a tick that
   starts while another harness run is still going exits `1` without doing
   anything (single-instance lock), so overlapping timers only waste a start.
 
