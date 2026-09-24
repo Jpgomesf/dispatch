@@ -471,7 +471,7 @@ async fn stop_terminates_running_cards_and_starts_no_more() {
     assert!(
         lines_of(&lines)
             .iter()
-            .any(|l| l.contains("card failed EX-1 — terminated"))
+            .any(|l| l.contains("card failed EX-1 — interrupted"))
     );
 }
 

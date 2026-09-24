@@ -95,6 +95,18 @@ impl Store {
         })
     }
 
+    /// Record the session id as soon as the stream names it, so a running or crashed session
+    /// can be resumed.
+    pub fn set_attempt_session(&self, id: i64, session_id: &str) -> Result<()> {
+        self.write(false, |tx| {
+            tx.execute(
+                "UPDATE attempts SET session_id = ?2 WHERE id = ?1",
+                params![id, session_id],
+            )
+            .map(|_| ())
+        })
+    }
+
     pub fn end_attempt(&self, id: i64, end: &AttemptEnd) -> Result<()> {
         self.write(false, |tx| {
             tx.execute(
@@ -239,10 +251,12 @@ mod tests {
         store
             .begin_attempt("beta", "card", "EX-3", cwd, now())
             .unwrap();
+        store.set_attempt_session(open, "session-9").unwrap();
         let running = store.open_attempts("alpha").unwrap();
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].id, open);
         assert_eq!(running[0].ended_at, None);
+        assert_eq!(running[0].session_id.as_deref(), Some("session-9"));
 
         let closed = store
             .close_open_attempts("alpha", "crash", "runner stopped", now())

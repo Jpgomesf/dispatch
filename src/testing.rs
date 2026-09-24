@@ -10,13 +10,14 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::config::{Config, tests::config_toml};
 use crate::paths::{EnvPaths, Paths};
 use crate::runner::{Clock, Runner};
-use crate::session::{Mode, Session, SessionReport, SessionRequest, Shutdown};
+use crate::session::{
+    Control, Ended, Mode, Notice, Session, SessionReport, SessionRequest, Shutdown,
+};
 use crate::store::Store;
 
 pub fn now() -> DateTime<Utc> {
@@ -73,21 +74,24 @@ pub fn write_plugin(root: &Path) {
 
 pub struct Step {
     pub delay: Duration,
-    pub output: Result<Value, String>,
+    pub ended: Ended,
+}
+
+/// A session that ends how `ended` says.
+pub fn ended(ended: Ended) -> Step {
+    Step {
+        delay: Duration::ZERO,
+        ended,
+    }
 }
 
 pub fn ok(output: Value) -> Step {
-    Step {
-        delay: Duration::ZERO,
-        output: Ok(output),
-    }
+    ended(Ended::Output(output))
 }
 
+/// A session whose result reports an error.
 pub fn fail(message: &str) -> Step {
-    Step {
-        delay: Duration::ZERO,
-        output: Err(message.to_string()),
-    }
+    ended(Ended::ApiError(message.to_string()))
 }
 
 impl Step {
@@ -192,11 +196,11 @@ impl FakeSession {
 }
 
 impl Session for FakeSession {
-    async fn run(
-        &self,
-        request: SessionRequest,
-        mut shutdown: watch::Receiver<Shutdown>,
-    ) -> SessionReport {
+    async fn run(&self, request: SessionRequest, control: Control) -> SessionReport {
+        let Control {
+            mut shutdown,
+            notices,
+        } = control;
         let step = (self.script)(&request);
         let number = {
             let mut calls = self.calls.lock().unwrap();
@@ -206,7 +210,10 @@ impl Session for FakeSession {
             });
             calls.len()
         };
-        let session_id = Some(format!("session-{number}"));
+        let session_id = format!("session-{number}");
+        let _ = notices.send(Notice::Started {
+            session_id: session_id.clone(),
+        });
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
         let terminated = if step.delay.is_zero() {
@@ -218,14 +225,13 @@ impl Session for FakeSession {
             }
         };
         self.active.fetch_sub(1, Ordering::SeqCst);
-        let output = if terminated {
-            Err("terminated: dispatch is stopping".into())
-        } else {
-            step.output
-        };
         SessionReport {
-            output,
-            session_id,
+            ended: if terminated {
+                Ended::Interrupted
+            } else {
+                step.ended
+            },
+            session_id: Some(session_id),
             cost_usd: Some(0.05),
         }
     }

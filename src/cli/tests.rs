@@ -25,9 +25,9 @@ impl Session for SharedSession {
     async fn run(
         &self,
         request: crate::session::SessionRequest,
-        shutdown: watch::Receiver<Shutdown>,
+        control: crate::session::Control,
     ) -> crate::session::SessionReport {
-        self.0.run(request, shutdown).await
+        self.0.run(request, control).await
     }
 }
 

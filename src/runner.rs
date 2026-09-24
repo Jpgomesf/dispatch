@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, interval_at};
 
 use crate::config::{Config, Effort, UnknownWorkspace, Workspace};
@@ -21,7 +21,9 @@ use crate::results::{
     CardOutcome, CardResult, DiscussionResult, DiscussionToRun, TriageResult, card_schema,
     discussion_schema, triage_schema,
 };
-use crate::session::{Mode, Session, SessionReport, SessionRequest, Shutdown};
+use crate::session::{
+    Control, Ended, Mode, Notice, Session, SessionReport, SessionRequest, Shutdown,
+};
 use crate::state::{CardState, CardStatus};
 use crate::store::{AttemptEnd, CLAIM_LEASE, CLAIM_RENEW, Claim, Store};
 use crate::worktree;
@@ -244,6 +246,39 @@ impl<S: Session> Runner<S> {
             .map_err(|e| format!("store: {e}"))
     }
 
+    /// Run one session for attempt `id`, acting on its notices while it runs.
+    async fn run_session(&self, request: SessionRequest, id: i64) -> SessionReport {
+        let (notices, mut received) = mpsc::unbounded_channel();
+        let control = Control {
+            shutdown: self.shutdown.subscribe(),
+            notices,
+        };
+        let mut run = pin!(self.session.run(request, control));
+        loop {
+            tokio::select! {
+                report = &mut run => {
+                    while let Ok(notice) = received.try_recv() {
+                        self.on_notice(id, notice).await;
+                    }
+                    return report;
+                }
+                Some(notice) = received.recv() => self.on_notice(id, notice).await,
+            }
+        }
+    }
+
+    /// Best effort: a notice never fails the session.
+    async fn on_notice(&self, id: i64, notice: Notice) {
+        match notice {
+            Notice::Started { session_id } => {
+                let _ = self
+                    .store
+                    .call(move |s| s.set_attempt_session(id, &session_id))
+                    .await;
+            }
+        }
+    }
+
     /// Close an attempt row with how the session ended. Best effort: the session already ran,
     /// so a store failure costs only the record (one line).
     async fn end_attempt(
@@ -449,8 +484,8 @@ impl<S: Session> Runner<S> {
             card_schema(),
         );
         let (id, _) = self.begin_attempt(Mode::Card, card_ref, &checkout).await?;
-        let report = self.session.run(request, self.shutdown.subscribe()).await;
-        let parsed = report.output.clone().and_then(|output| {
+        let report = self.run_session(request, id).await;
+        let parsed = report.ended.output().and_then(|output| {
             serde_json::from_value::<CardResult>(output)
                 .map_err(|e| format!("invalid card result: {e}"))
         });
@@ -537,15 +572,15 @@ impl<S: Session> Runner<S> {
             .begin_attempt(Mode::Discussion, &discussion.discussion_ref, &checkout)
             .await;
         let report = match &attempt {
-            Ok(_) => self.session.run(request, self.shutdown.subscribe()).await,
-            Err(error) => SessionReport::failed(error.clone()),
+            Ok((id, _)) => self.run_session(request, *id).await,
+            Err(error) => SessionReport::ended(Ended::Crash(error.clone())),
         };
         if let Some(workspace) = &workspace {
             // Discussions never commit; a dirty tree is kept for a person to look at.
             let _ = worktree::release_checkout(workspace, &checkout).await;
         }
         let (id, _) = attempt?;
-        let parsed = report.output.clone().and_then(|output| {
+        let parsed = report.ended.output().and_then(|output| {
             serde_json::from_value::<DiscussionResult>(output)
                 .map_err(|e| format!("invalid discussion result: {e}"))
         });
@@ -607,8 +642,8 @@ impl<S: Session> Runner<S> {
             triage_schema(),
         );
         let (id, _) = self.begin_attempt(Mode::Triage, "", &cwd).await?;
-        let report = self.session.run(request, self.shutdown.subscribe()).await;
-        let parsed = report.output.clone().and_then(|output| {
+        let report = self.run_session(request, id).await;
+        let parsed = report.ended.output().and_then(|output| {
             serde_json::from_value::<TriageResult>(output)
                 .map_err(|e| format!("invalid triage result: {e}"))
         });
