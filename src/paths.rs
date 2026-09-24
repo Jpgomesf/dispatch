@@ -78,11 +78,6 @@ impl Paths {
         }
     }
 
-    /// Phase 1 state, imported into `dispatch.db` once and renamed `state.json.migrated`.
-    pub fn legacy_state_file(&self) -> PathBuf {
-        self.state_dir.join("state.json")
-    }
-
     pub fn kill_switch(&self) -> PathBuf {
         self.state_dir.join("STOP")
     }
@@ -143,10 +138,6 @@ mod tests {
     fn derived_paths() {
         let config = Config::from_toml("name = \"ex\"\nstate_dir = \"/var/example\"").unwrap();
         let paths = Paths::resolve(Path::new("c.toml"), &config, &EnvPaths::default());
-        assert_eq!(
-            paths.legacy_state_file(),
-            PathBuf::from("/var/example/state.json")
-        );
         assert_eq!(paths.kill_switch(), PathBuf::from("/var/example/STOP"));
         assert_eq!(
             paths.instance_lock_file(),

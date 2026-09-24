@@ -121,7 +121,7 @@ pub async fn run<S: Session>(
 }
 
 /// Only one session-running process per runner name (held until the caller drops it), then
-/// the shared store, importing this runner's phase 1 `state.json` once.
+/// the shared store.
 fn open_runner(paths: &Paths) -> Result<(InstanceLock, Store), ()> {
     let lock_file = paths.instance_lock_file();
     let instance = match InstanceLock::try_acquire(&lock_file) {
@@ -139,21 +139,6 @@ fn open_runner(paths: &Paths) -> Result<(InstanceLock, Store), ()> {
         }
     };
     let store = open_store(paths)?;
-    match store.import_state_file(&paths.runner, &paths.legacy_state_file()) {
-        Ok(Some(migrated)) => println!(
-            "imported state into {}; kept {}",
-            paths.db.display(),
-            migrated.display()
-        ),
-        Ok(None) => {}
-        Err(error) => {
-            eprintln!(
-                "cannot import {}: {error}",
-                paths.legacy_state_file().display()
-            );
-            return Err(());
-        }
-    }
     Ok((instance, store))
 }
 

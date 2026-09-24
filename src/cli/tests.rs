@@ -195,25 +195,6 @@ async fn enqueued_event_reaches_the_next_triage() {
 }
 
 #[tokio::test]
-async fn state_json_is_imported_once() {
-    let env = test_env();
-    std::fs::create_dir_all(&env.paths.state_dir).unwrap();
-    let legacy = env.paths.legacy_state_file();
-    std::fs::write(
-        &legacy,
-        r#"{"cursors": {"slack:C0000000001": "c1"}, "cards": {}}"#,
-    )
-    .unwrap();
-    let session = FakeSession::sequence(vec![ok(triage_output(&[]))]);
-    let (code, session) = run_with(&env, &["heartbeat", "--once"], session).await;
-    assert_eq!(code, EXIT_OK);
-    assert!(!legacy.exists());
-    assert!(env.paths.state_dir.join("state.json.migrated").is_file());
-    let context = crate::prompts::context_of(&session.calls()[0].request.prompt);
-    assert_eq!(context["cursors"]["slack:C0000000001"], "c1");
-}
-
-#[tokio::test]
 async fn bad_interval_is_rejected() {
     let env = test_env();
     let code = run_with(&env, &["heartbeat", "--interval", "soon"], no_session())

@@ -157,12 +157,9 @@ Tables (all runner-scoped rows carry `runner`):
 |---|---|---|
 | `events` | `id`; `UNIQUE(source, external_id)` | intake queue: `runner`, `source`, `external_id`, `payload` JSON, `status` (`new`/`batched`/`done`), `created_at` |
 | `claims` | `key` (PK) | cross-runner exclusivity: `runner`, `lease_until`, `claimed_at` |
-| `cards` | `(runner, ref)` | replaces `state.json` cards: `status`, `blocked_by` JSON, `pr_url`, `updated_at` |
-| `cursors` | `(runner, key)` | replaces `state.json` cursors (skill cursors and poller cursors) |
+| `cards` | `(runner, ref)` | per-runner card state: `status`, `blocked_by` JSON, `pr_url`, `updated_at` |
+| `cursors` | `(runner, key)` | skill cursors and poller cursors |
 | `schema_version` | — | migrations, applied in order at open |
-
-Migration: on first open a runner imports its `state.json` (if present) into the
-DB and renames it `state.json.migrated`. Nothing is deleted.
 
 As implemented: the default path is fixed (not under `state_dir`) so runners
 with different state dirs still share it; `dispatch check` never creates it.

@@ -1,13 +1,12 @@
-//! Per-runner cards and cursors (what `state.json` held in phase 1), and its one-time import.
+//! Per-runner cards and cursors.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::{Result, Store, StoreError, iso, parse_time};
-use crate::state::{CardState, CardStatus, State, load_state};
+use crate::state::{CardState, CardStatus, State};
 
 fn put_card(
     tx: &Transaction<'_>,
@@ -128,30 +127,6 @@ impl Store {
                 .try_for_each(|(key, value)| put_cursor(tx, runner, key, value))
         })
     }
-
-    /// Import a phase 1 `state.json` (if present) and rename it `state.json.migrated`;
-    /// nothing is deleted. Returns the new name when a file was imported.
-    pub fn import_state_file(&self, runner: &str, file: &Path) -> Result<Option<PathBuf>> {
-        if !file.is_file() {
-            return Ok(None);
-        }
-        let state = load_state(file).map_err(|e| StoreError::Invalid(format!("{e:#}")))?;
-        self.write(true, |tx| {
-            for (key, value) in &state.cursors {
-                put_cursor(tx, runner, key, value)?;
-            }
-            for (card_ref, card) in &state.cards {
-                put_card(tx, runner, card_ref, card, &[])?;
-            }
-            Ok(())
-        })?;
-        let mut migrated = file.as_os_str().to_owned();
-        migrated.push(".migrated");
-        let migrated = PathBuf::from(migrated);
-        std::fs::rename(file, &migrated)
-            .map_err(|e| StoreError::Invalid(format!("rename {}: {e}", file.display())))?;
-        Ok(Some(migrated))
-    }
 }
 
 #[cfg(test)]
@@ -209,37 +184,5 @@ mod tests {
             store.load_state("alpha").unwrap().status("EX-1"),
             Some(CardStatus::Done)
         );
-    }
-
-    #[test]
-    fn imports_state_json_once_and_keeps_it() {
-        let (dir, store) = temp_store();
-        let file = dir.path().join("state.json");
-        std::fs::write(
-            &file,
-            r#"{"cursors": {"tracker:linear": "c1"}, "sends": [],
-                "cards": {"EX-1": {"status": "done", "updated_at": "2026-01-15T09:30:00Z",
-                                   "pr_url": "https://example.com/pr/1"}}}"#,
-        )
-        .unwrap();
-        let migrated = store.import_state_file("alpha", &file).unwrap().unwrap();
-        assert!(!file.exists());
-        assert!(migrated.ends_with("state.json.migrated") && migrated.is_file());
-        let state = store.load_state("alpha").unwrap();
-        assert_eq!(state.cursors["tracker:linear"], "c1");
-        assert_eq!(
-            state.cards["EX-1"].pr_url.as_deref(),
-            Some("https://example.com/pr/1")
-        );
-        assert_eq!(store.import_state_file("alpha", &file).unwrap(), None);
-    }
-
-    #[test]
-    fn unreadable_state_json_is_not_renamed() {
-        let (dir, store) = temp_store();
-        let file = dir.path().join("state.json");
-        std::fs::write(&file, "{not json").unwrap();
-        assert!(store.import_state_file("alpha", &file).is_err());
-        assert!(file.is_file());
     }
 }

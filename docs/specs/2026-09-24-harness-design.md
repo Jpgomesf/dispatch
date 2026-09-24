@@ -16,8 +16,8 @@ tracker, Slack and git are the record.
 > **Phase 2** (`2026-09-24-phase2-intake-design.md`) supersedes parts of this
 > document: the heartbeat session mode is now `triage` (config `[triage]`, default
 > interval `30m`, started by intake events and as a fallback sweep), a third mode
-> `discussion <ref>` exists, `state.json` is replaced by the machine-wide
-> `dispatch.db`, and the instance lock is per runner name. The sections below are
+> `discussion <ref>` exists, state lives in the machine-wide `dispatch.db`, and
+> the instance lock is per runner name. The sections below are
 > corrected where they would otherwise mislead.
 
 ## Scope
@@ -209,8 +209,7 @@ processes never run the same card in one worktree and a starting heartbeat never
 releases another process's live cards. `check`, `stop`, `resume` and `enqueue`
 do not take the lock.
 
-State (phase 2: the `cards` and `cursors` tables of `dispatch.db`, per runner;
-phase 1's `state.json` is imported once and renamed `state.json.migrated`):
+State (the `cards` and `cursors` tables of `dispatch.db`, per runner):
 `cursors`, `cards` (`ref → {status, updated_at, pr_url}`, status
 `in_progress|done|blocked|failed`). Every write is a SQLite transaction and all
 store I/O runs on the blocking thread pool. A card starts only after its
