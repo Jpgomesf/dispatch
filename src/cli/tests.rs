@@ -26,7 +26,7 @@ impl Session for SharedSession {
         &self,
         request: crate::session::SessionRequest,
         shutdown: watch::Receiver<Shutdown>,
-    ) -> Result<crate::session::SessionOutcome, crate::session::SessionError> {
+    ) -> crate::session::SessionReport {
         self.0.run(request, shutdown).await
     }
 }
@@ -201,6 +201,29 @@ async fn enqueued_event_reaches_the_next_triage() {
         .parse()
         .unwrap();
     assert_eq!(store.event_status(id).unwrap().as_deref(), Some("done"));
+}
+
+#[tokio::test]
+async fn status_and_history_are_read_only() {
+    let env = test_env();
+    for args in [&["status"][..], &["history"], &["history", "EX-1"]] {
+        assert_eq!(run_with(&env, args, no_session()).await.0, EXIT_OK);
+    }
+    assert!(!env.paths.db.exists(), "never created by a view");
+
+    let done = FakeSession::sequence(vec![ok(card_output("EX-1", "done"))]);
+    assert_eq!(run_with(&env, &["card", "EX-1"], done).await.0, EXIT_OK);
+    let modified = || {
+        std::fs::metadata(&env.paths.db)
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
+    let before = modified();
+    for args in [&["status"][..], &["history"], &["history", "EX-1"]] {
+        assert_eq!(run_with(&env, args, no_session()).await.0, EXIT_OK);
+    }
+    assert_eq!(modified(), before);
 }
 
 #[tokio::test]

@@ -8,6 +8,7 @@ pub mod durations;
 pub mod intake;
 pub mod paths;
 pub mod prompts;
+pub mod report;
 pub mod results;
 pub mod runner;
 pub mod session;

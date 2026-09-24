@@ -48,15 +48,26 @@ pub struct SessionRequest {
     pub output_schema: Value,
 }
 
+/// What one session produced.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SessionOutcome {
-    pub output: Value,
+pub struct SessionReport {
+    /// The structured output, or why there is none.
+    pub output: Result<Value, String>,
+    /// Claude Code's session id: `claude --resume <id>` from the session's cwd.
+    pub session_id: Option<String>,
     pub cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct SessionError(pub String);
+impl SessionReport {
+    #[must_use]
+    pub fn failed(reason: impl Into<String>) -> SessionReport {
+        SessionReport {
+            output: Err(reason.into()),
+            session_id: None,
+            cost_usd: None,
+        }
+    }
+}
 
 /// Runner-wide shutdown level, broadcast to every running session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,7 +85,7 @@ pub trait Session: Send + Sync + 'static {
         &self,
         request: SessionRequest,
         shutdown: watch::Receiver<Shutdown>,
-    ) -> impl Future<Output = Result<SessionOutcome, SessionError>> + Send;
+    ) -> impl Future<Output = SessionReport> + Send;
 }
 
 /// `claude -p` in print mode with JSON structured output, auto permission mode, no permission
@@ -125,7 +136,7 @@ pub fn build_args(request: &SessionRequest) -> Vec<String> {
 }
 
 /// Parse the final `{"type": "result", ...}` object printed by `--output-format json`.
-pub fn outcome_from_stdout(stdout: &str) -> Result<SessionOutcome, SessionError> {
+pub fn report_from_stdout(stdout: &str) -> SessionReport {
     let parsed = serde_json::from_str::<Value>(stdout.trim())
         .ok()
         .or_else(|| {
@@ -135,10 +146,10 @@ pub fn outcome_from_stdout(stdout: &str) -> Result<SessionOutcome, SessionError>
                 .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
         });
     let Some(result) = parsed.filter(|v| v["type"] == "result") else {
-        return Err(SessionError("session ended without a result".into()));
+        return SessionReport::failed("session ended without a result");
     };
     let structured = &result["structured_output"];
-    if result["is_error"] == Value::Bool(true) || !structured.is_object() {
+    let output = if result["is_error"] == Value::Bool(true) || !structured.is_object() {
         let errors: Vec<&str> = result["errors"]
             .as_array()
             .map(|list| list.iter().filter_map(Value::as_str).collect())
@@ -151,12 +162,15 @@ pub fn outcome_from_stdout(stdout: &str) -> Result<SessionOutcome, SessionError>
         } else {
             errors.join("; ")
         };
-        return Err(SessionError(format!("session failed: {detail}")));
-    }
-    Ok(SessionOutcome {
-        output: structured.clone(),
+        Err(format!("session failed: {detail}"))
+    } else {
+        Ok(structured.clone())
+    };
+    SessionReport {
+        output,
+        session_id: result["session_id"].as_str().map(str::to_string),
         cost_usd: result["total_cost_usd"].as_f64(),
-    })
+    }
 }
 
 /// Signal every process in the session's group (the child leads a group of its own), so
@@ -207,11 +221,11 @@ impl Session for ClaudeCli {
         &self,
         request: SessionRequest,
         mut shutdown: watch::Receiver<Shutdown>,
-    ) -> Result<SessionOutcome, SessionError> {
+    ) -> SessionReport {
         if *shutdown.borrow_and_update() != Shutdown::Run {
-            return Err(SessionError("not started: dispatch is stopping".into()));
+            return SessionReport::failed("not started: dispatch is stopping");
         }
-        let mut child = Command::new(&self.program)
+        let spawned = Command::new(&self.program)
             .args(build_args(&request))
             .current_dir(&request.cwd)
             .stdin(Stdio::null())
@@ -219,14 +233,22 @@ impl Session for ClaudeCli {
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| SessionError(format!("cannot start {}: {e}", self.program.display())))?;
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) => {
+                return SessionReport::failed(format!(
+                    "cannot start {}: {e}",
+                    self.program.display()
+                ));
+            }
+        };
         let group = child.id();
         let (stdout, mut read_out) = drain(child.stdout.take().expect("piped stdout"));
         let (stderr, mut read_err) = drain(child.stderr.take().expect("piped stderr"));
 
         let mut terminated = false;
-        let status = loop {
+        let waited = loop {
             tokio::select! {
                 status = child.wait() => break status,
                 changed = shutdown.changed() => {
@@ -246,8 +268,11 @@ impl Session for ClaudeCli {
                     }
                 }
             }
-        }
-        .map_err(|e| SessionError(format!("waiting for claude: {e}")))?;
+        };
+        let status = match waited {
+            Ok(status) => status,
+            Err(e) => return SessionReport::failed(format!("waiting for claude: {e}")),
+        };
 
         // A leftover subprocess holding a pipe open must not pin this session forever.
         let pipes_closed = timeout(self.pipe_grace, async {
@@ -266,19 +291,16 @@ impl Session for ClaudeCli {
             }
         }
         let (stdout, stderr) = (text(&stdout), text(&stderr));
+        let mut report = report_from_stdout(&stdout);
         if terminated {
-            return Err(SessionError("terminated: dispatch is stopping".into()));
+            report.output = Err("terminated: dispatch is stopping".into());
+        } else if stdout.trim().is_empty() {
+            report.output = Err(format!(
+                "claude exited with {status}: {}",
+                last_line(&stderr)
+            ));
         }
-        outcome_from_stdout(&stdout).map_err(|error| {
-            if stdout.trim().is_empty() {
-                SessionError(format!(
-                    "claude exited with {status}: {}",
-                    last_line(&stderr)
-                ))
-            } else {
-                error
-            }
-        })
+        report
     }
 }
 
@@ -344,7 +366,7 @@ mod tests {
         let mut base = json!({
             "type": "result", "subtype": "success", "is_error": false,
             "total_cost_usd": 0.42, "structured_output": {"summary": "ok"},
-            "result": "{\"summary\":\"ok\"}"
+            "result": "{\"summary\":\"ok\"}", "session_id": "session-example"
         });
         for (key, value) in overrides.as_object().unwrap() {
             base[key] = value.clone();
@@ -353,27 +375,32 @@ mod tests {
     }
 
     #[test]
-    fn outcome_from_success() {
-        let outcome = outcome_from_stdout(&result(json!({}))).unwrap();
-        assert_eq!(outcome.output, json!({"summary": "ok"}));
-        assert_eq!(outcome.cost_usd, Some(0.42));
+    fn report_from_success() {
+        let report = report_from_stdout(&result(json!({})));
+        assert_eq!(report.output, Ok(json!({"summary": "ok"})));
+        assert_eq!(report.cost_usd, Some(0.42));
+        assert_eq!(report.session_id.as_deref(), Some("session-example"));
         let with_noise = format!("warning: something\n{}\n", result(json!({})));
-        assert!(outcome_from_stdout(&with_noise).is_ok());
+        assert!(report_from_stdout(&with_noise).output.is_ok());
     }
 
     #[test]
-    fn outcome_from_failures() {
+    fn report_from_failures() {
         let budget = result(json!({
             "is_error": true, "subtype": "error_max_budget_usd",
             "errors": ["Reached maximum budget ($0.05)"], "structured_output": null
         }));
-        let error = outcome_from_stdout(&budget).unwrap_err();
-        assert_eq!(error.0, "session failed: Reached maximum budget ($0.05)");
+        let report = report_from_stdout(&budget);
+        assert_eq!(
+            report.output,
+            Err("session failed: Reached maximum budget ($0.05)".into())
+        );
+        assert_eq!(report.session_id.as_deref(), Some("session-example"));
         let subtype_only = result(json!({"is_error": true, "subtype": "error_during_execution"}));
         assert!(
-            outcome_from_stdout(&subtype_only)
+            report_from_stdout(&subtype_only)
+                .output
                 .unwrap_err()
-                .0
                 .contains("error_during_execution")
         );
         for bad in [
@@ -383,7 +410,7 @@ mod tests {
             result(json!({"structured_output": null})),
             result(json!({"structured_output": "plain text"})),
         ] {
-            assert!(outcome_from_stdout(&bad).is_err(), "{bad}");
+            assert!(report_from_stdout(&bad).output.is_err(), "{bad}");
         }
     }
 
@@ -398,8 +425,8 @@ mod tests {
             cwd: std::env::temp_dir(),
             ..request()
         };
-        let error = cli.run(request, rx).await.unwrap_err();
-        assert!(error.0.starts_with("cannot start"), "{}", error.0);
+        let error = cli.run(request, rx).await.output.unwrap_err();
+        assert!(error.starts_with("cannot start"), "{error}");
     }
 
     /// A fake `claude`: a shell script with the given body.
@@ -448,8 +475,9 @@ mod tests {
             .await
             .expect("session ended promptly")
             .unwrap()
+            .output
             .unwrap_err();
-        assert!(error.0.starts_with("terminated"), "{}", error.0);
+        assert!(error.starts_with("terminated"), "{error}");
         let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
             .unwrap()
             .trim()
@@ -473,9 +501,8 @@ mod tests {
         let (_tx, rx) = watch::channel(Shutdown::Run);
         let outcome = timeout(Duration::from_secs(5), cli.run(in_dir(dir.path()), rx))
             .await
-            .expect("pipe reads are bounded")
-            .unwrap();
-        assert_eq!(outcome.output["summary"], "ok");
+            .expect("pipe reads are bounded");
+        assert_eq!(outcome.output.unwrap()["summary"], "ok");
         let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
             .unwrap()
             .trim()
@@ -491,7 +518,8 @@ mod tests {
         let body = format!("cat <<'EOF'\n{}\nEOF", result(json!({})));
         let cli = fake_cli(dir.path(), &body);
         let (_tx, rx) = watch::channel(Shutdown::Run);
-        let outcome = cli.run(in_dir(dir.path()), rx).await.unwrap();
-        assert_eq!(outcome.output["summary"], "ok");
+        let report = cli.run(in_dir(dir.path()), rx).await;
+        assert_eq!(report.output.unwrap()["summary"], "ok");
+        assert_eq!(report.session_id.as_deref(), Some("session-example"));
     }
 }

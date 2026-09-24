@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,13 +21,16 @@ use crate::results::{
     CardOutcome, CardResult, DiscussionResult, DiscussionToRun, TriageResult, card_schema,
     discussion_schema, triage_schema,
 };
-use crate::session::{Mode, Session, SessionRequest, Shutdown};
+use crate::session::{Mode, Session, SessionReport, SessionRequest, Shutdown};
 use crate::state::{CardState, CardStatus};
-use crate::store::{CLAIM_LEASE, CLAIM_RENEW, Claim, Store};
+use crate::store::{AttemptEnd, CLAIM_LEASE, CLAIM_RENEW, Claim, Store};
 use crate::worktree;
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 pub type Output = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Summary of an attempt a stopped runner left open.
+const STOPPED_MID_SESSION: &str = "the runner stopped before the session ended";
 
 pub struct Runner<S> {
     pub config: Arc<Config>,
@@ -200,15 +203,17 @@ impl<S: Session> Runner<S> {
         }
     }
 
-    /// At startup, under the instance lock (no other live process of this runner): cards left
-    /// `in_progress` become `failed` so triage can queue them again, this runner's claims are
-    /// released, and batches a crashed triage held go back to `new`.
+    /// At startup, under the instance lock (no other live process of this runner): attempts
+    /// left open are closed as `crash`, cards left `in_progress` become `failed` so triage can
+    /// queue them again, this runner's claims are released, and batches a crashed triage held
+    /// go back to `new`.
     pub async fn recover(&self) {
         let runner = self.name().to_string();
         let now = self.now();
         let recovered = self
             .store
             .call(move |store| {
+                store.close_open_attempts(&runner, "crash", STOPPED_MID_SESSION, now)?;
                 store.fail_in_progress(&runner, now)?;
                 store.release_all(&runner)?;
                 store.requeue_batched(&runner)
@@ -216,6 +221,53 @@ impl<S: Session> Runner<S> {
             .await;
         if let Err(error) = recovered {
             self.emit("triage", "failed", &format!("store: {error}"));
+        }
+    }
+
+    /// Open this session's attempt row. A store that cannot record it keeps the session from
+    /// starting, like one that cannot record the card.
+    async fn begin_attempt(
+        &self,
+        mode: Mode,
+        reference: &str,
+        cwd: &Path,
+    ) -> Result<(i64, u32), String> {
+        let (runner, reference, cwd, now) = (
+            self.name().to_string(),
+            reference.to_string(),
+            cwd.to_path_buf(),
+            self.now(),
+        );
+        self.store
+            .call(move |s| s.begin_attempt(&runner, mode.as_str(), &reference, &cwd, now))
+            .await
+            .map_err(|e| format!("store: {e}"))
+    }
+
+    /// Close an attempt row with how the session ended. Best effort: the session already ran,
+    /// so a store failure costs only the record (one line).
+    async fn end_attempt(
+        &self,
+        id: i64,
+        outcome: &str,
+        report: &SessionReport,
+        summary: &str,
+        blocked_on: Option<String>,
+    ) {
+        let end = AttemptEnd {
+            outcome: outcome.to_string(),
+            summary: one_line(summary),
+            blocked_on,
+            session_id: report.session_id.clone(),
+            cost_usd: report.cost_usd,
+            ended_at: self.now(),
+        };
+        if let Err(error) = self.store.call(move |s| s.end_attempt(id, &end)).await {
+            self.emit(
+                "store",
+                "failed",
+                &one_line(&format!("attempt {id} not recorded — {error}")),
+            );
         }
     }
 
@@ -396,14 +448,27 @@ impl<S: Session> Runner<S> {
             checkout.clone(),
             card_schema(),
         );
-        let outcome = self
-            .session
-            .run(request, self.shutdown.subscribe())
-            .await
-            .map_err(|e| e.0)?;
-        let result: CardResult = serde_json::from_value(outcome.output)
-            .map_err(|e| format!("invalid card result: {e}"))?;
-        Ok((result, outcome.cost_usd, checkout))
+        let (id, _) = self.begin_attempt(Mode::Card, card_ref, &checkout).await?;
+        let report = self.session.run(request, self.shutdown.subscribe()).await;
+        let parsed = report.output.clone().and_then(|output| {
+            serde_json::from_value::<CardResult>(output)
+                .map_err(|e| format!("invalid card result: {e}"))
+        });
+        match &parsed {
+            Ok(result) => {
+                let blocked_on = result.blocked_on.clone();
+                self.end_attempt(
+                    id,
+                    result.status.as_str(),
+                    &report,
+                    &result.summary,
+                    blocked_on,
+                )
+                .await;
+            }
+            Err(error) => self.end_attempt(id, "failed", &report, error, None).await,
+        }
+        Ok((parsed?, report.cost_usd, checkout))
     }
 
     /// The workspace a discussion runs in: `match` against its ref, then its thread.
@@ -468,15 +533,30 @@ impl<S: Session> Runner<S> {
             checkout.clone(),
             discussion_schema(),
         );
-        let outcome = self.session.run(request, self.shutdown.subscribe()).await;
+        let attempt = self
+            .begin_attempt(Mode::Discussion, &discussion.discussion_ref, &checkout)
+            .await;
+        let report = match &attempt {
+            Ok(_) => self.session.run(request, self.shutdown.subscribe()).await,
+            Err(error) => SessionReport::failed(error.clone()),
+        };
         if let Some(workspace) = &workspace {
             // Discussions never commit; a dirty tree is kept for a person to look at.
             let _ = worktree::release_checkout(workspace, &checkout).await;
         }
-        let outcome = outcome.map_err(|e| e.0)?;
-        let result: DiscussionResult = serde_json::from_value(outcome.output)
-            .map_err(|e| format!("invalid discussion result: {e}"))?;
-        Ok((result, outcome.cost_usd))
+        let (id, _) = attempt?;
+        let parsed = report.output.clone().and_then(|output| {
+            serde_json::from_value::<DiscussionResult>(output)
+                .map_err(|e| format!("invalid discussion result: {e}"))
+        });
+        match &parsed {
+            Ok(result) => {
+                self.end_attempt(id, result.status.as_str(), &report, &result.summary, None)
+                    .await;
+            }
+            Err(error) => self.end_attempt(id, "failed", &report, error, None).await,
+        }
+        Ok((parsed?, report.cost_usd))
     }
 
     /// One triage session over `events` (empty: a fallback sweep). Cursors are persisted as
@@ -518,20 +598,28 @@ impl<S: Session> Runner<S> {
             self.now(),
         );
         let triage = &self.config.triage;
+        let cwd = self.state_dir();
         let request = self.request(
             Mode::Triage,
             prompt,
             (&triage.model, triage.effort, triage.max_budget_usd),
-            self.state_dir(),
+            cwd.clone(),
             triage_schema(),
         );
-        let outcome = self
-            .session
-            .run(request, self.shutdown.subscribe())
-            .await
-            .map_err(|e| e.0)?;
-        let result: TriageResult = serde_json::from_value(outcome.output)
-            .map_err(|e| format!("invalid triage result: {e}"))?;
+        let (id, _) = self.begin_attempt(Mode::Triage, "", &cwd).await?;
+        let report = self.session.run(request, self.shutdown.subscribe()).await;
+        let parsed = report.output.clone().and_then(|output| {
+            serde_json::from_value::<TriageResult>(output)
+                .map_err(|e| format!("invalid triage result: {e}"))
+        });
+        match &parsed {
+            Ok(result) => {
+                self.end_attempt(id, "ok", &report, &result.summary, None)
+                    .await
+            }
+            Err(error) => self.end_attempt(id, "failed", &report, error, None).await,
+        }
+        let result = parsed?;
         // The pollers' own cursors are never the skill's to change.
         let cursors: BTreeMap<String, String> = result
             .cursors
@@ -552,7 +640,7 @@ impl<S: Session> Runner<S> {
                 &one_line(&format!("cursors not saved — store: {error}")),
             );
         }
-        Ok((result, outcome.cost_usd))
+        Ok((result, report.cost_usd))
     }
 
     pub(crate) fn batch_window(&self) -> Duration {

@@ -41,4 +41,23 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (runner, key)
     );
     ",
+    // 2: one row per session attempt (triage, card, discussion).
+    "
+    CREATE TABLE attempts (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        runner     TEXT NOT NULL,
+        mode       TEXT NOT NULL,
+        ref        TEXT NOT NULL,
+        attempt    INTEGER NOT NULL,
+        cwd        TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at   TEXT,
+        outcome    TEXT,
+        summary    TEXT,
+        blocked_on TEXT,
+        session_id TEXT,
+        cost_usd   REAL
+    );
+    CREATE INDEX attempts_by_ref ON attempts (runner, ref, id);
+    ",
 ];

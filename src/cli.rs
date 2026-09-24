@@ -14,6 +14,7 @@ use crate::durations::parse_duration;
 use crate::intake::secrets::{FileStatus, Secrets, process_env};
 use crate::intake::{EventKind, IncomingEvent, SourceKind, notifications, required_keys};
 use crate::paths::{EnvPaths, Paths, resolve_config_path};
+use crate::report;
 use crate::results::CardOutcome;
 use crate::runner::Runner;
 use crate::session::{Session, Shutdown};
@@ -67,6 +68,14 @@ enum Command {
     Resume,
     /// Validate config, print resolved paths and which sources have their keys
     Check,
+    /// This runner's running sessions, queued events, cards and claims (read-only)
+    Status,
+    /// Session attempts with outcome, times, cost and how to resume each (read-only)
+    History {
+        /// Only this card or discussion ref (default: the last 20 attempts)
+        #[arg(value_name = "REF")]
+        card_ref: Option<String>,
+    },
 }
 
 /// Parse `argv`, run the command and return the process exit code.
@@ -94,6 +103,17 @@ pub async fn run<S: Session>(
     let paths = Paths::resolve(&config_path, &config, &env);
     match cli.command {
         Command::Check => cmd_check(&paths, &config),
+        Command::Status => cmd_view(&paths, |store| {
+            report::status_lines(
+                store,
+                &paths.runner,
+                paths.kill_switch().exists(),
+                Utc::now(),
+            )
+        }),
+        Command::History { card_ref } => cmd_view(&paths, |store| {
+            report::history_lines(store, &paths.runner, card_ref.as_deref())
+        }),
         Command::Stop => cmd_stop(&paths),
         Command::Resume => cmd_resume(&paths),
         Command::Enqueue { source, text } => cmd_enqueue(&paths, &config, &source, &text).await,
@@ -144,6 +164,28 @@ fn open_runner(paths: &Paths) -> Result<(InstanceLock, Store), ()> {
 
 fn open_store(paths: &Paths) -> Result<Store, ()> {
     Store::open(&paths.db).map_err(|error| eprintln!("cannot open store: {error}"))
+}
+
+/// `status` and `history`: print lines built from a read-only store; takes no lock and never
+/// creates the store.
+fn cmd_view(paths: &Paths, lines: impl FnOnce(&Store) -> crate::store::Result<Vec<String>>) -> i32 {
+    if !paths.db.exists() {
+        println!("store:        {} (not created yet)", paths.db.display());
+        return EXIT_OK;
+    }
+    let viewed = Store::open_read_only(&paths.db).and_then(|store| lines(&store));
+    match viewed {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("cannot read store: {error}");
+            EXIT_FAILED
+        }
+    }
 }
 
 fn load(path: &Path, allow_missing: bool) -> Result<Config, String> {

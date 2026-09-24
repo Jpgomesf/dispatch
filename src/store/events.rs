@@ -84,10 +84,15 @@ impl Store {
     }
 
     pub fn new_event_count(&self, runner: &str) -> Result<i64> {
+        self.event_count(runner, "new")
+    }
+
+    /// This runner's events in `status` (`new`, `batched` or `done`).
+    pub fn event_count(&self, runner: &str, status: &str) -> Result<i64> {
         self.read(|c| {
             c.query_row(
-                "SELECT COUNT(*) FROM events WHERE runner = ?1 AND status = 'new'",
-                [runner],
+                "SELECT COUNT(*) FROM events WHERE runner = ?1 AND status = ?2",
+                [runner, status],
                 |row| row.get(0),
             )
         })

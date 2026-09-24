@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use crate::config::{Config, tests::config_toml};
 use crate::paths::{EnvPaths, Paths};
 use crate::runner::{Clock, Runner};
-use crate::session::{Mode, Session, SessionError, SessionOutcome, SessionRequest, Shutdown};
+use crate::session::{Mode, Session, SessionReport, SessionRequest, Shutdown};
 use crate::store::Store;
 
 pub fn now() -> DateTime<Utc> {
@@ -196,12 +196,17 @@ impl Session for FakeSession {
         &self,
         request: SessionRequest,
         mut shutdown: watch::Receiver<Shutdown>,
-    ) -> Result<SessionOutcome, SessionError> {
+    ) -> SessionReport {
         let step = (self.script)(&request);
-        self.calls.lock().unwrap().push(Call {
-            request,
-            started: Instant::now(),
-        });
+        let number = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(Call {
+                request,
+                started: Instant::now(),
+            });
+            calls.len()
+        };
+        let session_id = Some(format!("session-{number}"));
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
         let terminated = if step.delay.is_zero() {
@@ -213,15 +218,16 @@ impl Session for FakeSession {
             }
         };
         self.active.fetch_sub(1, Ordering::SeqCst);
-        if terminated {
-            return Err(SessionError("terminated: dispatch is stopping".into()));
+        let output = if terminated {
+            Err("terminated: dispatch is stopping".into())
+        } else {
+            step.output
+        };
+        SessionReport {
+            output,
+            session_id,
+            cost_usd: Some(0.05),
         }
-        step.output
-            .map(|output| SessionOutcome {
-                output,
-                cost_usd: Some(0.05),
-            })
-            .map_err(SessionError)
     }
 }
 

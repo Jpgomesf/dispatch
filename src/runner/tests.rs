@@ -242,3 +242,67 @@ async fn invalid_discussion_result_is_a_failure() {
     assert!(runner.run_discussion(discussion("t")).await.is_none());
     assert!(lines_of(&lines)[0].contains("discussion failed EX-9 — invalid discussion result"));
 }
+
+#[tokio::test]
+async fn every_session_is_recorded_as_an_attempt() {
+    let env = test_env();
+    let session = FakeSession::sequence(vec![
+        ok(triage_output(&[])),
+        ok(card_output("EX-1", "blocked")),
+        ok(discussion_output("EX-9", "replied")),
+        fail("boom"),
+    ]);
+    let (runner, _) = make_runner(&env, session);
+    runner.triage(vec![]).await.unwrap();
+    runner.run_card("EX-1", None).await.unwrap().unwrap();
+    runner.run_discussion(discussion("t1")).await.unwrap();
+    assert!(runner.run_card("EX-1", None).await.unwrap().is_none());
+
+    let store = env.store();
+    let mut attempts = store.attempts("example-app", None, -1).unwrap();
+    attempts.reverse();
+    let recorded: Vec<String> = attempts
+        .iter()
+        .map(|a| {
+            format!(
+                "{} {} #{} {} {}",
+                a.mode,
+                a.reference,
+                a.attempt,
+                a.outcome.as_deref().unwrap_or("-"),
+                a.session_id.as_deref().unwrap_or("-")
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            "triage  #1 ok session-1",
+            "card EX-1 #1 blocked session-2",
+            "discussion EX-9 #1 replied session-3",
+            "card EX-1 #2 failed session-4",
+        ]
+    );
+    assert_eq!(attempts[1].cost_usd, Some(0.05));
+    assert_eq!(
+        attempts[1].cwd,
+        env.config.workspaces[0].path.display().to_string()
+    );
+    assert_eq!(attempts[3].summary.as_deref(), Some("boom"));
+    assert!(attempts.iter().all(|a| a.ended_at.is_some()));
+}
+
+#[tokio::test]
+async fn recover_closes_attempts_a_stopped_runner_left_open() {
+    let env = test_env();
+    let (runner, _) = make_runner(&env, FakeSession::sequence(vec![]));
+    let store = env.store();
+    let cwd = std::path::Path::new("/tmp/example");
+    store
+        .begin_attempt("example-app", "card", "EX-1", cwd, now())
+        .unwrap();
+    runner.recover().await;
+    assert!(store.open_attempts("example-app").unwrap().is_empty());
+    let closed = &store.attempts("example-app", Some("EX-1"), -1).unwrap()[0];
+    assert_eq!(closed.outcome.as_deref(), Some("crash"));
+}
