@@ -13,6 +13,7 @@ use crate::paths::{Paths, resolve_config_path};
 use crate::results::CardOutcome;
 use crate::runner::Runner;
 use crate::session::{Session, Shutdown};
+use crate::state::InstanceLock;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FAILED: i32 = 1;
@@ -78,6 +79,14 @@ pub async fn run<S: Session>(
         }
     };
     let paths = Paths::resolve(&config_path, &config);
+    // Only one session-running process per state dir, held until this function returns.
+    let _instance = match cli.command {
+        Command::Heartbeat { .. } | Command::Card { .. } => match single_instance(&paths) {
+            Ok(lock) => Some(lock),
+            Err(code) => return code,
+        },
+        _ => None,
+    };
     match cli.command {
         Command::Check => cmd_check(&paths),
         Command::Stop => cmd_stop(&paths),
@@ -95,6 +104,24 @@ pub async fn run<S: Session>(
         } => {
             let runner = Runner::new(config, paths, session());
             cmd_card(runner, &card_ref, workspace.as_deref()).await
+        }
+    }
+}
+
+fn single_instance(paths: &Paths) -> Result<InstanceLock, i32> {
+    let lock_file = paths.state_dir.join("harness.lock");
+    match InstanceLock::try_acquire(&paths.state_dir) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => {
+            eprintln!(
+                "another harness heartbeat or card run holds {}; not starting",
+                lock_file.display()
+            );
+            Err(EXIT_FAILED)
+        }
+        Err(error) => {
+            eprintln!("cannot lock {}: {error:#}", lock_file.display());
+            Err(EXIT_FAILED)
         }
     }
 }
@@ -350,6 +377,26 @@ mod tests {
         let (code, session) = run_with(&env, &["card", "EX-1"], no_session()).await;
         assert_eq!(code, EXIT_FAILED);
         assert!(session.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn second_instance_refuses_to_run_sessions() {
+        let env = test_env();
+        let held = InstanceLock::try_acquire(&env.paths.state_dir)
+            .unwrap()
+            .unwrap();
+        let (code, session) = run_with(&env, &["card", "EX-1"], no_session()).await;
+        assert_eq!(code, EXIT_FAILED);
+        let args = ["heartbeat", "--once"];
+        let (hb_code, hb_session) = run_with(&env, &args, no_session()).await;
+        assert_eq!(hb_code, EXIT_FAILED);
+        assert!(session.calls().is_empty() && hb_session.calls().is_empty());
+        // Commands that run no sessions are not blocked.
+        assert_eq!(run_with(&env, &["stop"], no_session()).await.0, EXIT_OK);
+        drop(held);
+        let done = FakeSession::sequence(vec![ok(card_output("EX-1", "done"))]);
+        run_with(&env, &["resume"], no_session()).await;
+        assert_eq!(run_with(&env, &["card", "EX-1"], done).await.0, EXIT_OK);
     }
 
     #[tokio::test]

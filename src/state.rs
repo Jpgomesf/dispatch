@@ -95,6 +95,47 @@ impl StateStore {
         Ok(result)
         // `lock` drops here, releasing the lock.
     }
+
+    /// `load` off the async runtime's worker threads.
+    pub async fn load_async(&self) -> Result<State> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.load()).await?
+    }
+
+    /// `update` on the blocking pool: the lock wait and the fsync never stall async tasks.
+    pub async fn update_async<R: Send + 'static>(
+        &self,
+        change: impl FnOnce(&mut State) -> R + Send + 'static,
+    ) -> Result<R> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.update(change)).await?
+    }
+}
+
+/// Held for the life of a process that runs sessions (`heartbeat`, `card`), so two harness
+/// processes never work the same cards or release each other's `in_progress` cards.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    /// `Ok(None)` when another process holds the lock.
+    pub fn try_acquire(state_dir: &Path) -> Result<Option<InstanceLock>> {
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("create state dir {}", state_dir.display()))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(state_dir.join("harness.lock"))
+            .context("open harness.lock")?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(InstanceLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error).context("lock harness.lock"),
+        }
+    }
 }
 
 pub fn load_state(path: &Path) -> Result<State> {
@@ -176,6 +217,28 @@ mod tests {
         assert!(state.in_progress("EX-1"));
         assert!(!state.in_progress("EX-2"));
         assert!(!state.in_progress("EX-3"));
+    }
+
+    #[test]
+    fn instance_lock_is_exclusive_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = InstanceLock::try_acquire(dir.path()).unwrap();
+        assert!(first.is_some());
+        assert!(InstanceLock::try_acquire(dir.path()).unwrap().is_none());
+        drop(first);
+        assert!(InstanceLock::try_acquire(dir.path()).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn async_update_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::new(dir.path());
+        let changed = store
+            .update_async(|s| s.cursors.insert("a".into(), "1".into()).is_none())
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(store.load_async().await.unwrap().cursors["a"], "1");
     }
 
     #[test]
