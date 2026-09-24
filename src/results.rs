@@ -14,14 +14,14 @@ pub enum HandledAction {
     Escalated,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct HandledItem {
     pub source: String,
     pub item: String,
     pub action: HandledAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CardToWork {
     #[serde(rename = "ref")]
     pub card_ref: String,
@@ -30,7 +30,7 @@ pub struct CardToWork {
     pub blocked_by: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct HeartbeatResult {
     #[serde(default)]
     pub cursors: BTreeMap<String, String>,
@@ -49,7 +49,7 @@ pub enum CardOutcome {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CardResult {
     #[serde(rename = "ref")]
     pub card_ref: String,

@@ -9,6 +9,7 @@ use crate::config::Workspace;
 /// Directory name for a ref or workspace name: readable part plus a stable hash of the
 /// original, so names that normalise alike (`EX-1`, `ex_1`, `EX/1`) never share a directory.
 /// `EX-123` → `ex-123-<8 hex>`; anything outside `[a-z0-9]` becomes `-`.
+#[must_use]
 pub fn slug(name: &str) -> String {
     let lowered: String = name
         .to_lowercase()

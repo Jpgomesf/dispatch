@@ -76,7 +76,7 @@ impl Default for CardConfig {
 }
 
 /// Free-form: the workflow skill interprets these values.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourcesConfig {
     pub slack_channels: Vec<String>,
@@ -97,7 +97,7 @@ impl Default for SourcesConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Workspace {
     pub name: String,
@@ -132,7 +132,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("no workspace named {0:?} in config")]
 pub struct UnknownWorkspace(pub String);
 

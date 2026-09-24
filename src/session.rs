@@ -32,12 +32,12 @@ pub struct SessionOutcome {
     pub cost_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct SessionError(pub String);
 
 /// Runner-wide shutdown level, broadcast to every running session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Shutdown {
     #[default]
     Run,
