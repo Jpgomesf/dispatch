@@ -175,8 +175,9 @@ impl Store {
         Ok(attempts)
     }
 
-    /// The counted card attempts of the current run (the last `run` counted ones before
-    /// attempt `before`, when given), newest first: what the retry rules look back on.
+    /// The counted card attempts of the current run (at most the last `run` counted ones
+    /// before attempt `before`, when given, and none from before the card was last done),
+    /// newest first: what the retry rules look back on.
     pub fn card_chain(
         &self,
         runner: &str,
@@ -205,6 +206,7 @@ impl Store {
                     new_commits,
                 })
             })
+            .take_while(|prior| !prior.outcome.is_finished())
             .filter(|prior| prior.outcome.counts())
             .take(usize::try_from(run).unwrap_or(usize::MAX))
             .collect())
@@ -328,6 +330,11 @@ mod tests {
             outcomes(store.card_chain("alpha", "EX-1", Some(ids[4]), 1).unwrap()),
             [Outcome::Failed],
             "before the current attempt"
+        );
+        assert_eq!(
+            outcomes(store.card_chain("alpha", "EX-1", None, 9).unwrap()),
+            [Outcome::Crash, Outcome::Failed, Outcome::Timeout],
+            "never past the last done, whatever the count says"
         );
         assert!(
             store

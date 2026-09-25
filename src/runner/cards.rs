@@ -1,6 +1,8 @@
 //! Card sessions: the personal-scope check, the `card:<ref>` claim, one attempt in the
 //! card's worktree, and what follows it by the retry rules.
 
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 
 use super::{Runner, cost, describe, judge, one_line};
@@ -10,7 +12,7 @@ use crate::intake::{CardScope, card_scope};
 use crate::outcome::{self, Next, Outcome};
 use crate::prompts::{PREVIOUS_ATTEMPTS, PreviousAttempt, card_prompt};
 use crate::results::{CardOutcome, CardResult, card_schema};
-use crate::session::{Mode, Session, SessionReport};
+use crate::session::{Ended, Mode, Session, SessionReport};
 use crate::state::{CardState, CardStatus};
 use crate::worktree;
 
@@ -113,6 +115,16 @@ impl<S: Session> Runner<S> {
         }
     }
 
+    /// A card attempt that failed before its session started, recorded as a `crash` so the
+    /// attempt rows and the card's count agree. Best effort: `None` when the store failed.
+    async fn record_unstarted(&self, card_ref: &str, cwd: &Path, error: &str) -> Option<i64> {
+        let (id, _) = self.begin_attempt(Mode::Card, card_ref, cwd).await.ok()?;
+        let report = SessionReport::ended(Ended::Crash(error.to_string()));
+        self.end_attempt(id, self.attempt_end(Outcome::Crash, &report, error))
+            .await;
+        Some(id)
+    }
+
     /// Best effort: a retry that could not start is not tried again every tick.
     async fn cancel_retry(&self, card_ref: &str) {
         let (runner, card_ref) = (self.name().to_string(), card_ref.to_string());
@@ -149,9 +161,13 @@ impl<S: Session> Runner<S> {
         let checkout = match checkout {
             Ok(checkout) => checkout,
             Err(error) => {
-                // No session ran; the card follows the rules for a crash, so it is retried.
+                // No session ran; recorded as a crashed attempt, so it counts and is retried.
+                let cwd = workspace
+                    .as_ref()
+                    .map_or_else(|| self.state_dir(), |w| w.path.clone());
+                let id = self.record_unstarted(card_ref, &cwd, &error).await;
                 let next = self
-                    .settle_card(card_ref, None, Outcome::Crash, None, None)
+                    .settle_card(card_ref, id, Outcome::Crash, None, None)
                     .await;
                 let detail = format!("{card_ref} — {}{}", one_line(&error), describe(&next));
                 self.emit("card", Outcome::Crash.as_str(), &detail);
@@ -189,10 +205,7 @@ impl<S: Session> Runner<S> {
         );
         let (id, report) = match self.begin_attempt(Mode::Card, card_ref, &checkout).await {
             Ok((id, _)) => (Some(id), self.run_session(request, id, card_ref).await),
-            Err(error) => (
-                None,
-                SessionReport::ended(crate::session::Ended::Crash(error)),
-            ),
+            Err(error) => (None, SessionReport::ended(Ended::Crash(error))),
         };
         let new_commits = match (&workspace, head_before) {
             (Some(w), Some(before)) => match worktree::head(w, &checkout).await {
@@ -246,7 +259,15 @@ impl<S: Session> Runner<S> {
                     .card(&runner, &card_ref)?
                     .unwrap_or_else(|| CardState::new(CardStatus::InProgress, now));
                 let chain = s.card_chain(&runner, &card_ref, current, card.attempts)?;
-                let mut next = outcome::next(outcome, new_commits, &chain, max_attempts, now);
+                // The card's own count is authoritative; the chain is what was recorded of it.
+                let mut next = outcome::next(
+                    outcome,
+                    new_commits,
+                    &chain,
+                    card.attempts,
+                    max_attempts,
+                    now,
+                );
                 if outcome == Outcome::RateLimited
                     && let Some(pause) = s.pause(now)?
                 {

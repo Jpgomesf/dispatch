@@ -219,13 +219,15 @@ pub fn not_before(next: Next, at: DateTime<Utc>) -> Next {
     }
 }
 
-/// What follows `outcome`, given the counted attempts before it in this run (`chain`, newest
-/// first) and the cap.
+/// What follows `outcome`, given how many counted attempts came before it in this run
+/// (`previous`, which also covers attempts that never got a record), the recorded ones
+/// (`chain`, newest first) and the cap.
 #[must_use]
 pub fn next(
     outcome: Outcome,
     new_commits: Option<u32>,
     chain: &[Prior],
+    previous: u32,
     max_attempts: u32,
     now: DateTime<Utc>,
 ) -> Next {
@@ -246,9 +248,7 @@ pub fn next(
     {
         return Next::NeedsHuman(Reason::NoProgress);
     }
-    let counted = u32::try_from(chain.len())
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
+    let counted = previous.saturating_add(1);
     if counted >= max_attempts {
         return Next::NeedsHuman(Reason::MaxAttempts);
     }
@@ -280,6 +280,32 @@ mod tests {
 
     fn minutes(m: i64) -> DateTime<Utc> {
         now() + TimeDelta::minutes(m)
+    }
+
+    /// `super::next` when every earlier attempt of the run was recorded.
+    fn next(
+        outcome: Outcome,
+        new_commits: Option<u32>,
+        chain: &[Prior],
+        max_attempts: u32,
+        now: DateTime<Utc>,
+    ) -> Next {
+        let previous = u32::try_from(chain.len()).unwrap();
+        super::next(outcome, new_commits, chain, previous, max_attempts, now)
+    }
+
+    #[test]
+    fn the_cap_counts_attempts_that_left_no_record() {
+        // Two earlier crashes before any session (no record), then a timeout.
+        assert_eq!(
+            super::next(Outcome::Timeout, None, &[], 2, 3, now()),
+            Next::NeedsHuman(Reason::MaxAttempts)
+        );
+        assert_eq!(
+            super::next(Outcome::Crash, None, &[], 1, 3, now()),
+            Next::Retry { at: minutes(2) },
+            "the backoff follows the count too"
+        );
     }
 
     #[test]

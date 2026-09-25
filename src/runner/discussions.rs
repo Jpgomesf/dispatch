@@ -87,6 +87,7 @@ impl<S: Session> Runner<S> {
             outcome,
             None,
             &queued.chain,
+            u32::try_from(queued.chain.len()).unwrap_or(u32::MAX),
             self.config.card.max_attempts,
             now,
         );

@@ -261,10 +261,34 @@ impl<S: Session> Runner<S> {
     /// `new`.
     pub async fn recover(&self) {
         let (runner, now) = (self.name().to_string(), self.now());
+        let state_dir = self.paths.state_dir.clone();
         let recovered = self
             .store
             .call(move |store| {
                 let open = store.open_attempts(&runner)?;
+                let state = store.load_state(&runner)?;
+                let mut stranded = Vec::new();
+                for (card_ref, card) in &state.cards {
+                    if card.status != CardStatus::InProgress {
+                        continue;
+                    }
+                    let attempt = open
+                        .iter()
+                        .rfind(|a| a.mode == Mode::Card.as_str() && &a.reference == card_ref)
+                        .map(|a| a.id);
+                    // Stopped before its session started: record the attempt all the same,
+                    // so the attempt rows and the card's count agree.
+                    let attempt = match attempt {
+                        Some(id) => id,
+                        None => {
+                            let mode = Mode::Card.as_str();
+                            store
+                                .begin_attempt(&runner, mode, card_ref, &state_dir, now)?
+                                .0
+                        }
+                    };
+                    stranded.push((card_ref.clone(), Some(attempt)));
+                }
                 store.close_open_attempts(
                     &runner,
                     Outcome::Crash.as_str(),
@@ -273,18 +297,6 @@ impl<S: Session> Runner<S> {
                 )?;
                 store.release_all(&runner)?;
                 store.requeue_batched(&runner)?;
-                let state = store.load_state(&runner)?;
-                let stranded: Vec<(String, Option<i64>)> = state
-                    .cards
-                    .iter()
-                    .filter(|(_, card)| card.status == CardStatus::InProgress)
-                    .map(|(card_ref, _)| {
-                        let attempt = open
-                            .iter()
-                            .rfind(|a| a.mode == Mode::Card.as_str() && &a.reference == card_ref);
-                        (card_ref.clone(), attempt.map(|a| a.id))
-                    })
-                    .collect();
                 Ok(stranded)
             })
             .await;

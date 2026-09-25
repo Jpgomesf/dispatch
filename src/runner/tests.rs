@@ -111,6 +111,13 @@ async fn recover_resets_what_a_crash_left_behind() {
         Some(now() + chrono::TimeDelta::minutes(1)),
         "retried after the first backoff"
     );
+    let recorded = store.attempts("example-app", Some("EX-1"), -1).unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "stopped before its session: recorded anyway"
+    );
+    assert_eq!(recorded[0].outcome.as_deref(), Some("crash"));
     assert_eq!(store.holder("card:EX-1", now()).unwrap(), None);
     assert_eq!(
         store.holder("card:EX-2", now()).unwrap().as_deref(),
@@ -339,6 +346,43 @@ async fn attempts_that_add_no_commits_twice_in_a_row_need_a_person() {
         lines[2].ends_with("; needs_human (no_progress)"),
         "{lines:?}"
     );
+}
+
+#[tokio::test]
+async fn a_worktree_that_cannot_be_created_counts_toward_the_cap() {
+    let env = test_env();
+    let workspace = env.config.workspaces[0].clone();
+    init_repo(&workspace.path);
+    // A plain file where the card's worktree should go: `git worktree add` fails every time.
+    let target = env
+        .paths
+        .worktrees_dir()
+        .join(crate::worktree::slug(&workspace.name))
+        .join(crate::worktree::slug("EX-1"));
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "not a worktree").unwrap();
+    let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![]));
+    for _ in 0..3 {
+        runner
+            .run_card_in("EX-1", Some(workspace.clone()), &[])
+            .await;
+    }
+    assert!(runner.session().calls().is_empty());
+    let card = env.store().card("example-app", "EX-1").unwrap().unwrap();
+    assert_eq!(card.status, CardStatus::NeedsHuman);
+    assert_eq!(card.reason.as_deref(), Some("max_attempts"));
+    assert_eq!(card.attempts, 3);
+    let recorded = env
+        .store()
+        .attempts("example-app", Some("EX-1"), -1)
+        .unwrap();
+    assert!(
+        recorded
+            .iter()
+            .all(|a| a.outcome.as_deref() == Some("crash"))
+    );
+    assert_eq!(recorded.len(), 3);
+    assert!(lines_of(&lines)[2].ends_with("; needs_human (max_attempts)"));
 }
 
 #[tokio::test]
