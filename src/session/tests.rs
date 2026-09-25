@@ -398,6 +398,32 @@ async fn a_stop_kills_what_claude_leaves_in_its_group() {
 }
 
 #[tokio::test]
+async fn a_clean_exit_kills_what_claude_leaves_in_its_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("server.pid");
+    // A detached "server" with its own stdio: nothing holds claude's pipes once it exits.
+    let body = format!(
+        "sleep 300 >/dev/null 2>&1 &\necho $! > {}\n{}",
+        pid_file.display(),
+        print(&[init_line(), result_line(json!({}))])
+    );
+    let cli = fake_cli(dir.path(), &body);
+    let (control, _shutdown, _notices) = new_control();
+    let report = timeout(
+        Duration::from_secs(10),
+        cli.run(in_dir(dir.path()), control),
+    )
+    .await
+    .expect("ended by itself");
+    assert_eq!(report.ended, Ended::Output(json!({"summary": "ok"})));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !is_alive(read_pid(&pid_file)),
+        "the server outlived its session"
+    );
+}
+
+#[tokio::test]
 async fn a_second_signal_kills_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let cli = ClaudeCli {

@@ -292,14 +292,12 @@ impl StopSequence {
         self.next = None;
     }
 
-    /// `claude` was just reaped. When it was being stopped, whatever it left in its group is
-    /// killed now (the group id stays taken while any member lives); after that nothing more
-    /// is sent to its pid, which another process may get. Leftovers of a session that ended
-    /// by itself are handled by the pipe grace.
+    /// `claude` was just reaped: whatever it left in its group is killed now, however the
+    /// session ended, so a detached subprocess with its own stdio never outlives it. The
+    /// group id stays taken while any member lives, and an empty group only gives ESRCH;
+    /// after this nothing more is sent to its pid, which another process may get.
     fn exited(&mut self) {
-        if self.started {
-            signal_group(self.pid, libc::SIGKILL);
-        }
+        signal_group(self.pid, libc::SIGKILL);
         self.pid = None;
         self.next = None;
     }
