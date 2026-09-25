@@ -12,6 +12,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use tokio::sync::{Notify, mpsc, watch};
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Instant, interval_at};
 
 use crate::config::{Config, Effort};
@@ -89,6 +90,30 @@ fn describe(next: &Result<Next, String>) -> String {
         Ok(Next::Retry { at }) => format!("; retry at {}", time(*at)),
         Ok(Next::NeedsHuman(reason)) => format!("; needs_human ({})", reason.as_str()),
         Err(error) => format!("; not recorded ({error})"),
+    }
+}
+
+/// A task aborted when its handle is dropped, so a session never outlives its attempt.
+struct Aborting<T>(JoinHandle<T>);
+
+impl<T> Drop for Aborting<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Why a session task ended without a report.
+fn task_failure(error: JoinError) -> String {
+    match error.try_into_panic() {
+        Ok(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("no message");
+            format!("session panicked: {message}")
+        }
+        Err(_) => "session task cancelled".into(),
     }
 }
 
@@ -336,7 +361,9 @@ impl<S: Session> Runner<S> {
 
     /// Run one session for attempt `id` (of `reference`, empty for triage), acting on its
     /// notices while it runs. A session that is already running when a limit is hit keeps
-    /// going (Claude Code retries on its own) until it ends or its timeout.
+    /// going (Claude Code retries on its own) until it ends or its timeout. The session is a
+    /// task of its own: one that panics ends as a `crash`, so its attempt, card and claim
+    /// are settled like those of any session that ended without a result.
     async fn run_session(
         &self,
         request: SessionRequest,
@@ -351,14 +378,19 @@ impl<S: Session> Runner<S> {
             shutdown: self.shutdown.subscribe(),
             notices,
         };
-        let mut run = pin!(self.session.run(request, control));
+        let session = self.session.clone();
+        let mut run = Aborting(tokio::spawn(
+            async move { session.run(request, control).await },
+        ));
         let report = loop {
             tokio::select! {
-                report = &mut run => {
+                joined = &mut run.0 => {
                     while let Ok(notice) = received.try_recv() {
                         self.on_notice(id, &source, notice).await;
                     }
-                    break report;
+                    break joined.unwrap_or_else(|error| {
+                        SessionReport::ended(Ended::Crash(task_failure(error)))
+                    });
                 }
                 Some(notice) = received.recv() => self.on_notice(id, &source, notice).await,
             }

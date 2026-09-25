@@ -477,6 +477,34 @@ async fn a_card_whose_session_lacks_its_environment_needs_a_person() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_session_that_panics_ends_as_a_crash_and_releases_its_card() {
+    let env = test_env();
+    let session = FakeSession::new(|_| panic!("session blew up"));
+    let (runner, lines) = make_runner(&env, session);
+    assert!(runner.run_card("EX-1", None).await.unwrap().is_none());
+
+    let store = env.store();
+    let card = store.card("example-app", "EX-1").unwrap().unwrap();
+    assert_eq!(card.status, CardStatus::Failed, "not left in_progress");
+    assert_eq!(card.attempts, 1);
+    assert_eq!(card.retry_at, Some(now() + chrono::TimeDelta::minutes(1)));
+    let recorded = &store.attempts("example-app", Some("EX-1"), -1).unwrap()[0];
+    assert_eq!(recorded.outcome.as_deref(), Some("crash"));
+    assert_eq!(
+        recorded.summary.as_deref(),
+        Some("session panicked: session blew up")
+    );
+    assert_eq!(store.holder("card:EX-1", now()).unwrap(), None, "released");
+    assert_eq!(
+        lines_of(&lines),
+        [
+            "2026-01-15T09:30:00Z card crash EX-1 — session panicked: session blew up; \
+          retry at 2026-01-15T09:31:00Z"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn each_mode_gets_its_timeout_and_the_shared_idle_limit() {
     let mut env = test_env();
