@@ -26,14 +26,16 @@ machine's own Claude Code setup. Build, configure and first run:
 4. **Attempts.** Every session has a wall-clock `timeout` (triage 20m,
    discussion 1h, card 3h) and is ended early when its output goes quiet
    (`idle_timeout`), it repeats the same tool call (`loop_threshold`), or it
-   starts without its `required_mcp` servers. Each attempt is recorded with an
-   outcome: `done`, `blocked`, `failed`, `timeout`, `stuck`, `api_error`,
-   `crash`, `rate_limited`, `environment` or `needs_human`. A card cut short is
+   starts without its `required_mcp` servers or outside auto permission mode.
+   Each attempt is recorded with an outcome: `done`, `blocked`, `failed`,
+   `timeout`, `stuck`, `api_error`, `crash`, `rate_limited`, `environment` or
+   `needs_human`. A card cut short is
    retried in a fresh session whose context carries `previous_attempts`
    (outcome, summary, session id, new commits), so it starts where the last one
    stopped.
 5. **Usage limits.** Hitting the plan's usage limit pauses every runner on the
-   machine until it resets. Session starts are staggered (`start_stagger`).
+   machine until it resets (at most 8 days). Session starts are staggered
+   (`start_stagger`).
 6. **Escalation.** A card that reaches `[card].max_attempts` or stops making
    progress is not retried again; the next triage gets it under `escalations`,
    for Claude to tell you about.

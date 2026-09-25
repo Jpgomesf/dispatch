@@ -134,13 +134,13 @@ CLI (`dispatch`, global `--config PATH`):
   `cd '<cwd>' && claude --resume <session_id>`.
 
 `status` and `history` open the store read-only, never create it, and take no
-lock. Exit codes: `0` ok; `1` run failed, kill switch present, machine paused
-(`card`), a configured plugin dir without `.claude-plugin/plugin.json`
-(`check`), or an unreadable store (`status`, `history`); `2` bad config, bad
-arguments or unknown workspace. Output: one line per event on stdout,
-`<UTC time> <kind> <status> <detail>`, where `kind` is `triage`, `card`,
-`discussion`, `intake`, `claim`, `pause` or `store` and a session's status is its
-outcome (below); no logging subsystem.
+lock. Exit codes: `0` ok; `1` run failed, kill switch present at start
+(`heartbeat`, `card`), machine paused (`card`), a configured plugin dir without
+`.claude-plugin/plugin.json` (`check`), or an unreadable store (`status`,
+`history`); `2` bad config, bad arguments or unknown workspace. Output: one line
+per event on stdout, `<UTC time> <kind> <status> <detail>`, where `kind` is
+`triage`, `card`, `discussion`, `intake`, `claim`, `pause` or `store` and a
+session's status is its outcome (below); no logging subsystem.
 
 ### Sessions
 
@@ -213,7 +213,9 @@ The runner reads `claude`'s stdout line by line (field names checked against
 Claude Code 2.1.282 with one short haiku run; lines that are not JSON are
 ignored):
 
-- `system/init` — `session_id`, `mcp_servers: [{name, status}]` (`connected`,
+- `system/init` — `session_id`, `permissionMode` (`auto` when auto mode is in
+  effect; `default` when Claude Code fell back because auto mode is unavailable for
+  the model, plan or settings), `mcp_servers: [{name, status}]` (`connected`,
   `failed`, `needs-auth`, `pending`, `disabled`), `plugins: [{name, path}]` and,
   only when a plugin failed to load, `plugin_errors: [{plugin, type, message}]`.
 - `assistant` — `message.content[]` blocks (`tool_use` with `name` and `input`),
@@ -242,18 +244,26 @@ running or crashed session can be resumed by hand.
   and input (object keys sorted), per agent context (the main thread, or one
   subagent by `parent_tool_use_id`); `loop_threshold` identical calls within the
   last `2 * loop_threshold` of that context stop the session; outcome `stuck`.
-- **Environment guard**: at the first `system/init`, any `plugin_errors`, or a
+- **Environment guard**: at the first `system/init`, any `plugin_errors`, a
+  `permissionMode` other than the `auto` the session asked for, or a
   `required_mcp` server that is missing or not `connected`, stops the session;
   outcome `environment`, with one line naming what is wrong. This protects
   against `--bare` becoming the `-p` default, which would drop the login, skills
-  and MCP servers; it catches missing MCP servers only for the servers listed in
-  `required_mcp`.
+  and MCP servers, and against a silent fallback to `default` permission mode, in
+  which every prompt is denied; it catches missing MCP servers only for the
+  servers listed in `required_mcp`, and an init without `permissionMode` passes.
 - **Stop sequence** (for all of the above and for a graceful shutdown): SIGINT to
   the `claude` process (it ends the turn cleanly), after 20s SIGTERM to its
-  process group, after another 20s SIGKILL to the group. As soon as `claude`
-  exits during a stop, whatever it left in its group is SIGKILLed; after that
-  nothing is sent to its pid. A second signal to the runner SIGKILLs the group at
-  once.
+  process group, after another 20s SIGKILL to the group. A second signal to the
+  runner SIGKILLs the group at once.
+- **Group kill on exit**: whenever `claude` exits, stopped or not, whatever it
+  left in its group is SIGKILLed at once (an empty group is fine), so a detached
+  subprocess with its own output (`npm run dev >/tmp/x 2>&1 &`) never outlives
+  its session; after that nothing is sent to its pid.
+- **Panics**: each session runs as a task of its own; one that panics ends as a
+  `crash` (`session panicked: <message>`), so its attempt is closed, its card
+  settled by the retry rules and its claim released like any session that ended
+  without a result.
 
 A session that hits a usage limit while running is not stopped: Claude Code
 retries on its own, until it ends or reaches its timeout.
@@ -272,10 +282,10 @@ always wins over a stop that came too late to matter.
 | `timeout` | wall clock passed | retry |
 | `stuck` | watchdog or loop detection | retry |
 | `api_error` | an error result (API error, budget, turn limit) | retry |
-| `crash` | ended without a result, or the runner stopped mid-session | retry |
+| `crash` | ended without a result, the session panicked, or the runner stopped mid-session | retry |
 | `invalid_output` | success without a valid structured output (incl. one that does not parse as the result type) | retry |
 | `rate_limited` | usage or rate limit | retry when the pause ends; not counted |
-| `environment` | plugin errors, required MCP server not connected | `needs_human` (`environment`), never retried |
+| `environment` | plugin errors, permission mode not `auto`, required MCP server not connected | `needs_human` (`environment`), never retried |
 | `interrupted` | kill switch or signal | retry when the runner runs again; not counted |
 
 Triage reports `ok`; discussions report `replied`, `drafted`, `skipped` or
@@ -307,7 +317,9 @@ Triage reports `ok`; discussions report `replied`, `drafted`, `skipped` or
   the pollers report a comment on my own ticket only as a `work` event, so an
   answer there needs a mention elsewhere or `dispatch card`.
 - A retry that cannot start (the card is no longer assigned to me, or another
-  runner holds its claim) is dropped; the card stays `failed` for triage.
+  runner holds its claim) is dropped; the card stays `failed` for triage. A
+  store error while claiming is not contention: one `card failed` line, and the
+  retry stays scheduled.
 - **Discussions** follow the same rules with `[card] max_attempts`, but their
   retries live in the coordinator's queue (a discussion is a one-off request, not
   tracker state): lost when the runner stops, and not waited for by `--once`.
@@ -323,7 +335,10 @@ message with `error: "rate_limit"`, or a result with `api_error_status: 429`
 (including a limit stop that otherwise looks like a clean `success` without
 structured output). On the first sign, and again when a later reset time is
 learned, the runner sets a **machine-wide pause** in the store: until the
-`resetsAt` a `rejected` event gave, else for 15 minutes. A pause only ever grows.
+`resetsAt` a `rejected` event gave, else for 15 minutes, and never more than 8
+days from now (weekly limits reset days away; a later reset is capped, and the
+`pause set` line prints the capped time and the reset it capped). A pause only
+ever grows.
 While paused no runner starts a triage, card or discussion session (running ones
 carry on); `dispatch card` refuses; `--once` exits without starting anything;
 `status` shows the pause with its reason and the runner that set it. The attempt
@@ -387,14 +402,17 @@ cards run:
 
 - **Kill switch** (`dispatch stop`): checked before every start and polled every
   5s while waiting. Once present, nothing new starts and running sessions are
-  ended with the stop sequence; the loop exits when they have ended.
+  ended with the stop sequence; the loop exits when they have ended. `heartbeat`
+  (with or without `--once`) and `card` started while it is present print one
+  line and exit `1` without starting anything.
 - **SIGINT / SIGTERM**: the first signal does the same; the second SIGKILLs
   running sessions; a third exits immediately. Sessions ended this way are
   `interrupted` and retried when the runner runs again.
 - Each `claude` process leads its own process group, so signals reach the
-  subprocesses it started. Once `claude` exits, its output pipes get 5s to close;
-  then whatever is left in the group is killed, so a stray subprocess never
-  holds a card slot or blocks shutdown.
+  subprocesses it started. Once `claude` exits, however the session ended,
+  whatever is left in its group is killed at once; its output pipes then get 5s
+  to close before they are abandoned (and the group is killed again), so a stray
+  subprocess never holds a card slot or blocks shutdown.
 
 ### Single instance and state
 
@@ -412,9 +430,10 @@ reason}`, status `in_progress|done|blocked|failed|needs_human`) and `attempts`
 transaction and all store I/O runs on the blocking thread pool. A card starts
 only after its `card:<ref>` claim (`BEGIN IMMEDIATE`, 10 min lease renewed every
 minute, released at the end): a card held by any runner, this one included, is
-skipped with one line. If the store cannot be read, the scheduler prints one line
-and skips scheduling until it can. It never assumes an empty state. A session
-starts only once its attempt row is written.
+skipped with one line; a store error while claiming prints one line and leaves a
+scheduled retry in place. If the store cannot be read, the scheduler prints one
+line and skips scheduling until it can. It never assumes an empty state. A
+session starts only once its attempt row is written.
 
 ### Messaging policy lives in Claude Code
 

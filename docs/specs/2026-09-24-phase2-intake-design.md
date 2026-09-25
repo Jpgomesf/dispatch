@@ -197,6 +197,8 @@ its own claims and returns its `batched` events to `new`.
 - A claim is not re-entrant: a key held by the same runner name is "held" too.
   Losing a claim (lease expired and taken over) prints one `claim lost` line.
 - A card held by another runner is skipped with one stdout line, never started.
+  A store error while claiming is not "held": one line, and a scheduled retry
+  stays scheduled (only real contention or a refusal drops it).
 
 ## Level 2 — soft claims (skills, across machines and people)
 
