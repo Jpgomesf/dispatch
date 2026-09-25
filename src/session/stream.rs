@@ -137,6 +137,11 @@ impl Stream {
         };
         if let Some(resets_at) = limit {
             observed.notices.extend(self.rate_limit(resets_at));
+        } else if event["type"] == "assistant" && event["error"].is_null() {
+            // The API answered again: a limit hit earlier no longer explains how the session
+            // ends (the pause it set stands).
+            self.rate_limited = false;
+            self.resets_at = None;
         }
         if event["type"] == "assistant"
             && let Some(detail) = self.loops.observe_event(&event)
@@ -381,6 +386,20 @@ mod tests {
             Ended::RateLimited {
                 resets_at: at(1_790_305_200)
             }
+        );
+    }
+
+    #[test]
+    fn a_limit_the_session_recovered_from_explains_nothing() {
+        let answer = json!({"type": "assistant", "session_id": "session-a",
+                            "message": {"content": [{"type": "text", "text": "Reading."}]}})
+        .to_string();
+        let hours = Duration::from_secs(3 * 3600);
+        let lines = [init(), api_retry("rate_limit"), answer];
+        assert_eq!(
+            run(&lines, Some(Stop::Timeout(hours))).ended,
+            Ended::Timeout("no result within 3h".into()),
+            "a counted timeout, not a limit"
         );
     }
 
