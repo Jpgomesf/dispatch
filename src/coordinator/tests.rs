@@ -705,6 +705,17 @@ async fn sessions_start_a_stagger_apart_even_in_once() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn once_does_not_wait_out_the_stagger_with_nothing_queued() {
+    let mut env = test_env();
+    env.config.sessions.start_stagger = Duration::from_secs(30);
+    let session = FakeSession::sequence(vec![ok(triage_output(&[])).after(MINUTE / 6)]);
+    let (runner, _) = make_runner(&env, session);
+    let start = Instant::now();
+    runner.heartbeat(TEN_MINUTES, true).await;
+    assert_eq!(start.elapsed(), MINUTE / 6, "exits when triage ends");
+}
+
 #[test]
 fn refs_are_matched_as_whole_tokens() {
     assert!(mentions_ref("see EX-1.", "EX-1"));

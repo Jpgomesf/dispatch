@@ -537,9 +537,11 @@ impl<S: Session> Runner<S> {
                 self.queue_due_retries(&mut work, &state);
                 self.start_ready(&mut work, &state);
             }
-            // Past the stagger, anything ready has just been started: nothing left to wait for.
+            // Past the stagger anything ready has just been started, so once nothing runs there
+            // is nothing left to wait for; with nothing queued there is nothing to stagger.
             let idle = work.triage.is_none() && work.sessions.is_empty();
-            if once && idle && (paused || (work.triaged && work.may_start())) {
+            let nothing_queued = work.queue.is_empty() && work.discussions.is_empty();
+            if once && idle && (paused || (work.triaged && (work.may_start() || nothing_queued))) {
                 if let (false, Some(until)) = (work.triaged, work.pause_seen) {
                     self.emit(
                         "triage",
