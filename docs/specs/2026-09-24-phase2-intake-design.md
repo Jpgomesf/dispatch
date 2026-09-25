@@ -274,9 +274,11 @@ under `--once`.
   events become `batched` and go to one triage session as `events: [...]` in the
   triage context (with cursors, sources, workspaces and escalations). On success
   they become `done`; on failure they return to `new` (retry with backoff).
-- A batched event whose payload or sender mentions a `needs_human` card of this
-  runner (the ref as a whole token) resets that card, with one `card reopened`
-  line: the external change it was waiting for.
+- A batched `message` or `discussion` event that occurred after a `needs_human`
+  card of this runner stopped, and whose payload or sender mentions it (the ref
+  as a whole token), resets that card, with one `card reopened` line: a person
+  writing is the external change it was waiting for. `work` events never reset a
+  card (see the main spec).
 - Nothing starts while the machine-wide pause holds, and session starts are
   staggered (main spec).
 - On success every batched event becomes `done`, whether or not `handled` names

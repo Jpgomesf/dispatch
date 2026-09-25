@@ -250,8 +250,10 @@ running or crashed session can be resumed by hand.
   `required_mcp`.
 - **Stop sequence** (for all of the above and for a graceful shutdown): SIGINT to
   the `claude` process (it ends the turn cleanly), after 20s SIGTERM to its
-  process group, after another 20s SIGKILL to the group. A second signal to the
-  runner SIGKILLs the group at once.
+  process group, after another 20s SIGKILL to the group. As soon as `claude`
+  exits during a stop, whatever it left in its group is SIGKILLed; after that
+  nothing is sent to its pid. A second signal to the runner SIGKILLs the group at
+  once.
 
 A session that hits a usage limit while running is not stopped: Claude Code
 retries on its own, until it ends or reaches its timeout.
@@ -284,6 +286,10 @@ Triage reports `ok`; discussions report `replied`, `drafted`, `skipped` or
 - **Cap**: counted attempts in the current run (since the card was last done or
   reset) stop at `max_attempts`; the attempt that reaches it makes the card
   `needs_human` (`max_attempts`). `rate_limited` and `interrupted` do not count.
+  The card's own count is authoritative; the rules look back at the recorded
+  attempts of the run (never past the last `done`), and an attempt that fails
+  before its session starts (a worktree that cannot be created, a runner stopped
+  in between) is recorded as a `crash` so the two agree.
 - **No progress**: the runner records the worktree's `HEAD` before and after each
   card attempt; `new_commits` is `git rev-list --count before..after`. Two
   counted attempts in a row that end unfinished with zero new commits make the
@@ -293,9 +299,13 @@ Triage reports `ok`; discussions report `replied`, `drafted`, `skipped` or
   was created, when the skill branches from it.
 - **`needs_human`** cards are never started again by the runner or by triage;
   triage sees them in `escalations`. A person resets one with `dispatch card
-  <ref>`; a new intake event whose payload or sender mentions the ref (as a
-  whole token) also resets it (status `failed`, count 0, no retry scheduled), so
-  triage may list it again.
+  <ref>`; a new `message` or `discussion` intake event (a person writing) that
+  occurred after the card stopped and whose payload or sender mentions the ref
+  (as a whole token) also resets it (status `failed`, count 0, no retry
+  scheduled), so triage may list it again. `work` events do not: an assigned
+  card updates on the agent's own comments and on the escalation itself, and
+  the pollers report a comment on my own ticket only as a `work` event, so an
+  answer there needs a mention elsewhere or `dispatch card`.
 - A retry that cannot start (the card is no longer assigned to me, or another
   runner holds its claim) is dropped; the card stays `failed` for triage.
 - **Discussions** follow the same rules with `[card] max_attempts`, but their
@@ -317,9 +327,10 @@ learned, the runner sets a **machine-wide pause** in the store: until the
 While paused no runner starts a triage, card or discussion session (running ones
 carry on); `dispatch card` refuses; `--once` exits without starting anything;
 `status` shows the pause with its reason and the runner that set it. The attempt
-ends `rate_limited` unless it finished anyway, or hit its own budget or turn
-limit (`api_error`). Its card is retried when the pause ends; the attempt is not
-counted. One `pause set` line when a runner sets or extends the pause, one
+ends `rate_limited` unless it finished anyway, hit its own budget or turn limit
+(`api_error`), or got a normal answer from the API after the limit (then its own
+ending counts, e.g. `timeout`). Its card is retried when the pause ends; the
+attempt is not counted. One `pause set` line when a runner sets or extends the pause, one
 `pause waiting` line when a runner first sees another runner's pause, one `pause
 lifted` line when it ends.
 
