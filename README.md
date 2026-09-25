@@ -6,9 +6,9 @@ does the rest on a dedicated machine: it watches your notifications and
 trackers, points Claude at the right objective, and keeps each session alive and
 recoverable. What Claude does with an objective is up to your own skills.
 
-One Rust binary. Needs a stable Rust toolchain, `git`, and the `claude` CLI on
-`PATH`; Claude Code auth and connectors come from the machine
-(`docs/machine-setup.md`).
+One Rust binary. It starts `git` and the `claude` CLI from `PATH` and uses the
+machine's own Claude Code setup. Build, configure and first run:
+[`docs/setup.md`](docs/setup.md).
 
 ## How a run works
 
@@ -83,11 +83,10 @@ dispatch stop                       # kill switch; `dispatch resume` removes it
   `agent/<name>/<ref>` branches do the same across machines and people.
 - Output: one line per run on stdout. Exit codes: `0` ok, `1` run failed / kill
   switch, `2` bad config.
-- Inspect a run with `claude --resume <session_id>` (`docs/machine-setup.md`).
+- Inspect a run with `claude --resume <session_id>` (from `dispatch history`).
 
-Background: the practices behind timeouts, attempts and escalation are in
-`~/research/2026-09-24-long-horizon-agent-runner-practices.md`; design notes in
-`docs/specs/`.
+Design notes, including the practices behind timeouts, attempts and
+escalation, are in `docs/specs/`.
 
 ## Recommended: Slack Socket Mode
 

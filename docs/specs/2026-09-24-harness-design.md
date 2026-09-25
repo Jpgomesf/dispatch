@@ -31,9 +31,9 @@ In the repo (gittable):
 
 1. **Runner** — Rust crate at the repo root building the `dispatch` binary (`src/`).
 2. **Skill pack** — an optional Claude Code plugin named `dispatch` (`plugin/`).
-3. **Pointers** — `docs/machine-setup.md` lists the machine-level customizations
-   the user must provide (auth, MCP connectors, service manager, repo checkouts)
-   and points to the tools. It creates none of them.
+3. **Setup doc** — `docs/setup.md` covers the Rust toolchain, building, configuring
+   and a first run. Machine-level setup (accounts, auth, connectors, keeping the
+   process running) is the user's and is not documented here.
 
 Out of the repo: every user-specific value (people, channels, workspaces,
 repos, send policy) lives in `~/.config/dispatch/`. The repo ships

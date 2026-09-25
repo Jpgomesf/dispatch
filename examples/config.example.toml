@@ -42,8 +42,9 @@ tracker_query = "assignee:me state:Todo label:agent"
 batch_window = "60s"          # collect events this long before one triage session
 allow_senders = []            # optional sender allowlist (display names / emails); empty = no filter
                               # mentions of me and direct replies to me always pass
+mention_names = []            # your name and handles; flags notifications that mention you
 
-[intake.notifications]        # macOS only; needs Full Disk Access (docs/machine-setup.md)
+[intake.notifications]        # macOS only; reads the notification database (needs Full Disk Access)
 enabled = true
 poll = "5s"
 apps = ["com.tinyspeck.slackmacgap"]
@@ -72,5 +73,5 @@ path = "~/code/example-app"
 match = ["EX-", "example-app"]
 
 # Who may be messaged is not configured here: use Claude Code permission rules
-# (e.g. deny "mcp__*__send_message") and your outreach.md. See docs/machine-setup.md.
+# (e.g. deny "mcp__*__send_message") and your outreach.md.
 # Secrets (API keys) never go here: see examples/secrets.env.example.
