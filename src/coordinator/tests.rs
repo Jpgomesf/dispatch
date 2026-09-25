@@ -495,22 +495,41 @@ async fn blocked_cards_wait_for_triage_and_retries_skip_the_triage_limit() {
 #[tokio::test(start_paused = true)]
 async fn a_new_event_mentioning_a_card_that_needs_a_person_reopens_it() {
     let env = test_env();
-    let mut escalated = CardState::new(CardStatus::NeedsHuman, now());
+    let escalated_at = now() - chrono::TimeDelta::hours(1);
+    let mut escalated = CardState::new(CardStatus::NeedsHuman, escalated_at);
     escalated.attempts = 3;
     escalated.reason = Some("max_attempts".into());
     let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![ok(triage_output(&[]))]));
-    seed(&runner, "EX-1", &escalated);
-    seed(&runner, "EX-12", &escalated);
-    let mut event = manual_event("1");
-    event.payload = json!({"body": "EX-1 is unblocked, the decision is made"});
-    env.store().enqueue("example-app", &event, now()).unwrap();
+    for card_ref in ["EX-1", "EX-12", "EX-2", "EX-3"] {
+        seed(&runner, card_ref, &escalated);
+    }
+    let store = env.store();
+    let mut answer = manual_event("1");
+    answer.payload = json!({"body": "EX-1 is unblocked, the decision is made"});
+    store.enqueue("example-app", &answer, now()).unwrap();
+    // The card's own tracker update (the agent's comment, the escalation): not a person.
+    let mut update = manual_event("2");
+    update.kind = crate::intake::EventKind::Work;
+    update.payload = json!({"ref": "EX-2", "title": "Example task"});
+    store.enqueue("example-app", &update, now()).unwrap();
+    // Said before the card stopped: not news.
+    let mut stale = manual_event("3");
+    stale.occurred_at = escalated_at - chrono::TimeDelta::minutes(5);
+    stale.payload = json!({"body": "what about EX-3?"});
+    store.enqueue("example-app", &stale, now()).unwrap();
     runner.heartbeat(TEN_MINUTES, true).await;
     let reopened = card_of(&runner, "EX-1");
     assert_eq!(
         (reopened.status, reopened.attempts, reopened.reason),
         (CardStatus::Failed, 0, None)
     );
-    assert_eq!(status_of(&runner, "EX-12"), Some(CardStatus::NeedsHuman));
+    for card_ref in ["EX-12", "EX-2", "EX-3"] {
+        assert_eq!(
+            status_of(&runner, card_ref),
+            Some(CardStatus::NeedsHuman),
+            "{card_ref}"
+        );
+    }
     assert!(
         lines_of(&lines)
             .iter()

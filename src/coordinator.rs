@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, sleep_until};
 
-use crate::intake::{self, Event};
+use crate::intake::{self, Event, EventKind};
 use crate::results::{CardToWork, DiscussionToRun, TriageResult};
 use crate::runner::{QueuedDiscussion, Runner, one_line, time};
 use crate::session::Session;
@@ -352,19 +352,26 @@ impl<S: Session> Runner<S> {
         pause.is_some()
     }
 
-    /// A new event that mentions a `needs_human` card is the external change it waited for:
-    /// its attempt count starts over and triage may list it again.
+    /// A person writing about a `needs_human` card after it stopped (a message or discussion
+    /// event that mentions it) is the external change it waited for: its attempt count starts
+    /// over and triage may list it again. `work` events are not enough: an assigned card
+    /// updates on the agent's own comments and on the escalation itself.
     async fn reopen_mentioned(&self, events: &[Event]) {
-        let texts: Vec<String> = events
+        let texts: Vec<(DateTime<Utc>, String)> = events
             .iter()
+            .filter(|event| event.kind != EventKind::Work)
             .map(|event| {
-                format!(
+                let text = format!(
                     "{} {}",
                     event.sender.as_deref().unwrap_or(""),
                     event.payload
-                )
+                );
+                (event.occurred_at, text)
             })
             .collect();
+        if texts.is_empty() {
+            return;
+        }
         let (runner, now) = (self.name().to_string(), self.now());
         let reopened = self
             .store()
@@ -372,7 +379,9 @@ impl<S: Session> Runner<S> {
                 let state = s.load_state(&runner)?;
                 let mut reopened = Vec::new();
                 for (card_ref, card) in &state.cards {
-                    let mentioned = texts.iter().any(|text| mentions_ref(text, card_ref));
+                    let mentioned = texts
+                        .iter()
+                        .any(|(at, text)| *at > card.updated_at && mentions_ref(text, card_ref));
                     if card.status == CardStatus::NeedsHuman
                         && mentioned
                         && s.reset_card(&runner, card_ref, true, now)?
