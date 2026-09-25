@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
-use harness::cli;
-use harness::paths::EnvPaths;
-use harness::session::ClaudeCli;
+use dispatch::cli;
+use dispatch::paths::EnvPaths;
+use dispatch::session::ClaudeCli;
 
 #[tokio::main]
 async fn main() -> ExitCode {

@@ -64,7 +64,7 @@ async fn is_checkout_root(path: &Path) -> bool {
 /// Where a card (or a discussion, named by its claim key) runs:
 /// `<worktrees_dir>/<workspace>/<name-slug>`, a detached worktree of the workspace, reused
 /// when it already exists (resume). A workspace that is not a git checkout
-/// is returned as is; the workflow skill reports it as blocked.
+/// is returned as is.
 pub async fn card_checkout(
     workspace: &Workspace,
     card_ref: &str,
@@ -89,6 +89,28 @@ pub async fn card_checkout(
     Ok(checkout)
 }
 
+/// The commit `checkout` has checked out, when it is one of our worktrees (not a workspace
+/// used as is, which may sit inside someone else's repository).
+pub async fn head(workspace: &Workspace, checkout: &Path) -> Option<String> {
+    if checkout == workspace.path {
+        return None;
+    }
+    git(checkout, &["rev-parse", "--verify", "HEAD"]).await.ok()
+}
+
+/// Commits reachable from `after` but not from `before`: what an attempt added to HEAD.
+pub async fn commits_between(checkout: &Path, before: &str, after: &str) -> Option<u32> {
+    if before == after {
+        return Some(0);
+    }
+    let range = format!("{before}..{after}");
+    git(checkout, &["rev-list", "--count", &range])
+        .await
+        .ok()?
+        .parse()
+        .ok()
+}
+
 /// Remove a finished card's worktree. `git worktree remove` without `--force` refuses when the
 /// tree has uncommitted or untracked changes, so nothing unsaved is lost; commits stay on
 /// their branch.
@@ -105,6 +127,7 @@ pub async fn release_checkout(workspace: &Workspace, checkout: &Path) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{commit, init_repo};
 
     fn workspace(path: &Path) -> Workspace {
         Workspace {
@@ -112,27 +135,6 @@ mod tests {
             path: path.to_path_buf(),
             match_: vec![],
         }
-    }
-
-    fn init_repo(path: &Path) {
-        std::fs::create_dir_all(path).unwrap();
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(args)
-                .env("GIT_AUTHOR_NAME", "Example")
-                .env("GIT_AUTHOR_EMAIL", "dev@example.com")
-                .env("GIT_COMMITTER_NAME", "Example")
-                .env("GIT_COMMITTER_EMAIL", "dev@example.com")
-                .output()
-                .unwrap();
-            assert!(status.status.success(), "{args:?}: {status:?}");
-        };
-        run(&["init", "-q"]);
-        std::fs::write(path.join("README.md"), "example\n").unwrap();
-        run(&["add", "README.md"]);
-        run(&["-c", "commit.gpgsign=false", "commit", "-qm", "init"]);
     }
 
     #[test]
@@ -207,6 +209,19 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.join("README.md").is_file());
         assert_eq!(card_checkout(&ws, "EX-1", &wt).await.unwrap(), first);
+
+        let before = head(&ws, &first).await.unwrap();
+        assert_eq!(
+            head(&ws, &repo).await,
+            None,
+            "the workspace itself is not ours"
+        );
+        commit(&first, "one");
+        commit(&first, "two");
+        let after = head(&ws, &first).await.unwrap();
+        assert_eq!(commits_between(&first, &before, &after).await, Some(2));
+        assert_eq!(commits_between(&first, &after, &after).await, Some(0));
+        assert_eq!(commits_between(&first, "nonsense", &after).await, None);
 
         std::fs::write(first.join("scratch.txt"), "unsaved").unwrap();
         assert!(

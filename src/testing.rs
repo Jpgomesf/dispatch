@@ -10,13 +10,14 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::config::{Config, tests::config_toml};
 use crate::paths::{EnvPaths, Paths};
 use crate::runner::{Clock, Runner};
-use crate::session::{Session, SessionError, SessionOutcome, SessionRequest, Shutdown};
+use crate::session::{
+    Control, Ended, Mode, Notice, Session, SessionReport, SessionRequest, Shutdown,
+};
 use crate::store::Store;
 
 pub fn now() -> DateTime<Utc> {
@@ -40,7 +41,7 @@ impl TestEnv {
     pub fn env_paths(&self) -> EnvPaths {
         EnvPaths {
             config: None,
-            db: Some(self.dir.path().join("harness.db").display().to_string()),
+            db: Some(self.dir.path().join("dispatch.db").display().to_string()),
             secrets: Some(self.dir.path().join("secrets.env").display().to_string()),
         }
     }
@@ -65,29 +66,71 @@ pub fn test_env() -> TestEnv {
     env
 }
 
+fn git(path: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Example")
+        .env("GIT_AUTHOR_EMAIL", "dev@example.com")
+        .env("GIT_COMMITTER_NAME", "Example")
+        .env("GIT_COMMITTER_EMAIL", "dev@example.com")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{args:?}: {output:?}");
+}
+
+/// A git repository with one commit.
+pub fn init_repo(path: &Path) {
+    std::fs::create_dir_all(path).unwrap();
+    git(path, &["init", "-q"]);
+    std::fs::write(path.join("README.md"), "example\n").unwrap();
+    git(path, &["add", "README.md"]);
+    git(path, &["commit", "-qm", "init"]);
+}
+
+/// An empty commit on whatever `path` has checked out.
+pub fn commit(path: &Path, message: &str) {
+    git(path, &["commit", "-q", "--allow-empty", "-m", message]);
+}
+
 pub fn write_plugin(root: &Path) {
     let manifest = root.join("plugin/.claude-plugin/plugin.json");
     std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-    std::fs::write(manifest, r#"{"name": "claude-harness"}"#).unwrap();
+    std::fs::write(manifest, r#"{"name": "dispatch"}"#).unwrap();
 }
 
 pub struct Step {
     pub delay: Duration,
-    pub output: Result<Value, String>,
+    pub ended: Ended,
+    /// Sent as soon as the session starts, after `Started`.
+    pub notices: Vec<Notice>,
+}
+
+/// A session that ends how `ended` says.
+pub fn ended(ended: Ended) -> Step {
+    Step {
+        delay: Duration::ZERO,
+        ended,
+        notices: Vec::new(),
+    }
+}
+
+/// A session that hits a usage limit: it says so while running, then ends on it.
+pub fn rate_limited(resets_at: Option<DateTime<Utc>>) -> Step {
+    let mut step = ended(Ended::RateLimited { resets_at });
+    step.notices.push(Notice::RateLimited { resets_at });
+    step
 }
 
 pub fn ok(output: Value) -> Step {
-    Step {
-        delay: Duration::ZERO,
-        output: Ok(output),
-    }
+    ended(Ended::Output(output))
 }
 
+/// A session whose result reports an error.
 pub fn fail(message: &str) -> Step {
-    Step {
-        delay: Duration::ZERO,
-        output: Err(message.to_string()),
-    }
+    ended(Ended::ApiError(message.to_string()))
 }
 
 impl Step {
@@ -104,8 +147,21 @@ pub struct Call {
 }
 
 impl Call {
-    pub fn first_line(&self) -> &str {
-        self.request.prompt.lines().next().unwrap_or("")
+    pub fn context(&self) -> Value {
+        crate::prompts::context_of(&self.request.prompt)
+    }
+
+    /// The context's `ref` (empty for triage).
+    pub fn reference(&self) -> String {
+        self.context()["ref"].as_str().unwrap_or("").to_string()
+    }
+
+    /// `triage`, `card EX-1` or `discussion EX-9`.
+    pub fn label(&self) -> String {
+        match self.request.mode {
+            Mode::Triage => "triage".into(),
+            mode => format!("{} {}", mode.as_str(), self.reference()),
+        }
     }
 }
 
@@ -146,20 +202,18 @@ impl FakeSession {
     pub fn routed(triages: Vec<Step>, card: impl Fn(&str) -> Step + Send + Sync + 'static) -> Self {
         let triages = Mutex::new(VecDeque::from(triages));
         FakeSession::new(move |request| {
-            let first = request.prompt.lines().next().unwrap_or("");
-            let command = first
-                .strip_prefix("/claude-harness:workflow ")
-                .unwrap_or("");
-            if let Some(card_ref) = command.strip_prefix("card ") {
-                card(card_ref)
-            } else if let Some(discussion_ref) = command.strip_prefix("discussion ") {
-                ok(discussion_output(discussion_ref, "drafted"))
-            } else {
-                triages
+            let reference = crate::prompts::context_of(&request.prompt)["ref"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            match request.mode {
+                Mode::Card => card(&reference),
+                Mode::Discussion => ok(discussion_output(&reference, "drafted")),
+                Mode::Triage => triages
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .unwrap_or_else(|| ok(triage_output(&[])))
+                    .unwrap_or_else(|| ok(triage_output(&[]))),
             }
         })
     }
@@ -168,30 +222,40 @@ impl FakeSession {
         self.calls.lock().unwrap().clone()
     }
 
-    pub fn first_lines(&self) -> Vec<String> {
-        self.calls()
-            .iter()
-            .map(|c| c.first_line().to_string())
-            .collect()
+    /// Each call's `label()`, in call order.
+    pub fn labels(&self) -> Vec<String> {
+        self.calls().iter().map(Call::label).collect()
     }
 
     pub fn card_call(&self, card_ref: &str) -> Option<Call> {
-        let line = format!("/claude-harness:workflow card {card_ref}");
-        self.calls().into_iter().find(|c| c.first_line() == line)
+        self.calls()
+            .into_iter()
+            .find(|c| c.request.mode == Mode::Card && c.reference() == card_ref)
     }
 }
 
 impl Session for FakeSession {
-    async fn run(
-        &self,
-        request: SessionRequest,
-        mut shutdown: watch::Receiver<Shutdown>,
-    ) -> Result<SessionOutcome, SessionError> {
+    async fn run(&self, request: SessionRequest, control: Control) -> SessionReport {
+        let Control {
+            mut shutdown,
+            notices,
+        } = control;
         let step = (self.script)(&request);
-        self.calls.lock().unwrap().push(Call {
-            request,
-            started: Instant::now(),
+        let number = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(Call {
+                request,
+                started: Instant::now(),
+            });
+            calls.len()
+        };
+        let session_id = format!("session-{number}");
+        let _ = notices.send(Notice::Started {
+            session_id: session_id.clone(),
         });
+        for notice in step.notices {
+            let _ = notices.send(notice);
+        }
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
         let terminated = if step.delay.is_zero() {
@@ -203,15 +267,15 @@ impl Session for FakeSession {
             }
         };
         self.active.fetch_sub(1, Ordering::SeqCst);
-        if terminated {
-            return Err(SessionError("terminated: harness is stopping".into()));
+        SessionReport {
+            ended: if terminated {
+                Ended::Interrupted
+            } else {
+                step.ended
+            },
+            session_id: Some(session_id),
+            cost_usd: Some(0.05),
         }
-        step.output
-            .map(|output| SessionOutcome {
-                output,
-                cost_usd: Some(0.05),
-            })
-            .map_err(SessionError)
     }
 }
 

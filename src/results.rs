@@ -1,4 +1,4 @@
-//! Structured-output contract with the workflow skill.
+//! Structured-output contract with the sessions: the JSON schema each mode must return.
 
 use std::collections::BTreeMap;
 

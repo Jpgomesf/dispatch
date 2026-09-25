@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::durations::parse_duration;
+use crate::durations::{parse_duration, parse_duration_or_zero};
 
 mod intake;
 
@@ -12,8 +12,17 @@ pub use intake::{
     IntakeConfig, JiraConfig, LINEAR_API_URL, LinearConfig, NotificationsConfig, SLACK_APP_ID,
 };
 
-pub const DEFAULT_CONFIG_DIR: &str = "~/.config/claude-harness";
-pub const DEFAULT_STATE_DIR: &str = "~/.local/state/claude-harness";
+pub const DEFAULT_CONFIG_DIR: &str = "~/.config/dispatch";
+pub const DEFAULT_STATE_DIR: &str = "~/.local/state/dispatch";
+
+/// What each session is asked to do; the JSON context block follows it. `{ref}` is replaced by
+/// the card or discussion ref.
+pub const TRIAGE_OBJECTIVE: &str = "Check the new activity below (or sweep your sources if \
+`events` is empty) and decide what deserves attention: respond, draft, ignore, pick up \
+assigned work as cards, or investigate mentions.";
+pub const CARD_OBJECTIVE: &str = "Work card {ref} to completion in this workspace.";
+pub const DISCUSSION_OBJECTIVE: &str = "You were mentioned in a discussion about {ref}. \
+Investigate the question and respond in the thread.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,6 +57,10 @@ pub struct TriageConfig {
     pub effort: Effort,
     pub max_budget_usd: f64,
     pub max_cards_per_tick: u32,
+    /// Wall-clock limit of one triage session.
+    #[serde(deserialize_with = "duration_from_str")]
+    pub timeout: Duration,
+    pub objective: String,
 }
 
 impl Default for TriageConfig {
@@ -58,10 +71,13 @@ impl Default for TriageConfig {
             effort: Effort::Medium,
             max_budget_usd: 1.0,
             max_cards_per_tick: 1,
+            timeout: Duration::from_secs(20 * 60),
+            objective: TRIAGE_OBJECTIVE.into(),
         }
     }
 }
 
+/// Card sessions; discussion sessions use the same model, effort and budget.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CardConfig {
@@ -70,6 +86,13 @@ pub struct CardConfig {
     pub max_budget_usd: f64,
     /// Card and discussion sessions running at the same time under `heartbeat`.
     pub max_parallel: u32,
+    /// Wall-clock limit of one card attempt.
+    #[serde(deserialize_with = "duration_from_str")]
+    pub timeout: Duration,
+    /// Counted attempts per card (and per discussion) before it needs a person.
+    pub max_attempts: u32,
+    /// `{ref}` is replaced by the card ref.
+    pub objective: String,
 }
 
 impl Default for CardConfig {
@@ -79,11 +102,63 @@ impl Default for CardConfig {
             effort: Effort::High,
             max_budget_usd: 20.0,
             max_parallel: 2,
+            timeout: Duration::from_secs(3 * 60 * 60),
+            max_attempts: 3,
+            objective: CARD_OBJECTIVE.into(),
         }
     }
 }
 
-/// Free-form: the workflow skill interprets these values.
+/// Discussion sessions (model, effort and budget come from `[card]`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiscussionConfig {
+    /// Wall-clock limit of one discussion session.
+    #[serde(deserialize_with = "duration_from_str")]
+    pub timeout: Duration,
+    /// `{ref}` is replaced by the discussion ref.
+    pub objective: String,
+}
+
+impl Default for DiscussionConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(60 * 60),
+            objective: DISCUSSION_OBJECTIVE.into(),
+        }
+    }
+}
+
+/// Limits every session shares.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SessionsConfig {
+    /// No stream event for this long means the session is stuck.
+    #[serde(deserialize_with = "duration_from_str")]
+    pub idle_timeout: Duration,
+    /// Between two session starts, plus up to 50% random jitter; `0s` switches it off.
+    #[serde(deserialize_with = "duration_or_zero_from_str")]
+    pub start_stagger: Duration,
+    /// This many identical tool calls within the last twice as many means the session is
+    /// looping (stopped as `stuck`); 0 switches the check off.
+    pub loop_threshold: u32,
+    /// MCP servers (names as Claude Code reports them) every session needs connected; a
+    /// session without them is stopped at start.
+    pub required_mcp: Vec<String>,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(15 * 60),
+            start_stagger: Duration::from_secs(30),
+            loop_threshold: 10,
+            required_mcp: Vec::new(),
+        }
+    }
+}
+
+/// Free-form: passed to triage in its context; the skills interpret these values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourcesConfig {
@@ -124,6 +199,8 @@ pub struct Config {
     pub plugin_dir: Option<PathBuf>,
     pub triage: TriageConfig,
     pub card: CardConfig,
+    pub discussion: DiscussionConfig,
+    pub sessions: SessionsConfig,
     pub sources: SourcesConfig,
     pub intake: IntakeConfig,
     pub workspaces: Vec<Workspace>,
@@ -138,6 +215,8 @@ impl Default for Config {
             plugin_dir: None,
             triage: TriageConfig::default(),
             card: CardConfig::default(),
+            discussion: DiscussionConfig::default(),
+            sessions: SessionsConfig::default(),
             sources: SourcesConfig::default(),
             intake: IntakeConfig::default(),
             workspaces: Vec::new(),
@@ -170,6 +249,18 @@ impl Config {
         }
         if self.card.max_parallel == 0 {
             return Err("card.max_parallel must be >= 1".into());
+        }
+        if self.card.max_attempts == 0 {
+            return Err("card.max_attempts must be >= 1".into());
+        }
+        for (key, objective) in [
+            ("triage.objective", &self.triage.objective),
+            ("card.objective", &self.card.objective),
+            ("discussion.objective", &self.discussion.objective),
+        ] {
+            if objective.trim().is_empty() {
+                return Err(format!("{key} must not be empty"));
+            }
         }
         self.intake.validate()?;
         self.outreach_file = expand_user(&self.outreach_file);
@@ -227,6 +318,13 @@ fn duration_from_str<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Durat
     parse_duration(&text).map_err(serde::de::Error::custom)
 }
 
+fn duration_or_zero_from_str<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Duration, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    parse_duration_or_zero(&text).map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -243,6 +341,9 @@ plugin_dir = "{root}/plugin"
 [triage]
 interval = "10m"
 max_cards_per_tick = 2
+
+[sessions]
+start_stagger = "0s"
 
 [sources]
 slack_channels = ["C0000000001"]
@@ -284,13 +385,33 @@ match = ["EX-"]
         assert_eq!(config.card.effort, Effort::High);
         assert_eq!(config.card.max_budget_usd, 20.0);
         assert_eq!(config.card.max_parallel, 2);
+        assert_eq!(config.triage.objective, TRIAGE_OBJECTIVE);
+        assert_eq!(
+            config.card.objective,
+            "Work card {ref} to completion in this workspace."
+        );
+        assert!(
+            config
+                .discussion
+                .objective
+                .contains("discussion about {ref}")
+        );
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(config.triage.timeout, minutes(20));
+        assert_eq!(config.card.timeout, minutes(180));
+        assert_eq!(config.discussion.timeout, minutes(60));
+        assert_eq!(config.sessions.idle_timeout, minutes(15));
+        assert_eq!(config.sessions.start_stagger, Duration::from_secs(30));
+        assert!(config.sessions.required_mcp.is_empty());
+        assert_eq!(config.sessions.loop_threshold, 10);
+        assert_eq!(config.card.max_attempts, 3);
         assert_eq!(
             config.state_dir,
-            expand_user(Path::new("~/.local/state/claude-harness"))
+            expand_user(Path::new("~/.local/state/dispatch"))
         );
         assert_eq!(
             config.outreach_file,
-            expand_user(Path::new("~/.config/claude-harness/outreach.md"))
+            expand_user(Path::new("~/.config/dispatch/outreach.md"))
         );
         assert!(!config.state_dir.starts_with("~"));
         assert_eq!(config.triage.interval, Duration::from_secs(30 * 60));
@@ -336,6 +457,15 @@ match = ["EX-"]
             "[intake.jira]\nenabled = true\nbase_url = \"http://example.atlassian.net\"",
             "[intake.jira]\njql = \"project = EX) OR (project = OTHER\"",
             "[intake.notifications]\npoll = \"often\"",
+            "[card]\nobjective = \"  \"",
+            "[discussion]\nobjective = \"\"",
+            "[discussion]\nmodel = \"sonnet\"",
+            "[discussion]\ntimeout = \"soon\"",
+            "[card]\ntimeout = \"0s\"",
+            "[sessions]\nidle_timeout = \"-1m\"",
+            "[sessions]\nunknown = 1",
+            "[card]\nmax_attempts = 0",
+            "[sessions]\nloop_threshold = -1",
         ] {
             let raw = format!("name = \"example-app\"\n{body}");
             assert!(Config::from_toml(&raw).is_err(), "{raw}");
@@ -387,6 +517,31 @@ jql = "project = EX"
         assert_eq!(intake.linear.projects, ["Example App"]);
         assert_eq!(intake.linear.api_url, LINEAR_API_URL);
         assert_eq!(intake.jira.jql, "project = EX");
+    }
+
+    #[test]
+    fn session_limits_are_configurable() {
+        let raw = "name = \"ex\"\n[triage]\ntimeout = \"5m\"\n[card]\ntimeout = \"2h\"\n\
+                   [discussion]\ntimeout = \"30m\"\n[sessions]\nidle_timeout = \"10m\"\nstart_stagger = \"45s\"\nloop_threshold = 0\nrequired_mcp = [\"linear\"]\n";
+        let config = Config::from_toml(raw).unwrap();
+        assert_eq!(config.triage.timeout, Duration::from_secs(300));
+        assert_eq!(config.card.timeout, Duration::from_secs(7200));
+        assert_eq!(config.discussion.timeout, Duration::from_secs(1800));
+        assert_eq!(config.sessions.idle_timeout, Duration::from_secs(600));
+        assert_eq!(config.sessions.start_stagger, Duration::from_secs(45));
+        assert_eq!(config.sessions.required_mcp, ["linear"]);
+        assert_eq!(config.sessions.loop_threshold, 0, "switched off");
+    }
+
+    #[test]
+    fn objectives_are_configurable() {
+        let raw = "name = \"ex\"\n[triage]\nobjective = \"Look around.\"\n\
+                   [card]\nobjective = \"Finish {ref}.\"\n\
+                   [discussion]\nobjective = \"Answer about {ref}.\"\n";
+        let config = Config::from_toml(raw).unwrap();
+        assert_eq!(config.triage.objective, "Look around.");
+        assert_eq!(config.card.objective, "Finish {ref}.");
+        assert_eq!(config.discussion.objective, "Answer about {ref}.");
     }
 
     #[test]

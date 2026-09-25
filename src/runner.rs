@@ -1,33 +1,42 @@
-//! Sessions: triage, cards and discussions, each one `claude` process. Scheduling (when they
-//! start, batching of intake events, parallelism) lives in `dispatch`.
+//! Sessions: triage, cards and discussions, each one `claude` process recorded as an attempt.
+//! Scheduling (when they start, batching of intake events, parallelism) lives in
+//! `coordinator`; what follows an attempt is decided by the rules in `outcome`.
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{Notify, watch};
+use serde::de::DeserializeOwned;
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, interval_at};
 
-use crate::config::{Config, Effort, UnknownWorkspace, Workspace};
-use crate::intake::secrets::{EnvLookup, Secrets, process_env};
-use crate::intake::{CardScope, Event, IntakeContext, card_scope};
+use crate::config::{Config, Effort};
+use crate::intake::secrets::{EnvLookup, process_env};
+use crate::intake::{Event, IntakeContext};
+use crate::outcome::{self, Next, Outcome};
 use crate::paths::Paths;
-use crate::prompts::{INTAKE_CURSOR_PREFIX, card_prompt, discussion_prompt, triage_prompt};
-use crate::results::{
-    CardOutcome, CardResult, DiscussionResult, DiscussionToRun, TriageResult, card_schema,
-    discussion_schema, triage_schema,
+use crate::prompts::{Escalation, INTAKE_CURSOR_PREFIX, triage_prompt};
+use crate::results::{TriageResult, triage_schema};
+use crate::session::{
+    Control, Ended, Limits, Mode, Notice, Session, SessionReport, SessionRequest, Shutdown,
 };
-use crate::session::{Session, SessionRequest, Shutdown};
-use crate::state::{CardState, CardStatus};
-use crate::store::{CLAIM_LEASE, CLAIM_RENEW, Claim, Store};
-use crate::worktree;
+use crate::state::CardStatus;
+use crate::store::{AttemptEnd, CLAIM_LEASE, CLAIM_RENEW, Claim, Pause, Store};
+
+mod cards;
+mod discussions;
+
+pub(crate) use discussions::QueuedDiscussion;
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 pub type Output = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Summary of an attempt a stopped runner left open.
+const STOPPED_MID_SESSION: &str = "the runner stopped before the session ended";
 
 pub struct Runner<S> {
     pub config: Arc<Config>,
@@ -38,7 +47,7 @@ pub struct Runner<S> {
     clock: Clock,
     out: Output,
     shutdown: Arc<watch::Sender<Shutdown>>,
-    /// Raised by intake when events are stored, so the dispatcher looks right away.
+    /// Raised by intake when events are stored, so the coordinator looks right away.
     pub(crate) wake: Arc<Notify>,
 }
 
@@ -69,13 +78,44 @@ fn cost(cost_usd: Option<f64>) -> String {
         .unwrap_or_default()
 }
 
-impl From<CardOutcome> for CardStatus {
-    fn from(outcome: CardOutcome) -> Self {
-        match outcome {
-            CardOutcome::Done => CardStatus::Done,
-            CardOutcome::Blocked => CardStatus::Blocked,
-            CardOutcome::Failed => CardStatus::Failed,
-        }
+pub(crate) fn time(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// What follows an attempt, for its output line.
+fn describe(next: &Result<Next, String>) -> String {
+    match next {
+        Ok(Next::Finished | Next::Blocked) => String::new(),
+        Ok(Next::Retry { at }) => format!("; retry at {}", time(*at)),
+        Ok(Next::NeedsHuman(reason)) => format!("; needs_human ({})", reason.as_str()),
+        Err(error) => format!("; not recorded ({error})"),
+    }
+}
+
+/// How an attempt ended: the agent's result when its structured output parses as `T` (with
+/// the outcome and summary `verdict` reads from it), else the class of the failure.
+fn judge<T: DeserializeOwned>(
+    ended: &Ended,
+    what: &str,
+    verdict: impl Fn(&T) -> (Outcome, String),
+) -> (Outcome, String, Option<T>) {
+    match ended.output() {
+        Ok(output) => match serde_json::from_value::<T>(output) {
+            Ok(result) => {
+                let (outcome, summary) = verdict(&result);
+                (outcome, summary, Some(result))
+            }
+            Err(e) => (
+                Outcome::InvalidOutput,
+                format!("invalid {what} result: {e}"),
+                None,
+            ),
+        },
+        Err(detail) => (
+            Outcome::of_ended(ended).unwrap_or(Outcome::Crash),
+            detail,
+            None,
+        ),
     }
 }
 
@@ -155,9 +195,8 @@ impl<S: Session> Runner<S> {
     }
 
     pub(crate) fn emit(&self, kind: &str, status: &str, detail: &str) {
-        let now = self.now().format("%Y-%m-%dT%H:%M:%SZ");
         (self.out)(
-            format!("{now} {kind} {status} {detail}")
+            format!("{} {kind} {status} {detail}", time(self.now()))
                 .trim_end()
                 .to_string(),
         );
@@ -180,14 +219,32 @@ impl<S: Session> Runner<S> {
         self.paths.state_dir.clone()
     }
 
+    /// The mode's wall-clock timeout and the shared session limits.
+    fn limits(&self, mode: Mode) -> Limits {
+        let timeout = match mode {
+            Mode::Triage => self.config.triage.timeout,
+            Mode::Card => self.config.card.timeout,
+            Mode::Discussion => self.config.discussion.timeout,
+        };
+        Limits {
+            timeout,
+            idle_timeout: self.config.sessions.idle_timeout,
+            loop_threshold: self.config.sessions.loop_threshold,
+            required_mcp: self.config.sessions.required_mcp.clone(),
+        }
+    }
+
     fn request(
         &self,
+        mode: Mode,
         prompt: String,
         (model, effort, max_budget_usd): (&str, Effort, f64),
         cwd: PathBuf,
         output_schema: serde_json::Value,
     ) -> SessionRequest {
         SessionRequest {
+            limits: self.limits(mode),
+            mode,
             prompt,
             model: model.to_string(),
             effort,
@@ -198,22 +255,186 @@ impl<S: Session> Runner<S> {
         }
     }
 
-    /// At startup, under the instance lock (no other live process of this runner): cards left
-    /// `in_progress` become `failed` so triage can queue them again, this runner's claims are
-    /// released, and batches a crashed triage held go back to `new`.
+    /// At startup, under the instance lock (no other live process of this runner): attempts
+    /// left open are closed as `crash`, cards left `in_progress` follow the retry rules for a
+    /// crash, this runner's claims are released, and batches a crashed triage held go back to
+    /// `new`.
     pub async fn recover(&self) {
-        let runner = self.name().to_string();
-        let now = self.now();
+        let (runner, now) = (self.name().to_string(), self.now());
+        let state_dir = self.paths.state_dir.clone();
         let recovered = self
             .store
             .call(move |store| {
-                store.fail_in_progress(&runner, now)?;
+                let open = store.open_attempts(&runner)?;
+                let state = store.load_state(&runner)?;
+                let mut stranded = Vec::new();
+                for (card_ref, card) in &state.cards {
+                    if card.status != CardStatus::InProgress {
+                        continue;
+                    }
+                    let attempt = open
+                        .iter()
+                        .rfind(|a| a.mode == Mode::Card.as_str() && &a.reference == card_ref)
+                        .map(|a| a.id);
+                    // Stopped before its session started: record the attempt all the same,
+                    // so the attempt rows and the card's count agree.
+                    let attempt = match attempt {
+                        Some(id) => id,
+                        None => {
+                            let mode = Mode::Card.as_str();
+                            store
+                                .begin_attempt(&runner, mode, card_ref, &state_dir, now)?
+                                .0
+                        }
+                    };
+                    stranded.push((card_ref.clone(), Some(attempt)));
+                }
+                store.close_open_attempts(
+                    &runner,
+                    Outcome::Crash.as_str(),
+                    STOPPED_MID_SESSION,
+                    now,
+                )?;
                 store.release_all(&runner)?;
-                store.requeue_batched(&runner)
+                store.requeue_batched(&runner)?;
+                Ok(stranded)
             })
             .await;
-        if let Err(error) = recovered {
-            self.emit("triage", "failed", &format!("store: {error}"));
+        match recovered {
+            Err(error) => self.emit("triage", "failed", &format!("store: {error}")),
+            Ok(stranded) => {
+                for (card_ref, attempt) in stranded {
+                    let next = self
+                        .settle_card(&card_ref, attempt, Outcome::Crash, None, None)
+                        .await;
+                    let detail = format!("{card_ref} — {STOPPED_MID_SESSION}{}", describe(&next));
+                    self.emit("card", Outcome::Crash.as_str(), &detail);
+                }
+            }
+        }
+    }
+
+    /// Open this session's attempt row. A store that cannot record it keeps the session from
+    /// starting, like one that cannot record the card.
+    async fn begin_attempt(
+        &self,
+        mode: Mode,
+        reference: &str,
+        cwd: &Path,
+    ) -> Result<(i64, u32), String> {
+        let (runner, reference, cwd, now) = (
+            self.name().to_string(),
+            reference.to_string(),
+            cwd.to_path_buf(),
+            self.now(),
+        );
+        self.store
+            .call(move |s| s.begin_attempt(&runner, mode.as_str(), &reference, &cwd, now))
+            .await
+            .map_err(|e| format!("store: {e}"))
+    }
+
+    /// Run one session for attempt `id` (of `reference`, empty for triage), acting on its
+    /// notices while it runs. A session that is already running when a limit is hit keeps
+    /// going (Claude Code retries on its own) until it ends or its timeout.
+    async fn run_session(
+        &self,
+        request: SessionRequest,
+        id: i64,
+        reference: &str,
+    ) -> SessionReport {
+        let source = format!("{} {reference}", request.mode.as_str())
+            .trim_end()
+            .to_string();
+        let (notices, mut received) = mpsc::unbounded_channel();
+        let control = Control {
+            shutdown: self.shutdown.subscribe(),
+            notices,
+        };
+        let mut run = pin!(self.session.run(request, control));
+        let report = loop {
+            tokio::select! {
+                report = &mut run => {
+                    while let Ok(notice) = received.try_recv() {
+                        self.on_notice(id, &source, notice).await;
+                    }
+                    break report;
+                }
+                Some(notice) = received.recv() => self.on_notice(id, &source, notice).await,
+            }
+        };
+        if let Ended::RateLimited { resets_at } = report.ended {
+            self.pause_for(resets_at, &source).await;
+        }
+        report
+    }
+
+    /// Best effort: a notice never fails the session.
+    async fn on_notice(&self, id: i64, source: &str, notice: Notice) {
+        match notice {
+            Notice::Started { session_id } => {
+                let _ = self
+                    .store
+                    .call(move |s| s.set_attempt_session(id, &session_id))
+                    .await;
+            }
+            Notice::RateLimited { resets_at } => self.pause_for(resets_at, source).await,
+        }
+    }
+
+    /// Pause every runner on the machine after a usage or rate limit hit in `source`: until
+    /// the reset the stream gave, else for `DEFAULT_PAUSE`. One line when it is set or grows.
+    async fn pause_for(&self, resets_at: Option<DateTime<Utc>>, source: &str) {
+        let now = self.now();
+        let until = outcome::pause_until(resets_at, now);
+        let (runner, reason) = (
+            self.name().to_string(),
+            format!("usage or rate limit in {source}"),
+        );
+        let detail = format!("until {} — {reason}", time(until));
+        match self
+            .store
+            .call(move |s| s.set_pause(until, &reason, &runner, now))
+            .await
+        {
+            Ok(true) => self.emit("pause", "set", &detail),
+            Ok(false) => {}
+            Err(error) => self.emit(
+                "pause",
+                "failed",
+                &one_line(&format!("{detail} — store: {error}")),
+            ),
+        }
+    }
+
+    /// The machine-wide pause in force now, if any; `None` when the store cannot say.
+    pub async fn paused(&self) -> Option<Pause> {
+        let now = self.now();
+        self.store.call(move |s| s.pause(now)).await.ok().flatten()
+    }
+
+    /// How an attempt ended, as recorded; callers add `blocked_on` and `new_commits`.
+    fn attempt_end(&self, outcome: Outcome, report: &SessionReport, summary: &str) -> AttemptEnd {
+        AttemptEnd {
+            outcome: outcome.as_str().to_string(),
+            summary: one_line(summary),
+            blocked_on: None,
+            session_id: report.session_id.clone(),
+            cost_usd: report.cost_usd,
+            new_commits: None,
+            ended_at: self.now(),
+        }
+    }
+
+    /// Close an attempt row with how the session ended. Best effort: the session already ran,
+    /// so a store failure costs only the record (one line).
+    async fn end_attempt(&self, id: i64, end: AttemptEnd) {
+        if let Err(error) = self.store.call(move |s| s.end_attempt(id, &end)).await {
+            self.emit(
+                "store",
+                "failed",
+                &one_line(&format!("attempt {id} not recorded — {error}")),
+            );
         }
     }
 
@@ -255,228 +476,9 @@ impl<S: Session> Runner<S> {
         Ok(output)
     }
 
-    pub fn resolve_workspace(
-        &self,
-        card_ref: &str,
-        name: Option<&str>,
-    ) -> Result<Option<Workspace>, UnknownWorkspace> {
-        match name {
-            Some(name) => self.config.workspace_named(name).map(|w| Some(w.clone())),
-            None => Ok(self.config.workspace_for(card_ref).cloned()),
-        }
-    }
-
-    pub async fn run_card(
-        &self,
-        card_ref: &str,
-        workspace_name: Option<&str>,
-    ) -> Result<Option<CardResult>, UnknownWorkspace> {
-        let workspace = self.resolve_workspace(card_ref, workspace_name)?;
-        Ok(self.run_card_in(card_ref, workspace, &[]).await)
-    }
-
-    /// Personal scope, then the `card:<ref>` claim, then the session.
-    pub(crate) async fn run_card_in(
-        &self,
-        card_ref: &str,
-        workspace: Option<Workspace>,
-        blocked_by: &[String],
-    ) -> Option<CardResult> {
-        let secrets = Secrets::load(&self.paths.secrets, self.env.clone());
-        if let CardScope::Refused(reason) = card_scope(&self.config, &secrets, card_ref).await {
-            self.emit(
-                "card",
-                "refused",
-                &format!("{card_ref} — {}", one_line(&reason)),
-            );
-            return None;
-        }
-        let key = format!("card:{card_ref}");
-        match self
-            .claimed(&key, self.claimed_card(card_ref, workspace, blocked_by))
-            .await
-        {
-            Ok(result) => result,
-            Err(reason) => {
-                self.emit("card", "skipped", &format!("{card_ref} — {reason}"));
-                None
-            }
-        }
-    }
-
-    async fn claimed_card(
-        &self,
-        card_ref: &str,
-        workspace: Option<Workspace>,
-        blocked_by: &[String],
-    ) -> Option<CardResult> {
-        let started = self
-            .record_card(card_ref, CardStatus::InProgress, None, blocked_by)
-            .await;
-        let worked = match started {
-            Ok(()) => self.work_card(card_ref, workspace.as_ref()).await,
-            Err(error) => Err(error),
-        };
-        match worked {
-            Err(error) => {
-                let _ = self
-                    .record_card(card_ref, CardStatus::Failed, None, blocked_by)
-                    .await;
-                self.emit(
-                    "card",
-                    "failed",
-                    &format!("{card_ref} — {}", one_line(&error)),
-                );
-                None
-            }
-            Ok((result, cost_usd, checkout)) => {
-                let status = result.status.into();
-                let pr_url = result.pr_url.clone();
-                if let Err(error) = self.record_card(card_ref, status, pr_url, blocked_by).await {
-                    self.emit("card", "failed", &format!("{card_ref} — {error}"));
-                    return None;
-                }
-                let detail = format!("{card_ref}{} — {}", cost(cost_usd), result.summary);
-                self.emit("card", result.status.as_str(), &detail);
-                if let (CardOutcome::Done, Some(workspace)) = (result.status, &workspace) {
-                    // Best effort: a dirty worktree is kept for a person to look at.
-                    let _ = worktree::release_checkout(workspace, &checkout).await;
-                }
-                Some(result)
-            }
-        }
-    }
-
-    async fn record_card(
-        &self,
-        card_ref: &str,
-        status: CardStatus,
-        pr_url: Option<String>,
-        blocked_by: &[String],
-    ) -> Result<(), String> {
-        let card = CardState {
-            status,
-            updated_at: self.now(),
-            pr_url,
-        };
-        let (runner, card_ref, blocked_by) = (
-            self.name().to_string(),
-            card_ref.to_string(),
-            blocked_by.to_vec(),
-        );
-        self.store
-            .call(move |s| s.set_card(&runner, &card_ref, &card, &blocked_by))
-            .await
-            .map_err(|e| format!("store: {e}"))
-    }
-
-    async fn work_card(
-        &self,
-        card_ref: &str,
-        workspace: Option<&Workspace>,
-    ) -> Result<(CardResult, Option<f64>, PathBuf), String> {
-        let checkout = match workspace {
-            Some(w) => worktree::card_checkout(w, card_ref, &self.paths.worktrees_dir()).await?,
-            None => self.state_dir(),
-        };
-        let prompt = card_prompt(
-            card_ref,
-            workspace.map(|w| (w, checkout.as_path())),
-            &self.config,
-            &self.paths,
-            self.now(),
-        );
-        let card = &self.config.card;
-        let request = self.request(
-            prompt,
-            (&card.model, card.effort, card.max_budget_usd),
-            checkout.clone(),
-            card_schema(),
-        );
-        let outcome = self
-            .session
-            .run(request, self.shutdown.subscribe())
-            .await
-            .map_err(|e| e.0)?;
-        let result: CardResult = serde_json::from_value(outcome.output)
-            .map_err(|e| format!("invalid card result: {e}"))?;
-        Ok((result, outcome.cost_usd, checkout))
-    }
-
-    /// The workspace a discussion runs in: `match` against its ref, then its thread.
-    fn discussion_workspace(&self, discussion: &DiscussionToRun) -> Option<Workspace> {
-        self.config
-            .workspace_for(&discussion.discussion_ref)
-            .or_else(|| self.config.workspace_for(&discussion.thread))
-            .cloned()
-    }
-
-    /// A discussion session: no assignee check (talking is never gated), claimed by
-    /// `discussion:<thread>`, in a detached worktree removed afterwards when clean.
-    pub async fn run_discussion(&self, discussion: DiscussionToRun) -> Option<DiscussionResult> {
-        let key = discussion.claim_key();
-        let label = discussion.discussion_ref.clone();
-        match self
-            .claimed(&key, self.work_discussion(&key, discussion))
-            .await
-        {
-            Ok(Ok((result, cost_usd))) => {
-                let detail = format!("{label}{} — {}", cost(cost_usd), result.summary);
-                self.emit("discussion", result.status.as_str(), &detail);
-                Some(result)
-            }
-            Ok(Err(error)) => {
-                self.emit(
-                    "discussion",
-                    "failed",
-                    &format!("{label} — {}", one_line(&error)),
-                );
-                None
-            }
-            Err(reason) => {
-                self.emit("discussion", "skipped", &format!("{label} — {reason}"));
-                None
-            }
-        }
-    }
-
-    async fn work_discussion(
-        &self,
-        key: &str,
-        discussion: DiscussionToRun,
-    ) -> Result<(DiscussionResult, Option<f64>), String> {
-        let workspace = self.discussion_workspace(&discussion);
-        let checkout = match &workspace {
-            Some(w) => worktree::card_checkout(w, key, &self.paths.worktrees_dir()).await?,
-            None => self.state_dir(),
-        };
-        let prompt = discussion_prompt(
-            &discussion,
-            workspace.as_ref().map(|w| (w, checkout.as_path())),
-            &self.config,
-            &self.paths,
-            self.now(),
-        );
-        let card = &self.config.card;
-        let request = self.request(
-            prompt,
-            (&card.model, card.effort, card.max_budget_usd),
-            checkout.clone(),
-            discussion_schema(),
-        );
-        let outcome = self.session.run(request, self.shutdown.subscribe()).await;
-        if let Some(workspace) = &workspace {
-            // Discussions never commit; a dirty tree is kept for a person to look at.
-            let _ = worktree::release_checkout(workspace, &checkout).await;
-        }
-        let outcome = outcome.map_err(|e| e.0)?;
-        let result: DiscussionResult = serde_json::from_value(outcome.output)
-            .map_err(|e| format!("invalid discussion result: {e}"))?;
-        Ok((result, outcome.cost_usd))
-    }
-
     /// One triage session over `events` (empty: a fallback sweep). Cursors are persisted as
-    /// soon as it returns.
+    /// soon as it returns. A failed triage is not retried here: its events go back to `new`
+    /// and the coordinator backs off.
     pub async fn triage(&self, events: Vec<Event>) -> Option<TriageResult> {
         match self.try_triage(&events).await {
             Ok((result, cost_usd)) => {
@@ -489,44 +491,75 @@ impl<S: Session> Runner<S> {
                     cost(cost_usd),
                     result.summary
                 );
-                self.emit("triage", "ok", &detail);
+                self.emit("triage", Outcome::Ok.as_str(), &detail);
                 Some(result)
             }
-            Err(error) => {
-                self.emit("triage", "failed", &one_line(&error));
+            Err((outcome, detail)) => {
+                self.emit("triage", outcome.as_str(), &one_line(&detail));
                 None
             }
         }
     }
 
-    async fn try_triage(&self, events: &[Event]) -> Result<(TriageResult, Option<f64>), String> {
+    /// Cards waiting for a person, with the last attempt's summary.
+    fn escalations(store: &Store, runner: &str) -> crate::store::Result<Vec<Escalation>> {
+        let state = store.load_state(runner)?;
+        let mut escalations = Vec::new();
+        for (card_ref, card) in &state.cards {
+            if card.status != CardStatus::NeedsHuman {
+                continue;
+            }
+            // The card's own last attempt that ended, not a discussion about the same ref.
+            let last = store.recent_card_attempts(runner, card_ref, 1)?;
+            escalations.push(Escalation {
+                card_ref: card_ref.clone(),
+                reason: card.reason.clone().unwrap_or_default(),
+                attempts: card.attempts,
+                last_summary: last.into_iter().next_back().and_then(|a| a.summary),
+            });
+        }
+        Ok(escalations)
+    }
+
+    async fn try_triage(
+        &self,
+        events: &[Event],
+    ) -> Result<(TriageResult, Option<f64>), (Outcome, String)> {
+        let store_failed = |e: crate::store::StoreError| (Outcome::Crash, format!("store: {e}"));
         let runner = self.name().to_string();
-        let state = self
+        let (state, escalations) = self
             .store
-            .call(move |s| s.load_state(&runner))
+            .call(move |s| Ok((s.load_state(&runner)?, Self::escalations(s, &runner)?)))
             .await
-            .map_err(|e| format!("store: {e}"))?;
+            .map_err(store_failed)?;
         let prompt = triage_prompt(
             &self.config,
             &self.paths,
             &state.cursors,
             events,
+            &escalations,
             self.now(),
         );
         let triage = &self.config.triage;
+        let cwd = self.state_dir();
         let request = self.request(
+            Mode::Triage,
             prompt,
             (&triage.model, triage.effort, triage.max_budget_usd),
-            self.state_dir(),
+            cwd.clone(),
             triage_schema(),
         );
-        let outcome = self
-            .session
-            .run(request, self.shutdown.subscribe())
+        let (id, _) = self
+            .begin_attempt(Mode::Triage, "", &cwd)
             .await
-            .map_err(|e| e.0)?;
-        let result: TriageResult = serde_json::from_value(outcome.output)
-            .map_err(|e| format!("invalid triage result: {e}"))?;
+            .map_err(|e| (Outcome::Crash, e))?;
+        let report = self.run_session(request, id, "").await;
+        let (outcome, summary, result) = judge(&report.ended, "triage", |r: &TriageResult| {
+            (Outcome::Ok, r.summary.clone())
+        });
+        self.end_attempt(id, self.attempt_end(outcome, &report, &summary))
+            .await;
+        let result = result.ok_or((outcome, summary))?;
         // The pollers' own cursors are never the skill's to change.
         let cursors: BTreeMap<String, String> = result
             .cursors
@@ -547,7 +580,7 @@ impl<S: Session> Runner<S> {
                 &one_line(&format!("cursors not saved — store: {error}")),
             );
         }
-        Ok((result, outcome.cost_usd))
+        Ok((result, report.cost_usd))
     }
 
     pub(crate) fn batch_window(&self) -> Duration {

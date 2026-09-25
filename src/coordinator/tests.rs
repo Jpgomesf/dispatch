@@ -26,26 +26,30 @@ fn status_of(runner: &Runner<FakeSession>, card_ref: &str) -> Option<CardStatus>
 }
 
 fn seed_card(runner: &Runner<FakeSession>, card_ref: &str, status: CardStatus) {
-    let card = CardState {
-        status,
-        updated_at: now(),
-        pr_url: None,
-    };
+    seed(runner, card_ref, &CardState::new(status, now()));
+}
+
+fn seed(runner: &Runner<FakeSession>, card_ref: &str, card: &CardState) {
     runner
         .store()
-        .set_card(runner.name(), card_ref, &card, &[])
+        .set_card(runner.name(), card_ref, card)
         .unwrap();
+}
+
+fn card_of(runner: &Runner<FakeSession>, card_ref: &str) -> CardState {
+    runner
+        .store()
+        .card(runner.name(), card_ref)
+        .unwrap()
+        .unwrap()
 }
 
 fn state_with(cards: &[(&str, CardStatus)]) -> State {
     let mut state = State::default();
     for (card_ref, status) in cards {
-        let card = CardState {
-            status: *status,
-            updated_at: now(),
-            pr_url: None,
-        };
-        state.cards.insert(card_ref.to_string(), card);
+        state
+            .cards
+            .insert(card_ref.to_string(), CardState::new(*status, now()));
     }
     state
 }
@@ -142,11 +146,8 @@ async fn tick_persists_cursors_and_runs_cards() {
 
     let session = runner.session();
     let triage = &session.calls()[0].request;
-    assert!(
-        triage
-            .prompt
-            .starts_with("/claude-harness:workflow triage\n")
-    );
+    assert_eq!(triage.mode, crate::session::Mode::Triage);
+    assert!(triage.prompt.starts_with(crate::config::TRIAGE_OBJECTIVE));
     assert_eq!(triage.model, "sonnet");
     assert_eq!(triage.cwd, env.paths.state_dir);
     assert_eq!(
@@ -206,15 +207,9 @@ async fn respects_max_cards_and_skips_in_progress() {
     let (runner, _) = make_runner(&env, session);
     seed_card(&runner, "EX-1", CardStatus::InProgress);
     runner.schedule(TEN_MINUTES, true).await;
-    let mut cards = runner.session().first_lines()[1..].to_vec();
+    let mut cards = runner.session().labels()[1..].to_vec();
     cards.sort();
-    assert_eq!(
-        cards,
-        [
-            "/claude-harness:workflow card EX-2",
-            "/claude-harness:workflow card EX-3"
-        ]
-    );
+    assert_eq!(cards, ["card EX-2", "card EX-3"]);
 }
 
 #[tokio::test]
@@ -222,7 +217,7 @@ async fn failed_triage_reports_failure() {
     let env = test_env();
     let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![fail("budget exceeded")]));
     assert!(runner.triage(vec![]).await.is_none());
-    assert!(lines_of(&lines)[0].contains("triage failed budget exceeded"));
+    assert!(lines_of(&lines)[0].contains("triage api_error budget exceeded"));
 }
 
 #[tokio::test]
@@ -231,16 +226,24 @@ async fn invalid_structured_output_is_a_failure() {
     let session = FakeSession::sequence(vec![ok(json!({"unexpected": true}))]);
     let (runner, lines) = make_runner(&env, session);
     assert!(runner.triage(vec![]).await.is_none());
-    assert!(lines_of(&lines)[0].contains("triage failed invalid triage result"));
+    assert!(lines_of(&lines)[0].contains("triage invalid_output invalid triage result"));
 }
 
-#[tokio::test]
-async fn failed_card_is_marked_failed() {
+#[tokio::test(start_paused = true)]
+async fn a_failed_session_schedules_a_retry() {
     let env = test_env();
     let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![fail("boom")]));
     assert!(runner.run_card("EX-1", None).await.unwrap().is_none());
-    assert_eq!(status_of(&runner, "EX-1"), Some(CardStatus::Failed));
-    assert!(lines_of(&lines)[0].contains("card failed EX-1 — boom"));
+    let card = card_of(&runner, "EX-1");
+    assert_eq!(card.status, CardStatus::Failed);
+    assert_eq!(card.attempts, 1);
+    assert_eq!(card.retry_at, Some(now() + chrono::TimeDelta::minutes(1)));
+    assert!(
+        lines_of(&lines)[0]
+            .contains("card api_error EX-1 cost=$0.05 — boom; retry at 2026-01-15T09:31:00Z"),
+        "{:?}",
+        lines_of(&lines)
+    );
 }
 
 #[tokio::test]
@@ -363,15 +366,411 @@ async fn runner_accepts_default_config() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn heartbeat_releases_cards_left_in_progress() {
+async fn a_card_left_in_progress_is_retried_by_the_runner_not_by_triage() {
     let env = test_env();
+    let kill_switch = env.paths.kill_switch();
     let triage = triage_output(&[("EX-1", &[])]);
-    let session = FakeSession::routed(vec![ok(triage)], |r| ok(card_output(r, "done")));
-    let (runner, _) = make_runner(&env, session);
+    let session = FakeSession::routed(vec![ok(triage)], move |r| {
+        std::fs::write(&kill_switch, "").unwrap();
+        ok(card_output(r, "done"))
+    });
+    let (runner, lines) = make_runner(&env, session);
     seed_card(&runner, "EX-1", CardStatus::InProgress);
-    runner.heartbeat(TEN_MINUTES, true).await;
-    assert!(runner.session().card_call("EX-1").is_some());
+    let start = Instant::now();
+    runner.heartbeat(TEN_MINUTES, false).await;
+    let call = runner.session().card_call("EX-1").unwrap();
+    assert!(
+        call.started - start >= MINUTE,
+        "triage listed it at once, but the crash's retry waits a minute"
+    );
+    assert_eq!(runner.session().labels().len(), 2, "one triage, one card");
     assert_eq!(status_of(&runner, "EX-1"), Some(CardStatus::Done));
+    assert_eq!(
+        card_of(&runner, "EX-1").attempts,
+        0,
+        "done: the run is over"
+    );
+    assert!(
+        lines_of(&lines)[0]
+            .contains("card crash EX-1 — the runner stopped before the session ended; retry at")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn transient_failures_retry_until_max_attempts_then_escalate() {
+    let mut env = test_env();
+    env.config.card.max_attempts = 3;
+    let kill_switch = env.paths.kill_switch();
+    let triage = triage_output(&[("EX-1", &[])]);
+    let count = AtomicUsize::new(0);
+    // Triage lists the card once; every attempt times out; the third triage stops the loop.
+    let session = FakeSession::new(move |request| match request.mode {
+        crate::session::Mode::Card => {
+            ended(crate::session::Ended::Timeout("no result within 3h".into()))
+        }
+        _ => {
+            if count.fetch_add(1, Ordering::SeqCst) == 2 {
+                std::fs::write(&kill_switch, "").unwrap();
+            }
+            ok(triage.clone())
+        }
+    });
+    let (runner, lines) = make_runner(&env, session);
+    runner.heartbeat(TEN_MINUTES, false).await;
+
+    let session = runner.session();
+    let cards: Vec<Instant> = session
+        .calls()
+        .iter()
+        .filter(|c| c.request.mode == crate::session::Mode::Card)
+        .map(|c| c.started)
+        .collect();
+    assert_eq!(cards.len(), 3, "{:?}", session.labels());
+    let gaps: Vec<Duration> = cards.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        gaps[0] >= MINUTE && gaps[0] < MINUTE + KILL_SWITCH_POLL * 2,
+        "{gaps:?}"
+    );
+    assert!(
+        gaps[1] >= MINUTE * 2 && gaps[1] < MINUTE * 2 + KILL_SWITCH_POLL * 2,
+        "{gaps:?}"
+    );
+    let card = card_of(&runner, "EX-1");
+    assert_eq!(card.status, CardStatus::NeedsHuman);
+    assert_eq!(card.reason.as_deref(), Some("max_attempts"));
+    assert_eq!(card.attempts, 3);
+    assert!(
+        lines_of(&lines).iter().any(|l| l.contains(
+            "card timeout EX-1 cost=$0.05 — no result within 3h; needs_human (max_attempts)"
+        )),
+        "{:?}",
+        lines_of(&lines)
+    );
+    // Later triages list it again, but a card that needs a person is not restarted; triage
+    // sees it among its escalations instead.
+    let last_triage = session
+        .calls()
+        .into_iter()
+        .rfind(|c| c.request.mode == crate::session::Mode::Triage)
+        .unwrap();
+    assert_eq!(
+        last_triage.context()["escalations"],
+        json!([{"ref": "EX-1", "reason": "max_attempts", "attempts": 3,
+                "last_summary": "no result within 3h"}])
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_cards_wait_for_triage_and_retries_skip_the_triage_limit() {
+    let mut env = test_env();
+    env.config.triage.max_cards_per_tick = 1;
+    let mut waiting = CardState::new(CardStatus::Failed, now());
+    waiting.attempts = 1;
+    waiting.retry_at = Some(now());
+    waiting.blocked_by = vec!["EXT-1".into()];
+    let triage = triage_output(&[("EX-2", &[])]);
+    let session = FakeSession::routed(vec![ok(triage)], |r| match r {
+        "EX-2" => ok(card_output(r, "blocked")),
+        _ => ok(card_output(r, "done")),
+    });
+    let (runner, _) = make_runner(&env, session);
+    seed(&runner, "EX-1", &waiting);
+    runner.schedule(TEN_MINUTES, true).await;
+    let retried = runner.session().card_call("EX-1").unwrap();
+    assert_eq!(retried.request.mode, crate::session::Mode::Card);
+    assert!(
+        runner.session().card_call("EX-2").is_some(),
+        "not held by the retry"
+    );
+    assert_eq!(status_of(&runner, "EX-1"), Some(CardStatus::Done));
+    let blocked = card_of(&runner, "EX-2");
+    assert_eq!(blocked.status, CardStatus::Blocked);
+    assert_eq!(
+        blocked.retry_at, None,
+        "blocked is never retried by the runner"
+    );
+    assert_eq!(blocked.attempts, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_event_mentioning_a_card_that_needs_a_person_reopens_it() {
+    let env = test_env();
+    let escalated_at = now() - chrono::TimeDelta::hours(1);
+    let mut escalated = CardState::new(CardStatus::NeedsHuman, escalated_at);
+    escalated.attempts = 3;
+    escalated.reason = Some("max_attempts".into());
+    let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![ok(triage_output(&[]))]));
+    for card_ref in ["EX-1", "EX-12", "EX-2", "EX-3"] {
+        seed(&runner, card_ref, &escalated);
+    }
+    let store = env.store();
+    let mut answer = manual_event("1");
+    answer.payload = json!({"body": "EX-1 is unblocked, the decision is made"});
+    store.enqueue("example-app", &answer, now()).unwrap();
+    // The card's own tracker update (the agent's comment, the escalation): not a person.
+    let mut update = manual_event("2");
+    update.kind = crate::intake::EventKind::Work;
+    update.payload = json!({"ref": "EX-2", "title": "Example task"});
+    store.enqueue("example-app", &update, now()).unwrap();
+    // Said before the card stopped: not news.
+    let mut stale = manual_event("3");
+    stale.occurred_at = escalated_at - chrono::TimeDelta::minutes(5);
+    stale.payload = json!({"body": "what about EX-3?"});
+    store.enqueue("example-app", &stale, now()).unwrap();
+    runner.heartbeat(TEN_MINUTES, true).await;
+    let reopened = card_of(&runner, "EX-1");
+    assert_eq!(
+        (reopened.status, reopened.attempts, reopened.reason),
+        (CardStatus::Failed, 0, None)
+    );
+    for card_ref in ["EX-12", "EX-2", "EX-3"] {
+        assert_eq!(
+            status_of(&runner, card_ref),
+            Some(CardStatus::NeedsHuman),
+            "{card_ref}"
+        );
+    }
+    assert!(
+        lines_of(&lines)
+            .iter()
+            .any(|l| l.contains("card reopened EX-1 — a new event mentions it"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_discussion_that_crashes_is_retried_in_a_fresh_session() {
+    let env = test_env();
+    let kill_switch = env.paths.kill_switch();
+    let mut triage = triage_output(&[]);
+    triage["discussions_to_run"] = json!([
+        {"ref": "EX-9", "thread": "https://tracker.example.com/EX-9/c1", "question": "q1"}
+    ]);
+    let attempts = AtomicUsize::new(0);
+    let session = FakeSession::new(move |request| match request.mode {
+        crate::session::Mode::Discussion => {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                ended(crate::session::Ended::Crash(
+                    "no result: exit status: 1".into(),
+                ))
+            } else {
+                std::fs::write(&kill_switch, "").unwrap();
+                ok(discussion_output("EX-9", "replied"))
+            }
+        }
+        _ => ok(triage.clone()),
+    });
+    let (runner, lines) = make_runner(&env, session);
+    runner.heartbeat(Duration::from_secs(3600), false).await;
+    let starts: Vec<Instant> = runner
+        .session()
+        .calls()
+        .iter()
+        .filter(|c| c.request.mode == crate::session::Mode::Discussion)
+        .map(|c| c.started)
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert!(starts[1] - starts[0] >= MINUTE, "after the first backoff");
+    let lines = lines_of(&lines);
+    assert!(
+        lines.iter().any(|l| l
+            .contains("discussion crash EX-9 cost=$0.05 — no result: exit status: 1; retry at")),
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|l| l.contains("discussion replied EX-9")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_that_cannot_start_is_left_to_triage() {
+    let env = test_env();
+    let mut waiting = CardState::new(CardStatus::Failed, now());
+    waiting.attempts = 1;
+    waiting.retry_at = Some(now());
+    let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![ok(triage_output(&[]))]));
+    seed(&runner, "EX-1", &waiting);
+    env.store()
+        .claim("card:EX-1", "other-app", now(), crate::store::CLAIM_LEASE)
+        .unwrap();
+    runner.schedule(TEN_MINUTES, true).await;
+    let skipped = lines_of(&lines)
+        .iter()
+        .filter(|l| l.contains("card skipped EX-1 — held by other-app"))
+        .count();
+    assert_eq!(skipped, 1);
+    let card = card_of(&runner, "EX-1");
+    assert_eq!((card.status, card.retry_at), (CardStatus::Failed, None));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_usage_limit_pauses_every_session_start_and_is_not_a_failure() {
+    let mut env = test_env();
+    env.config.card.max_parallel = 1;
+    env.config.triage.max_cards_per_tick = 5;
+    let kill_switch = env.paths.kill_switch();
+    let triage = triage_output(&[("EX-1", &[]), ("EX-2", &[])]);
+    let tries = AtomicUsize::new(0);
+    // EX-1 hits the limit once; after the pause EX-2 and EX-1's retry finish, then the loop
+    // stops.
+    let session = FakeSession::routed(vec![ok(triage)], move |r| match r {
+        "EX-1" if tries.fetch_add(1, Ordering::SeqCst) == 0 => rate_limited(None),
+        "EX-1" => {
+            std::fs::write(&kill_switch, "").unwrap();
+            ok(card_output(r, "done"))
+        }
+        _ => ok(card_output(r, "done")),
+    });
+    let (runner, lines) = make_runner(&env, session);
+    let start = Instant::now();
+    runner.heartbeat(Duration::from_secs(3600), false).await;
+
+    let session = runner.session();
+    let calls = session.calls();
+    let cards: Vec<(String, Duration)> = calls
+        .iter()
+        .filter(|c| c.request.mode == crate::session::Mode::Card)
+        .map(|c| (c.reference(), c.started - start))
+        .collect();
+    assert_eq!(cards.len(), 3, "{cards:?}");
+    assert_eq!(cards[0], ("EX-1".to_string(), Duration::ZERO));
+    let pause = Duration::from_secs(15 * 60);
+    for (card_ref, at) in &cards[1..] {
+        assert!(
+            *at >= pause && *at < pause + KILL_SWITCH_POLL * 2,
+            "{card_ref} waited out the pause: {cards:?}"
+        );
+    }
+    let lines = lines_of(&lines);
+    assert!(
+        lines.iter().any(|l| l
+            .contains("pause set until 2026-01-15T09:45:00Z — usage or rate limit in card EX-1")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("card rate_limited EX-1")
+            && l.ends_with("retry at 2026-01-15T09:45:00Z")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("pause lifted")),
+        "{lines:?}"
+    );
+    let ex1 = card_of(&runner, "EX-1");
+    assert_eq!(ex1.status, CardStatus::Done);
+    let attempts = runner
+        .store()
+        .attempts(runner.name(), Some("EX-1"), -1)
+        .unwrap();
+    assert_eq!(
+        attempts.last().unwrap().outcome.as_deref(),
+        Some("rate_limited"),
+        "recorded, but not counted as a failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn once_starts_nothing_while_another_runner_has_paused_the_machine() {
+    let env = test_env();
+    let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![]));
+    env.store()
+        .set_pause(
+            now() + chrono::TimeDelta::minutes(15),
+            "usage or rate limit in card EX-9",
+            "other-app",
+            now(),
+        )
+        .unwrap();
+    runner.heartbeat(TEN_MINUTES, true).await;
+    assert!(runner.session().calls().is_empty());
+    let lines = lines_of(&lines);
+    assert!(
+        lines[0].contains("pause waiting until 2026-01-15T09:45:00Z — usage or rate limit in card EX-9 (set by other-app)"),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("triage skipped paused until 2026-01-15T09:45:00Z"));
+}
+
+#[test]
+fn jitter_adds_up_to_half_the_stagger() {
+    let base = Duration::from_secs(30);
+    assert_eq!(jittered(base, 0), base);
+    assert_eq!(jittered(base, 500), Duration::from_secs(45));
+    assert_eq!(jittered(base, 501), base, "wraps");
+    for random in [1, 250, 499, 12_345, u64::MAX] {
+        let delay = jittered(base, random);
+        assert!(delay >= base && delay <= base + base / 2, "{delay:?}");
+    }
+    assert_eq!(jittered(Duration::ZERO, 400), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sessions_start_a_stagger_apart_even_in_once() {
+    let mut env = test_env();
+    env.config.sessions.start_stagger = Duration::from_secs(30);
+    env.config.triage.max_cards_per_tick = 5;
+    env.config.card.max_parallel = 3;
+    let triage = triage_output(&[("EX-1", &[]), ("EX-2", &[])]);
+    let session = FakeSession::routed(vec![ok(triage)], |r| {
+        ok(card_output(r, "done")).after(TEN_MINUTES)
+    });
+    let (runner, _) = make_runner(&env, session);
+    runner.heartbeat(TEN_MINUTES, true).await;
+    let starts: Vec<Instant> = runner.session().calls().iter().map(|c| c.started).collect();
+    assert_eq!(starts.len(), 3, "triage and both cards ran");
+    for gap in starts.windows(2).map(|w| w[1] - w[0]) {
+        let base = Duration::from_secs(30);
+        assert!(
+            gap >= base && gap <= base + base / 2 + Duration::from_millis(5),
+            "{gap:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn once_does_not_wait_out_the_stagger_with_nothing_queued() {
+    let mut env = test_env();
+    env.config.sessions.start_stagger = Duration::from_secs(30);
+    let session = FakeSession::sequence(vec![ok(triage_output(&[])).after(MINUTE / 6)]);
+    let (runner, _) = make_runner(&env, session);
+    let start = Instant::now();
+    runner.heartbeat(TEN_MINUTES, true).await;
+    assert_eq!(start.elapsed(), MINUTE / 6, "exits when triage ends");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_overdue_sweep_waits_out_the_pause_without_spinning() {
+    let env = test_env();
+    let kill_switch = env.paths.kill_switch();
+    // A sweep is due every minute, all through a 15 minute pause set by another runner.
+    let session = FakeSession::new(move |_| {
+        std::fs::write(&kill_switch, "").unwrap();
+        ok(triage_output(&[]))
+    });
+    let (runner, _) = make_runner(&env, session);
+    env.store()
+        .set_pause(
+            now() + chrono::TimeDelta::minutes(15),
+            "usage or rate limit in card EX-9",
+            "other-app",
+            now(),
+        )
+        .unwrap();
+    let start = Instant::now();
+    runner.heartbeat(MINUTE, false).await;
+    let calls = runner.session().calls();
+    assert_eq!(calls.len(), 1);
+    let waited = calls[0].started - start;
+    assert!(
+        waited >= MINUTE * 15 && waited < MINUTE * 15 + KILL_SWITCH_POLL * 2,
+        "{waited:?}"
+    );
+}
+
+#[test]
+fn refs_are_matched_as_whole_tokens() {
+    assert!(mentions_ref("see EX-1.", "EX-1"));
+    assert!(mentions_ref("{\"body\":\"EX-1\"}", "EX-1"));
+    assert!(!mentions_ref("see EX-12", "EX-1"));
+    assert!(!mentions_ref("PREX-1 is done", "EX-1"));
+    assert!(!mentions_ref("anything", ""));
 }
 
 #[tokio::test(start_paused = true)]
@@ -445,9 +844,9 @@ async fn triage_keeps_ticking_while_cards_run() {
         std::fs::write(kill_switch, "").unwrap();
     });
     runner.heartbeat(TEN_MINUTES, false).await;
-    let lines = runner.session().first_lines();
-    let triages = lines.iter().filter(|l| l.ends_with("triage")).count();
-    let cards = lines.iter().filter(|l| l.contains(" card ")).count();
+    let lines = runner.session().labels();
+    let triages = lines.iter().filter(|l| *l == "triage").count();
+    let cards = lines.iter().filter(|l| l.starts_with("card ")).count();
     assert_eq!(triages, 3, "t=0, 10m, 20m while the card runs: {lines:?}");
     assert_eq!(cards, 1);
     assert_eq!(
@@ -477,11 +876,9 @@ async fn stop_terminates_running_cards_and_starts_no_more() {
     assert!(start.elapsed() < TEN_MINUTES);
     assert!(runner.session().card_call("EX-2").is_none());
     assert_eq!(status_of(&runner, "EX-1"), Some(CardStatus::Failed));
-    assert!(
-        lines_of(&lines)
-            .iter()
-            .any(|l| l.contains("card failed EX-1 — terminated"))
-    );
+    assert!(lines_of(&lines).iter().any(|l| l.contains(
+        "card interrupted EX-1 cost=$0.05 — interrupted: dispatch is stopping; retry at"
+    )));
 }
 
 #[tokio::test(start_paused = true)]
@@ -651,16 +1048,16 @@ async fn discussions_share_max_parallel_with_cards() {
 
     let session = runner.session();
     assert_eq!(session.max_active.load(Ordering::SeqCst), 1);
-    let firsts = session.first_lines();
+    let firsts = session.labels();
     assert_eq!(
-        firsts.iter().filter(|l| l.contains(" discussion ")).count(),
+        firsts
+            .iter()
+            .filter(|l| l.starts_with("discussion "))
+            .count(),
         1,
         "deduplicated by claim key: {firsts:?}"
     );
-    assert_eq!(
-        firsts[1], "/claude-harness:workflow discussion EX-9",
-        "discussions first"
-    );
+    assert_eq!(firsts[1], "discussion EX-9", "discussions first");
     let triage_at = session.calls()[0].started;
     assert_eq!(session.card_call("EX-1").unwrap().started, triage_at);
     assert_eq!(

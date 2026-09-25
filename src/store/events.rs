@@ -84,10 +84,15 @@ impl Store {
     }
 
     pub fn new_event_count(&self, runner: &str) -> Result<i64> {
+        self.event_count(runner, "new")
+    }
+
+    /// This runner's events in `status` (`new`, `batched` or `done`).
+    pub fn event_count(&self, runner: &str, status: &str) -> Result<i64> {
         self.read(|c| {
             c.query_row(
-                "SELECT COUNT(*) FROM events WHERE runner = ?1 AND status = 'new'",
-                [runner],
+                "SELECT COUNT(*) FROM events WHERE runner = ?1 AND status = ?2",
+                [runner, status],
                 |row| row.get(0),
             )
         })
@@ -200,7 +205,7 @@ mod tests {
     #[test]
     fn two_runners_contending_for_one_event_store_it_once() {
         let (dir, _store) = temp_store();
-        let path = dir.path().join("nested/harness.db");
+        let path = dir.path().join("nested/dispatch.db");
         let threads: Vec<_> = ["alpha", "beta", "alpha", "beta"]
             .into_iter()
             .map(|runner| {

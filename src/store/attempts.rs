@@ -1,0 +1,391 @@
+//! Session attempts: one row per triage, card or discussion session, opened when it starts
+//! and closed with its outcome. `dispatch status` and `dispatch history` read them.
+
+use std::path::Path;
+
+use chrono::{DateTime, Utc};
+use rusqlite::{Row, params};
+
+use super::{Result, Store, iso, parse_time};
+use crate::outcome::{Outcome, Prior};
+
+/// A recorded session attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attempt {
+    pub id: i64,
+    pub mode: String,
+    /// Card or discussion ref; empty for triage.
+    pub reference: String,
+    /// 1-based, per runner, mode and ref.
+    pub attempt: u32,
+    /// Where the session ran; `claude --resume <session_id>` works from there.
+    pub cwd: String,
+    pub started_at: DateTime<Utc>,
+    /// `None` while the session runs.
+    pub ended_at: Option<DateTime<Utc>>,
+    pub outcome: Option<String>,
+    pub summary: Option<String>,
+    pub blocked_on: Option<String>,
+    pub session_id: Option<String>,
+    pub cost_usd: Option<f64>,
+    /// Commits the attempt added to its worktree's HEAD; `None` without a worktree.
+    pub new_commits: Option<u32>,
+}
+
+/// How an attempt ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttemptEnd {
+    pub outcome: String,
+    pub summary: String,
+    pub blocked_on: Option<String>,
+    pub session_id: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub new_commits: Option<u32>,
+    pub ended_at: DateTime<Utc>,
+}
+
+const COLUMNS: &str = "id, mode, ref, attempt, cwd, started_at, ended_at, outcome, summary, \
+                       blocked_on, session_id, cost_usd, new_commits";
+
+fn attempt_from(row: &Row<'_>) -> rusqlite::Result<Attempt> {
+    let started_at: String = row.get(5)?;
+    let ended_at: Option<String> = row.get(6)?;
+    Ok(Attempt {
+        id: row.get(0)?,
+        mode: row.get(1)?,
+        reference: row.get(2)?,
+        attempt: row.get(3)?,
+        cwd: row.get(4)?,
+        started_at: parse_time(&started_at)?,
+        ended_at: ended_at.as_deref().map(parse_time).transpose()?,
+        outcome: row.get(7)?,
+        summary: row.get(8)?,
+        blocked_on: row.get(9)?,
+        session_id: row.get(10)?,
+        cost_usd: row.get(11)?,
+        new_commits: row.get(12)?,
+    })
+}
+
+impl Store {
+    /// Open an attempt row as a session starts; returns its id and attempt number.
+    pub fn begin_attempt(
+        &self,
+        runner: &str,
+        mode: &str,
+        reference: &str,
+        cwd: &Path,
+        now: DateTime<Utc>,
+    ) -> Result<(i64, u32)> {
+        self.write(true, |tx| {
+            let attempt: u32 = tx.query_row(
+                "SELECT COALESCE(MAX(attempt), 0) + 1 FROM attempts
+                 WHERE runner = ?1 AND mode = ?2 AND ref = ?3",
+                params![runner, mode, reference],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO attempts (runner, mode, ref, attempt, cwd, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    runner,
+                    mode,
+                    reference,
+                    attempt,
+                    cwd.display().to_string(),
+                    iso(now)
+                ],
+            )?;
+            Ok((tx.last_insert_rowid(), attempt))
+        })
+    }
+
+    /// Record the session id as soon as the stream names it, so a running or crashed session
+    /// can be resumed.
+    pub fn set_attempt_session(&self, id: i64, session_id: &str) -> Result<()> {
+        self.write(false, |tx| {
+            tx.execute(
+                "UPDATE attempts SET session_id = ?2 WHERE id = ?1",
+                params![id, session_id],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn end_attempt(&self, id: i64, end: &AttemptEnd) -> Result<()> {
+        self.write(false, |tx| {
+            tx.execute(
+                "UPDATE attempts SET ended_at = ?2, outcome = ?3, summary = ?4, blocked_on = ?5,
+                     session_id = COALESCE(?6, session_id), cost_usd = ?7, new_commits = ?8
+                 WHERE id = ?1",
+                params![
+                    id,
+                    iso(end.ended_at),
+                    end.outcome,
+                    end.summary,
+                    end.blocked_on,
+                    end.session_id,
+                    end.cost_usd,
+                    end.new_commits
+                ],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Newest first: this runner's attempts, only those of `reference` when given; a negative
+    /// `limit` returns them all.
+    pub fn attempts(
+        &self,
+        runner: &str,
+        reference: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Attempt>> {
+        self.read(|c| {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM attempts WHERE runner = ?1 AND (?2 IS NULL OR ref = ?2)
+                 ORDER BY id DESC LIMIT ?3"
+            );
+            let mut statement = c.prepare(&sql)?;
+            statement
+                .query_map(params![runner, reference, limit], attempt_from)?
+                .collect()
+        })
+    }
+
+    /// The last `limit` card attempts of `card_ref` that ended, oldest first.
+    pub fn recent_card_attempts(
+        &self,
+        runner: &str,
+        card_ref: &str,
+        limit: i64,
+    ) -> Result<Vec<Attempt>> {
+        let mut attempts = self.read(|c| {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM attempts
+                 WHERE runner = ?1 AND mode = 'card' AND ref = ?2 AND ended_at IS NOT NULL
+                 ORDER BY id DESC LIMIT ?3"
+            );
+            let mut statement = c.prepare(&sql)?;
+            statement
+                .query_map(params![runner, card_ref, limit], attempt_from)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        attempts.reverse();
+        Ok(attempts)
+    }
+
+    /// The counted card attempts of the current run (at most the last `run` counted ones
+    /// before attempt `before`, when given, and none from before the card was last done),
+    /// newest first: what the retry rules look back on.
+    pub fn card_chain(
+        &self,
+        runner: &str,
+        card_ref: &str,
+        before: Option<i64>,
+        run: u32,
+    ) -> Result<Vec<Prior>> {
+        let rows: Vec<(String, Option<u32>)> = self.read(|c| {
+            let mut statement = c.prepare(
+                "SELECT outcome, new_commits FROM attempts
+                 WHERE runner = ?1 AND mode = 'card' AND ref = ?2 AND outcome IS NOT NULL
+                     AND (?3 IS NULL OR id < ?3)
+                 ORDER BY id DESC",
+            )?;
+            statement
+                .query_map(params![runner, card_ref, before], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect()
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(text, new_commits)| {
+                Outcome::parse(&text).map(|outcome| Prior {
+                    outcome,
+                    new_commits,
+                })
+            })
+            .take_while(|prior| !prior.outcome.is_finished())
+            .filter(|prior| prior.outcome.counts())
+            .take(usize::try_from(run).unwrap_or(usize::MAX))
+            .collect())
+    }
+
+    /// This runner's attempts that have not ended, oldest first.
+    pub fn open_attempts(&self, runner: &str) -> Result<Vec<Attempt>> {
+        self.read(|c| {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM attempts WHERE runner = ?1 AND ended_at IS NULL ORDER BY id"
+            );
+            let mut statement = c.prepare(&sql)?;
+            statement.query_map([runner], attempt_from)?.collect()
+        })
+    }
+
+    /// At startup (under the instance lock): attempts a stopped process left open are closed.
+    pub fn close_open_attempts(
+        &self,
+        runner: &str,
+        outcome: &str,
+        summary: &str,
+        now: DateTime<Utc>,
+    ) -> Result<usize> {
+        self.write(false, |tx| {
+            tx.execute(
+                "UPDATE attempts SET ended_at = ?2, outcome = ?3, summary = ?4
+                 WHERE runner = ?1 AND ended_at IS NULL",
+                params![runner, iso(now), outcome, summary],
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::tests::temp_store;
+    use crate::testing::now;
+
+    fn end(outcome: &str) -> AttemptEnd {
+        AttemptEnd {
+            outcome: outcome.into(),
+            summary: format!("{outcome} summary"),
+            blocked_on: None,
+            session_id: Some("session-1".into()),
+            cost_usd: Some(0.25),
+            new_commits: Some(1),
+            ended_at: now(),
+        }
+    }
+
+    #[test]
+    fn attempts_are_numbered_per_runner_mode_and_ref() {
+        let (_dir, store) = temp_store();
+        let cwd = Path::new("/tmp/example/worktree");
+        assert_eq!(
+            store
+                .begin_attempt("alpha", "card", "EX-1", cwd, now())
+                .unwrap()
+                .1,
+            1
+        );
+        let (second, number) = store
+            .begin_attempt("alpha", "card", "EX-1", cwd, now())
+            .unwrap();
+        assert_eq!(number, 2);
+        let other = [
+            ("beta", "card", "EX-1"),
+            ("alpha", "discussion", "EX-1"),
+            ("alpha", "card", "EX-2"),
+            ("alpha", "triage", ""),
+        ];
+        for (runner, mode, reference) in other {
+            let (_, number) = store
+                .begin_attempt(runner, mode, reference, cwd, now())
+                .unwrap();
+            assert_eq!(number, 1, "{runner} {mode} {reference}");
+        }
+
+        store.end_attempt(second, &end("done")).unwrap();
+        let ex1 = store.attempts("alpha", Some("EX-1"), -1).unwrap();
+        assert_eq!(ex1.len(), 3, "both card attempts and the discussion");
+        let latest = ex1
+            .iter()
+            .find(|a| a.id == second)
+            .expect("second attempt listed");
+        assert_eq!(latest.outcome.as_deref(), Some("done"));
+        assert_eq!(latest.session_id.as_deref(), Some("session-1"));
+        assert_eq!(latest.cost_usd, Some(0.25));
+        assert_eq!(latest.new_commits, Some(1));
+        assert_eq!(latest.cwd, "/tmp/example/worktree");
+        assert_eq!(ex1[0].mode, "discussion", "newest first");
+        assert_eq!(store.attempts("alpha", None, 2).unwrap().len(), 2);
+        assert_eq!(store.attempts("alpha", None, -1).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn the_chain_is_the_counted_attempts_of_the_current_run() {
+        let (_dir, store) = temp_store();
+        let cwd = Path::new("/tmp/example");
+        let mut ids = Vec::new();
+        for outcome in ["done", "timeout", "interrupted", "failed", "crash"] {
+            let (id, _) = store
+                .begin_attempt("alpha", "card", "EX-1", cwd, now())
+                .unwrap();
+            store.end_attempt(id, &end(outcome)).unwrap();
+            ids.push(id);
+        }
+        store
+            .begin_attempt("alpha", "discussion", "EX-1", cwd, now())
+            .unwrap();
+        let outcomes =
+            |chain: Vec<Prior>| -> Vec<Outcome> { chain.into_iter().map(|p| p.outcome).collect() };
+        assert_eq!(
+            outcomes(store.card_chain("alpha", "EX-1", None, 3).unwrap()),
+            [Outcome::Crash, Outcome::Failed, Outcome::Timeout],
+            "interruptions are not counted; the run is three long"
+        );
+        assert_eq!(
+            outcomes(store.card_chain("alpha", "EX-1", Some(ids[4]), 1).unwrap()),
+            [Outcome::Failed],
+            "before the current attempt"
+        );
+        assert_eq!(
+            outcomes(store.card_chain("alpha", "EX-1", None, 9).unwrap()),
+            [Outcome::Crash, Outcome::Failed, Outcome::Timeout],
+            "never past the last done, whatever the count says"
+        );
+        assert!(
+            store
+                .card_chain("alpha", "EX-1", None, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .card_chain("beta", "EX-1", None, 3)
+                .unwrap()
+                .is_empty()
+        );
+
+        let recent = store.recent_card_attempts("alpha", "EX-1", 3).unwrap();
+        let outcomes: Vec<&str> = recent.iter().filter_map(|a| a.outcome.as_deref()).collect();
+        assert_eq!(
+            outcomes,
+            ["interrupted", "failed", "crash"],
+            "oldest first; the open discussion is not a card attempt"
+        );
+    }
+
+    #[test]
+    fn open_attempts_are_closed_at_startup() {
+        let (_dir, store) = temp_store();
+        let cwd = Path::new("/tmp/example");
+        let (open, _) = store
+            .begin_attempt("alpha", "card", "EX-1", cwd, now())
+            .unwrap();
+        let (ended, _) = store
+            .begin_attempt("alpha", "card", "EX-2", cwd, now())
+            .unwrap();
+        store.end_attempt(ended, &end("blocked")).unwrap();
+        store
+            .begin_attempt("beta", "card", "EX-3", cwd, now())
+            .unwrap();
+        store.set_attempt_session(open, "session-9").unwrap();
+        let running = store.open_attempts("alpha").unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, open);
+        assert_eq!(running[0].ended_at, None);
+        assert_eq!(running[0].session_id.as_deref(), Some("session-9"));
+
+        let closed = store
+            .close_open_attempts("alpha", "crash", "runner stopped", now())
+            .unwrap();
+        assert_eq!(closed, 1);
+        assert!(store.open_attempts("alpha").unwrap().is_empty());
+        assert_eq!(store.open_attempts("beta").unwrap().len(), 1, "untouched");
+        let listed = store.attempts("alpha", Some("EX-1"), -1).unwrap();
+        assert_eq!(listed[0].outcome.as_deref(), Some("crash"));
+    }
+}

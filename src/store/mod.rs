@@ -1,4 +1,4 @@
-//! `harness.db`: the machine-wide SQLite store shared by every runner (events, claims,
+//! `dispatch.db`: the machine-wide SQLite store shared by every runner (events, claims,
 //! cards, cursors). One connection per process, used from the blocking pool.
 
 use std::path::{Path, PathBuf};
@@ -8,16 +8,20 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
+mod attempts;
 mod cards;
 mod claims;
 mod events;
+mod pause;
 mod schema;
 
+pub use attempts::{Attempt, AttemptEnd};
 pub use claims::{CLAIM_LEASE, CLAIM_RENEW, Claim};
 pub use events::Enqueued;
+pub use pause::Pause;
 
-pub const DB_ENV: &str = "HARNESS_DB";
-pub const DEFAULT_DB: &str = "~/.local/state/claude-harness/harness.db";
+pub const DB_ENV: &str = "DISPATCH_DB";
+pub const DEFAULT_DB: &str = "~/.local/state/dispatch/dispatch.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +66,37 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(fail)?;
         migrate(&mut conn).map_err(fail)?;
+        Ok(Store {
+            path: path.to_path_buf(),
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Read-only (`status`, `history`): never creates or migrates the file, and refuses one
+    /// whose schema is not the one this binary writes.
+    pub fn open_read_only(path: &Path) -> Result<Store> {
+        let fail = |source| StoreError::Sqlite {
+            path: path.display().to_string(),
+            source,
+        };
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags).map_err(fail)?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(fail)?;
+        let version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(fail)?;
+        let expected = i64::try_from(schema::MIGRATIONS.len()).unwrap_or(i64::MAX);
+        if version != expected {
+            return Err(StoreError::Invalid(format!(
+                "{}: schema version {version}, this dispatch reads {expected}; \
+                 run `dispatch heartbeat` once to migrate",
+                path.display()
+            )));
+        }
         Ok(Store {
             path: path.to_path_buf(),
             conn: Arc::new(Mutex::new(conn)),
@@ -163,7 +198,7 @@ pub(crate) mod tests {
 
     pub(crate) fn temp_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("nested/harness.db")).unwrap();
+        let store = Store::open(&dir.path().join("nested/dispatch.db")).unwrap();
         (dir, store)
     }
 
@@ -175,14 +210,33 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(mode, "wal");
         drop(store);
-        let again = Store::open(&dir.path().join("nested/harness.db")).unwrap();
+        let again = Store::open(&dir.path().join("nested/dispatch.db")).unwrap();
         let versions: Vec<i64> = again
             .read(|c| {
                 let mut statement = c.prepare("SELECT version FROM schema_version")?;
                 statement.query_map([], |r| r.get(0))?.collect()
             })
             .unwrap();
-        assert_eq!(versions, [1]);
+        assert_eq!(versions, [1, 2]);
+    }
+
+    #[test]
+    fn read_only_store_never_creates_or_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dispatch.db");
+        assert!(Store::open_read_only(&path).is_err());
+        assert!(!path.exists(), "not created");
+        let store = Store::open(&path).unwrap();
+        store
+            .claim("card:EX-1", "alpha", crate::testing::now(), CLAIM_LEASE)
+            .unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+        assert!(reader.release_all("alpha").is_err(), "writes are refused");
+        let raw = Connection::open(&path).unwrap();
+        raw.execute("INSERT INTO schema_version (version) VALUES (99)", [])
+            .unwrap();
+        let error = Store::open_read_only(&path).unwrap_err().to_string();
+        assert!(error.contains("schema version 99"), "{error}");
     }
 
     #[test]

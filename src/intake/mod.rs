@@ -1,5 +1,5 @@
 //! Event intake: independent sources (macOS notifications, Linear, Jira) that store events in
-//! `harness.db`, where the dispatcher batches them into triage sessions. Each source is its
+//! `dispatch.db`, where the coordinator batches them into triage sessions. Each source is its
 //! own tokio task with its own backoff; one failing never stops the others.
 
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub struct IntakeContext {
     pub env: EnvLookup,
     pub clock: Clock,
     pub out: Output,
-    /// Wakes the dispatcher when new events are stored.
+    /// Wakes the coordinator when new events are stored.
     pub wake: Arc<Notify>,
 }
 

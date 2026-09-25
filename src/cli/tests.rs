@@ -2,7 +2,7 @@ use super::*;
 use crate::testing::*;
 
 fn argv(env: &TestEnv, args: &[&str]) -> Vec<OsString> {
-    let mut all: Vec<OsString> = vec!["harness".into(), "--config".into()];
+    let mut all: Vec<OsString> = vec!["dispatch".into(), "--config".into()];
     all.push(env.paths.config.clone().into());
     all.extend(args.iter().map(OsString::from));
     all
@@ -25,9 +25,9 @@ impl Session for SharedSession {
     async fn run(
         &self,
         request: crate::session::SessionRequest,
-        shutdown: watch::Receiver<Shutdown>,
-    ) -> Result<crate::session::SessionOutcome, crate::session::SessionError> {
-        self.0.run(request, shutdown).await
+        control: crate::session::Control,
+    ) -> crate::session::SessionReport {
+        self.0.run(request, control).await
     }
 }
 
@@ -43,12 +43,24 @@ async fn check_reports_paths() {
 }
 
 #[tokio::test]
-async fn check_fails_without_plugin() {
+async fn check_fails_when_the_configured_plugin_is_missing() {
     let env = test_env();
     assert_eq!(
         run_with(&env, &["check"], no_session()).await.0,
         EXIT_FAILED
     );
+}
+
+#[test]
+fn plugin_is_optional() {
+    let dir = tempfile::tempdir().unwrap();
+    let (none, ok) = plugin_report(None);
+    assert!(ok && none.starts_with("none"), "{none}");
+    let (missing, ok) = plugin_report(Some(dir.path()));
+    assert!(!ok && missing.contains("MISSING"), "{missing}");
+    write_plugin(dir.path());
+    let (present, ok) = plugin_report(Some(&dir.path().join("plugin")));
+    assert!(ok && present.ends_with("(ok)"), "{present}");
 }
 
 #[tokio::test]
@@ -87,7 +99,7 @@ async fn stop_and_resume() {
 #[tokio::test]
 async fn config_from_env() {
     let env = test_env();
-    let args = ["harness", "stop"].map(OsString::from);
+    let args = ["dispatch", "stop"].map(OsString::from);
     let paths = EnvPaths {
         config: Some(env.paths.config.display().to_string()),
         ..env.env_paths()
@@ -102,10 +114,7 @@ async fn card_command() {
     let session = FakeSession::sequence(vec![ok(card_output("EX-1", "done"))]);
     let (code, session) = run_with(&env, &["card", "EX-1"], session).await;
     assert_eq!(code, EXIT_OK);
-    assert_eq!(
-        session.first_lines(),
-        ["/claude-harness:workflow card EX-1"]
-    );
+    assert_eq!(session.labels(), ["card EX-1"]);
 }
 
 #[tokio::test]
@@ -169,7 +178,7 @@ async fn heartbeat_once() {
     let args = ["heartbeat", "--once", "--interval", "1m"];
     let (code, session) = run_with(&env, &args, session).await;
     assert_eq!(code, EXIT_OK);
-    assert_eq!(session.first_lines(), ["/claude-harness:workflow triage"]);
+    assert_eq!(session.labels(), ["triage"]);
 }
 
 #[tokio::test]
@@ -195,22 +204,44 @@ async fn enqueued_event_reaches_the_next_triage() {
 }
 
 #[tokio::test]
-async fn state_json_is_imported_once() {
+async fn card_refuses_while_the_machine_is_paused() {
     let env = test_env();
-    std::fs::create_dir_all(&env.paths.state_dir).unwrap();
-    let legacy = env.paths.legacy_state_file();
-    std::fs::write(
-        &legacy,
-        r#"{"cursors": {"slack:C0000000001": "c1"}, "cards": {}}"#,
-    )
-    .unwrap();
-    let session = FakeSession::sequence(vec![ok(triage_output(&[]))]);
-    let (code, session) = run_with(&env, &["heartbeat", "--once"], session).await;
-    assert_eq!(code, EXIT_OK);
-    assert!(!legacy.exists());
-    assert!(env.paths.state_dir.join("state.json.migrated").is_file());
-    let context = crate::prompts::context_of(&session.calls()[0].request.prompt);
-    assert_eq!(context["cursors"]["slack:C0000000001"], "c1");
+    let later = chrono::Utc::now() + chrono::TimeDelta::minutes(15);
+    Store::open(&env.paths.db)
+        .unwrap()
+        .set_pause(
+            later,
+            "usage or rate limit in card EX-9",
+            "other-app",
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    let (code, session) = run_with(&env, &["card", "EX-1"], no_session()).await;
+    assert_eq!(code, EXIT_FAILED);
+    assert!(session.calls().is_empty());
+}
+
+#[tokio::test]
+async fn status_and_history_are_read_only() {
+    let env = test_env();
+    for args in [&["status"][..], &["history"], &["history", "EX-1"]] {
+        assert_eq!(run_with(&env, args, no_session()).await.0, EXIT_OK);
+    }
+    assert!(!env.paths.db.exists(), "never created by a view");
+
+    let done = FakeSession::sequence(vec![ok(card_output("EX-1", "done"))]);
+    assert_eq!(run_with(&env, &["card", "EX-1"], done).await.0, EXIT_OK);
+    let modified = || {
+        std::fs::metadata(&env.paths.db)
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
+    let before = modified();
+    for args in [&["status"][..], &["history"], &["history", "EX-1"]] {
+        assert_eq!(run_with(&env, args, no_session()).await.0, EXIT_OK);
+    }
+    assert_eq!(modified(), before);
 }
 
 #[tokio::test]

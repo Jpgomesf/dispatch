@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use crate::config::expand_user;
 
-pub const SECRETS_ENV: &str = "HARNESS_SECRETS";
-pub const DEFAULT_SECRETS: &str = "~/.config/claude-harness/secrets.env";
+pub const SECRETS_ENV: &str = "DISPATCH_SECRETS";
+pub const DEFAULT_SECRETS: &str = "~/.config/dispatch/secrets.env";
 
 /// Environment lookup, injectable so tests never touch the process environment.
 pub type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -20,7 +20,7 @@ pub fn process_env() -> EnvLookup {
     Arc::new(|name| std::env::var(name).ok().filter(|v| !v.is_empty()))
 }
 
-/// `$HARNESS_SECRETS`, else `~/.config/claude-harness/secrets.env`.
+/// `$DISPATCH_SECRETS`, else `~/.config/dispatch/secrets.env`.
 #[must_use]
 pub fn secrets_path(env_value: Option<&str>) -> PathBuf {
     match env_value {

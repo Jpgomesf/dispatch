@@ -14,6 +14,7 @@ use crate::durations::parse_duration;
 use crate::intake::secrets::{FileStatus, Secrets, process_env};
 use crate::intake::{EventKind, IncomingEvent, SourceKind, notifications, required_keys};
 use crate::paths::{EnvPaths, Paths, resolve_config_path};
+use crate::report;
 use crate::results::CardOutcome;
 use crate::runner::Runner;
 use crate::session::{Session, Shutdown};
@@ -25,9 +26,9 @@ pub const EXIT_FAILED: i32 = 1;
 pub const EXIT_BAD_CONFIG: i32 = 2;
 
 #[derive(Debug, Parser)]
-#[command(name = "harness", about = "claude-harness runner", version)]
+#[command(name = "dispatch", about = "dispatch runner", version)]
 struct Cli {
-    /// config.toml path (default: $HARNESS_CONFIG or ~/.config/claude-harness/config.toml)
+    /// config.toml path (default: $DISPATCH_CONFIG or ~/.config/dispatch/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -67,6 +68,14 @@ enum Command {
     Resume,
     /// Validate config, print resolved paths and which sources have their keys
     Check,
+    /// This runner's running sessions, queued events, cards and claims (read-only)
+    Status,
+    /// Session attempts with outcome, times, cost and how to resume each (read-only)
+    History {
+        /// Only this card or discussion ref (default: the last 20 attempts)
+        #[arg(value_name = "REF")]
+        card_ref: Option<String>,
+    },
 }
 
 /// Parse `argv`, run the command and return the process exit code.
@@ -94,6 +103,17 @@ pub async fn run<S: Session>(
     let paths = Paths::resolve(&config_path, &config, &env);
     match cli.command {
         Command::Check => cmd_check(&paths, &config),
+        Command::Status => cmd_view(&paths, |store| {
+            report::status_lines(
+                store,
+                &paths.runner,
+                paths.kill_switch().exists(),
+                Utc::now(),
+            )
+        }),
+        Command::History { card_ref } => cmd_view(&paths, |store| {
+            report::history_lines(store, &paths.runner, card_ref.as_deref())
+        }),
         Command::Stop => cmd_stop(&paths),
         Command::Resume => cmd_resume(&paths),
         Command::Enqueue { source, text } => cmd_enqueue(&paths, &config, &source, &text).await,
@@ -121,14 +141,14 @@ pub async fn run<S: Session>(
 }
 
 /// Only one session-running process per runner name (held until the caller drops it), then
-/// the shared store, importing this runner's phase 1 `state.json` once.
+/// the shared store.
 fn open_runner(paths: &Paths) -> Result<(InstanceLock, Store), ()> {
     let lock_file = paths.instance_lock_file();
     let instance = match InstanceLock::try_acquire(&lock_file) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
             eprintln!(
-                "another harness heartbeat or card run holds {}; not starting",
+                "another dispatch heartbeat or card run holds {}; not starting",
                 lock_file.display()
             );
             return Err(());
@@ -139,26 +159,33 @@ fn open_runner(paths: &Paths) -> Result<(InstanceLock, Store), ()> {
         }
     };
     let store = open_store(paths)?;
-    match store.import_state_file(&paths.runner, &paths.legacy_state_file()) {
-        Ok(Some(migrated)) => println!(
-            "imported state into {}; kept {}",
-            paths.db.display(),
-            migrated.display()
-        ),
-        Ok(None) => {}
-        Err(error) => {
-            eprintln!(
-                "cannot import {}: {error}",
-                paths.legacy_state_file().display()
-            );
-            return Err(());
-        }
-    }
     Ok((instance, store))
 }
 
 fn open_store(paths: &Paths) -> Result<Store, ()> {
     Store::open(&paths.db).map_err(|error| eprintln!("cannot open store: {error}"))
+}
+
+/// `status` and `history`: print lines built from a read-only store; takes no lock and never
+/// creates the store.
+fn cmd_view(paths: &Paths, lines: impl FnOnce(&Store) -> crate::store::Result<Vec<String>>) -> i32 {
+    if !paths.db.exists() {
+        println!("store:        {} (not created yet)", paths.db.display());
+        return EXIT_OK;
+    }
+    let viewed = Store::open_read_only(&paths.db).and_then(|store| lines(&store));
+    match viewed {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("cannot read store: {error}");
+            EXIT_FAILED
+        }
+    }
 }
 
 fn load(path: &Path, allow_missing: bool) -> Result<Config, String> {
@@ -168,20 +195,30 @@ fn load(path: &Path, allow_missing: bool) -> Result<Config, String> {
     load_config(path)
 }
 
+/// Which plugin sessions load, and whether a plugin dir that is set actually holds a plugin.
+/// No plugin dir is fine: the user's own skills and plugins load either way.
+fn plugin_report(plugin_dir: Option<&Path>) -> (String, bool) {
+    match plugin_dir {
+        None => (
+            "none (no plugin_dir in config and no plugin/ in the build checkout)".into(),
+            true,
+        ),
+        Some(dir) if dir.join(".claude-plugin/plugin.json").is_file() => {
+            (format!("{} (ok)", dir.display()), true)
+        }
+        Some(dir) => (
+            format!("{} (MISSING .claude-plugin/plugin.json)", dir.display()),
+            false,
+        ),
+    }
+}
+
 fn cmd_check(paths: &Paths, config: &Config) -> i32 {
-    let plugin_ok = paths
-        .plugin_dir
-        .join(".claude-plugin/plugin.json")
-        .is_file();
+    let (plugin, plugin_ok) = plugin_report(paths.plugin_dir.as_deref());
     let kill = if paths.kill_switch().exists() {
         "SET"
     } else {
         "off"
-    };
-    let plugin = if plugin_ok {
-        "ok"
-    } else {
-        "MISSING plugin.json"
     };
     // `check` changes nothing: a store that does not exist yet is created by the first run.
     let store = if !paths.db.exists() {
@@ -209,7 +246,16 @@ fn cmd_check(paths: &Paths, config: &Config) -> i32 {
     println!("kill switch:  {} ({kill})", paths.kill_switch().display());
     println!("outreach:     {}", paths.outreach_file.display());
     println!("worktrees:    {}", paths.worktrees_dir().display());
-    println!("plugin dir:   {} ({plugin})", paths.plugin_dir.display());
+    println!("plugin dir:   {plugin}");
+    let required = &config.sessions.required_mcp;
+    println!(
+        "required mcp: {}",
+        if required.is_empty() {
+            "none".to_string()
+        } else {
+            required.join(", ")
+        }
+    );
     for kind in SourceKind::enabled(&config.intake) {
         println!(
             "source:       {} ({})",
@@ -321,6 +367,15 @@ async fn cmd_card<S: Session>(runner: Runner<S>, card_ref: &str, workspace: Opti
     }
     install_signal_handlers(runner.shutdown_handle());
     runner.recover().await;
+    if let Some(pause) = runner.paused().await {
+        eprintln!(
+            "paused until {} ({}, set by {}); not starting",
+            pause.until.format("%Y-%m-%dT%H:%M:%SZ"),
+            pause.reason,
+            pause.runner
+        );
+        return EXIT_FAILED;
+    }
     match runner.run_card(card_ref, workspace).await {
         Err(error) => {
             eprintln!("{error}");
@@ -331,8 +386,8 @@ async fn cmd_card<S: Session>(runner: Runner<S>, card_ref: &str, workspace: Opti
     }
 }
 
-/// First SIGINT/SIGTERM: start nothing new and SIGTERM running sessions. Second: SIGKILL
-/// them. Third: exit immediately.
+/// First SIGINT/SIGTERM: start nothing new and end running sessions with the stop sequence
+/// (SIGINT, SIGTERM, SIGKILL). Second: SIGKILL them. Third: exit immediately.
 fn install_signal_handlers(shutdown: Arc<watch::Sender<Shutdown>>) {
     let (Ok(mut interrupt), Ok(mut terminate)) = (
         signal(SignalKind::interrupt()),

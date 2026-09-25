@@ -8,10 +8,23 @@ use crate::config::{Config, SourcesConfig, Workspace};
 use crate::intake::Event;
 use crate::paths::Paths;
 use crate::results::DiscussionToRun;
+use crate::store::Attempt;
 
-pub const WORKFLOW_COMMAND: &str = "/claude-harness:workflow";
+/// How many earlier attempts a card session sees.
+pub const PREVIOUS_ATTEMPTS: i64 = 3;
+
 /// Cursor keys the runner's own pollers use; never shown to the skill.
 pub const INTAKE_CURSOR_PREFIX: &str = "intake:";
+
+/// Appended to Claude Code's system prompt in every session (`--append-system-prompt`). Fixed
+/// and short on purpose: how the work gets done is Claude's call, with the user's own skills.
+pub const RUNNER_RULES: &str = "You are running under dispatch, unattended. These are its \
+only non-negotiable rules; everything else is yours to decide with the user's skills and \
+settings.
+- Return your result as the JSON the output schema requires.
+- Discussion sessions never create branches, commit, push or open pull requests.
+- Only work cards assigned to the user.
+- Nobody can answer questions during this session: decide, or report the work blocked.";
 
 #[derive(Serialize)]
 struct WorkspaceContext<'a> {
@@ -31,6 +44,18 @@ impl<'a> WorkspaceContext<'a> {
     }
 }
 
+/// A card waiting for a person (`needs_human`): shown to triage so it can escalate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Escalation {
+    #[serde(rename = "ref")]
+    pub card_ref: String,
+    /// `max_attempts`, `no_progress`, `failed` or `environment`.
+    pub reason: String,
+    /// Counted attempts in the run that ended here.
+    pub attempts: u32,
+    pub last_summary: Option<String>,
+}
+
 #[derive(Serialize)]
 struct TriageContext<'a> {
     now: String,
@@ -41,6 +66,33 @@ struct TriageContext<'a> {
     outreach_file: String,
     /// Empty: a fallback sweep.
     events: &'a [Event],
+    escalations: &'a [Escalation],
+}
+
+/// An earlier attempt at the card, so a fresh session starts from what was learned rather
+/// than from a resumed transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviousAttempt {
+    pub attempt: u32,
+    pub outcome: String,
+    pub summary: Option<String>,
+    pub blocked_on: Option<String>,
+    pub session_id: Option<String>,
+    /// Commits it added to the worktree's HEAD; `null` when the card has no worktree.
+    pub new_commits: Option<u32>,
+}
+
+impl From<&Attempt> for PreviousAttempt {
+    fn from(attempt: &Attempt) -> Self {
+        PreviousAttempt {
+            attempt: attempt.attempt,
+            outcome: attempt.outcome.clone().unwrap_or_default(),
+            summary: attempt.summary.clone(),
+            blocked_on: attempt.blocked_on.clone(),
+            session_id: attempt.session_id.clone(),
+            new_commits: attempt.new_commits,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -52,6 +104,8 @@ struct CardContext<'a> {
     workspace: Option<WorkspaceContext<'a>>,
     workspaces: Vec<WorkspaceContext<'a>>,
     outreach_file: String,
+    /// The last few attempts, oldest first.
+    previous_attempts: &'a [PreviousAttempt],
 }
 
 #[derive(Serialize)]
@@ -67,9 +121,15 @@ struct DiscussionContext<'a> {
     outreach_file: String,
 }
 
-fn render(invocation: &str, context: &impl Serialize) -> String {
+/// The objective, a blank line, then the JSON context block.
+fn render(objective: &str, context: &impl Serialize) -> String {
     let json = serde_json::to_string_pretty(context).expect("context serializes");
-    format!("{invocation}\n\n```json\n{json}\n```\n")
+    format!("{}\n\n```json\n{json}\n```\n", objective.trim())
+}
+
+/// A configured objective with `{ref}` filled in.
+fn objective_for(template: &str, reference: &str) -> String {
+    template.replace("{ref}", reference)
 }
 
 fn iso(now: DateTime<Utc>) -> String {
@@ -89,6 +149,7 @@ pub fn triage_prompt(
     paths: &Paths,
     cursors: &BTreeMap<String, String>,
     events: &[Event],
+    escalations: &[Escalation],
     now: DateTime<Utc>,
 ) -> String {
     let skill_cursors = cursors
@@ -104,14 +165,16 @@ pub fn triage_prompt(
         workspaces: all_workspaces(config),
         outreach_file: paths.outreach_file.display().to_string(),
         events,
+        escalations,
     };
-    render(&format!("{WORKFLOW_COMMAND} triage"), &context)
+    render(&config.triage.objective, &context)
 }
 
 /// `checkout` is where this card runs: the card's own worktree, or the workspace path itself.
 pub fn card_prompt(
     card_ref: &str,
     workspace: Option<(&Workspace, &Path)>,
+    previous_attempts: &[PreviousAttempt],
     config: &Config,
     paths: &Paths,
     now: DateTime<Utc>,
@@ -123,8 +186,9 @@ pub fn card_prompt(
         workspace: workspace.map(|(w, checkout)| WorkspaceContext::of(w, checkout)),
         workspaces: all_workspaces(config),
         outreach_file: paths.outreach_file.display().to_string(),
+        previous_attempts,
     };
-    render(&format!("{WORKFLOW_COMMAND} card {card_ref}"), &context)
+    render(&objective_for(&config.card.objective, card_ref), &context)
 }
 
 /// `checkout` is the discussion's detached worktree, or the workspace path itself.
@@ -145,11 +209,8 @@ pub fn discussion_prompt(
         workspaces: all_workspaces(config),
         outreach_file: paths.outreach_file.display().to_string(),
     };
-    let invocation = format!(
-        "{WORKFLOW_COMMAND} discussion {}",
-        discussion.discussion_ref
-    );
-    render(&invocation, &context)
+    let objective = objective_for(&config.discussion.objective, &discussion.discussion_ref);
+    render(&objective, &context)
 }
 
 /// The JSON context block of a rendered prompt (tests and debugging).
@@ -183,8 +244,22 @@ mod tests {
             occurred_at: now(),
             payload: json!({"body": "test event"}),
         }];
-        let prompt = triage_prompt(&env.config, &env.paths, &cursors, &events, now());
-        assert!(prompt.starts_with("/claude-harness:workflow triage\n\n```json\n"));
+        let escalations = vec![Escalation {
+            card_ref: "EX-4".into(),
+            reason: "max_attempts".into(),
+            attempts: 3,
+            last_summary: Some("no result within 3h".into()),
+        }];
+        let prompt = triage_prompt(
+            &env.config,
+            &env.paths,
+            &cursors,
+            &events,
+            &escalations,
+            now(),
+        );
+        let expected_start = format!("{}\n\n```json\n", crate::config::TRIAGE_OBJECTIVE);
+        assert!(prompt.starts_with(&expected_start), "{prompt}");
         let context = context_of(&prompt);
         assert_eq!(context["now"], "2026-01-15T09:30:00+00:00");
         assert_eq!(context["runner"], "example-app");
@@ -201,14 +276,21 @@ mod tests {
             json!({"id": "7", "source": "manual", "kind": "message", "mentions_me": true,
                    "sender": null, "occurred_at": "2026-01-15T09:30:00Z", "payload": {"body": "test event"}})
         );
+        assert_eq!(
+            context["escalations"],
+            json!([{"ref": "EX-4", "reason": "max_attempts", "attempts": 3,
+                    "last_summary": "no result within 3h"}])
+        );
         let sweep = context_of(&triage_prompt(
             &env.config,
             &env.paths,
             &cursors,
             &[],
+            &[],
             now(),
         ));
         assert_eq!(sweep["events"], json!([]));
+        assert_eq!(sweep["escalations"], json!([]));
     }
 
     #[test]
@@ -216,14 +298,23 @@ mod tests {
         let env = test_env();
         let workspace = &env.config.workspaces[0];
         let checkout = Path::new("/tmp/example/worktrees/example-app/ex-3");
+        let previous = [PreviousAttempt {
+            attempt: 1,
+            outcome: "timeout".into(),
+            summary: Some("no result within 3h".into()),
+            blocked_on: None,
+            session_id: Some("session-1".into()),
+            new_commits: Some(2),
+        }];
         let prompt = card_prompt(
             "EX-3",
             Some((workspace, checkout)),
+            &previous,
             &env.config,
             &env.paths,
             now(),
         );
-        assert!(prompt.starts_with("/claude-harness:workflow card EX-3\n"));
+        assert!(prompt.starts_with("Work card EX-3 to completion in this workspace.\n\n```json\n"));
         let context = context_of(&prompt);
         assert_eq!(context["ref"], "EX-3");
         assert_eq!(context["runner"], "example-app");
@@ -233,8 +324,14 @@ mod tests {
             context["workspaces"][0]["path"],
             workspace.path.display().to_string()
         );
-        let unmatched = card_prompt("ZZ-1", None, &env.config, &env.paths, now());
+        assert_eq!(
+            context["previous_attempts"],
+            json!([{"attempt": 1, "outcome": "timeout", "summary": "no result within 3h",
+                    "blocked_on": null, "session_id": "session-1", "new_commits": 2}])
+        );
+        let unmatched = card_prompt("ZZ-1", None, &[], &env.config, &env.paths, now());
         assert!(context_of(&unmatched)["workspace"].is_null());
+        assert_eq!(context_of(&unmatched)["previous_attempts"], json!([]));
     }
 
     #[test]
@@ -246,7 +343,9 @@ mod tests {
             question: "Why does the example fail?".into(),
         };
         let prompt = discussion_prompt(&discussion, None, &env.config, &env.paths, now());
-        assert!(prompt.starts_with("/claude-harness:workflow discussion EX-9\n"));
+        assert!(prompt.starts_with(
+            "You were mentioned in a discussion about EX-9. Investigate the question"
+        ));
         let context = context_of(&prompt);
         let keys: Vec<&String> = context.as_object().unwrap().keys().collect();
         assert_eq!(
@@ -265,5 +364,31 @@ mod tests {
         assert_eq!(context["thread"], "https://example.com/EX-9/c1");
         assert_eq!(context["question"], "Why does the example fail?");
         assert!(context["workspace"].is_null());
+    }
+
+    #[test]
+    fn configured_objectives_replace_the_defaults() {
+        let mut env = test_env();
+        env.config.card.objective = "Ship {ref}; then report on {ref}.".into();
+        env.config.triage.objective = "  Look around.  ".into();
+        let card = card_prompt("EX-4", None, &[], &env.config, &env.paths, now());
+        assert!(card.starts_with("Ship EX-4; then report on EX-4.\n\n```json\n"));
+        assert_eq!(context_of(&card)["ref"], "EX-4");
+        let triage = triage_prompt(&env.config, &env.paths, &BTreeMap::new(), &[], &[], now());
+        assert!(triage.starts_with("Look around.\n\n```json\n"));
+    }
+
+    #[test]
+    fn runner_rules_state_the_contract() {
+        for rule in [
+            "only non-negotiable rules",
+            "JSON the output schema requires",
+            "Discussion sessions never create branches, commit, push or open pull requests",
+            "Only work cards assigned to the user",
+            "unattended",
+            "Nobody can answer questions",
+        ] {
+            assert!(RUNNER_RULES.contains(rule), "{rule}");
+        }
     }
 }

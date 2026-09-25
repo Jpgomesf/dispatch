@@ -110,6 +110,29 @@ impl Store {
             .optional()
         })
     }
+
+    /// Live claims `runner` holds, with their lease end, by key.
+    pub fn claims_held(
+        &self,
+        runner: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<(String, DateTime<Utc>)>> {
+        self.read(|c| {
+            let mut statement = c.prepare(
+                "SELECT key, lease_until FROM claims WHERE runner = ?1 AND lease_until > ?2
+                 ORDER BY key",
+            )?;
+            statement
+                .query_map(params![runner, millis(now)], |row| {
+                    let until: i64 = row.get(1)?;
+                    Ok((
+                        row.get(0)?,
+                        DateTime::from_timestamp_millis(until).unwrap_or(now),
+                    ))
+                })?
+                .collect()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -180,7 +203,7 @@ mod tests {
     #[test]
     fn two_runners_contending_for_one_card_get_exactly_one_claim() {
         let (dir, _store) = temp_store();
-        let path = dir.path().join("nested/harness.db");
+        let path = dir.path().join("nested/dispatch.db");
         let threads: Vec<_> = (0..8)
             .map(|i| {
                 // Separate connections, like separate runner processes.

@@ -5,9 +5,9 @@ use crate::intake::notifications;
 use crate::intake::secrets::{SECRETS_ENV, secrets_path};
 use crate::store::{DB_ENV, DEFAULT_DB};
 
-pub const CONFIG_ENV: &str = "HARNESS_CONFIG";
+pub const CONFIG_ENV: &str = "DISPATCH_CONFIG";
 
-/// Environment variables that move files: `HARNESS_CONFIG`, `HARNESS_DB`, `HARNESS_SECRETS`.
+/// Environment variables that move files: `DISPATCH_CONFIG`, `DISPATCH_DB`, `DISPATCH_SECRETS`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvPaths {
     pub config: Option<String>,
@@ -26,7 +26,7 @@ impl EnvPaths {
     }
 }
 
-/// `$HARNESS_DB`, else `~/.local/state/claude-harness/harness.db` (machine-wide, shared by
+/// `$DISPATCH_DB`, else `~/.local/state/dispatch/dispatch.db` (machine-wide, shared by
 /// every runner whatever its `state_dir`).
 #[must_use]
 pub fn db_path(env_value: Option<&str>) -> PathBuf {
@@ -35,10 +35,21 @@ pub fn db_path(env_value: Option<&str>) -> PathBuf {
         _ => expand_user(Path::new(DEFAULT_DB)),
     }
 }
+
 /// The repo's own plugin; `cargo install --path .` bakes in the checkout it was built from.
 pub const REPO_PLUGIN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/plugin");
 
-/// `--config`, else `$HARNESS_CONFIG`, else `~/.config/claude-harness/config.toml`.
+/// The plugin sessions load with `--plugin-dir`: config `plugin_dir`, else `repo_plugin` when
+/// that directory exists, else none (the user's own skills and plugins still load).
+#[must_use]
+pub fn resolve_plugin_dir(configured: Option<&Path>, repo_plugin: &Path) -> Option<PathBuf> {
+    match configured {
+        Some(dir) => Some(dir.to_path_buf()),
+        None => repo_plugin.is_dir().then(|| repo_plugin.to_path_buf()),
+    }
+}
+
+/// `--config`, else `$DISPATCH_CONFIG`, else `~/.config/dispatch/config.toml`.
 pub fn resolve_config_path(cli_value: Option<&Path>, env_value: Option<&str>) -> PathBuf {
     let raw = match (cli_value, env_value) {
         (Some(cli), _) if !cli.as_os_str().is_empty() => cli.to_path_buf(),
@@ -55,7 +66,8 @@ pub struct Paths {
     pub runner: String,
     pub state_dir: PathBuf,
     pub outreach_file: PathBuf,
-    pub plugin_dir: PathBuf,
+    /// `None`: no `--plugin-dir` is passed.
+    pub plugin_dir: Option<PathBuf>,
     pub db: PathBuf,
     pub secrets: PathBuf,
     pub notifications_db: PathBuf,
@@ -71,16 +83,11 @@ impl Paths {
             notifications_db: notifications::default_db(),
             state_dir: config.state_dir.clone(),
             outreach_file: config.outreach_file.clone(),
-            plugin_dir: config
-                .plugin_dir
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(REPO_PLUGIN_DIR)),
+            plugin_dir: resolve_plugin_dir(
+                config.plugin_dir.as_deref(),
+                Path::new(REPO_PLUGIN_DIR),
+            ),
         }
-    }
-
-    /// Phase 1 state, imported into `harness.db` once and renamed `state.json.migrated`.
-    pub fn legacy_state_file(&self) -> PathBuf {
-        self.state_dir.join("state.json")
     }
 
     pub fn kill_switch(&self) -> PathBuf {
@@ -110,25 +117,27 @@ mod tests {
             PathBuf::from("cli.toml")
         );
         assert_eq!(resolve_config_path(None, Some(env)), PathBuf::from(env));
-        let default = expand_user(Path::new("~/.config/claude-harness/config.toml"));
+        let default = expand_user(Path::new("~/.config/dispatch/config.toml"));
         assert_eq!(resolve_config_path(None, None), default);
         assert_eq!(resolve_config_path(None, Some("")), default);
     }
 
     #[test]
-    fn plugin_dir_defaults_to_repo_plugin() {
+    fn plugin_dir_defaults_to_repo_plugin_when_present() {
         let resolved = Paths::resolve(
             Path::new("c.toml"),
             &Config::default(),
             &EnvPaths::default(),
         );
-        assert_eq!(resolved.plugin_dir, PathBuf::from(REPO_PLUGIN_DIR));
-        assert!(
-            resolved
-                .plugin_dir
-                .join(".claude-plugin/plugin.json")
-                .is_file()
-        );
+        let repo_plugin = PathBuf::from(REPO_PLUGIN_DIR);
+        let expected = repo_plugin.is_dir().then_some(repo_plugin);
+        assert_eq!(resolved.plugin_dir, expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("plugin");
+        assert_eq!(resolve_plugin_dir(None, &absent), None, "no plugin: none");
+        std::fs::create_dir_all(&absent).unwrap();
+        assert_eq!(resolve_plugin_dir(None, &absent), Some(absent.clone()));
     }
 
     #[test]
@@ -136,17 +145,17 @@ mod tests {
         let config =
             Config::from_toml("name = \"ex\"\nplugin_dir = \"/opt/example/plugin\"").unwrap();
         let resolved = Paths::resolve(Path::new("c.toml"), &config, &EnvPaths::default());
-        assert_eq!(resolved.plugin_dir, PathBuf::from("/opt/example/plugin"));
+        assert_eq!(
+            resolved.plugin_dir,
+            Some(PathBuf::from("/opt/example/plugin")),
+            "configured: used even when missing, so check reports it"
+        );
     }
 
     #[test]
     fn derived_paths() {
         let config = Config::from_toml("name = \"ex\"\nstate_dir = \"/var/example\"").unwrap();
         let paths = Paths::resolve(Path::new("c.toml"), &config, &EnvPaths::default());
-        assert_eq!(
-            paths.legacy_state_file(),
-            PathBuf::from("/var/example/state.json")
-        );
         assert_eq!(paths.kill_switch(), PathBuf::from("/var/example/STOP"));
         assert_eq!(
             paths.instance_lock_file(),

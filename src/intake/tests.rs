@@ -92,7 +92,7 @@ fn backoff_doubles_from_the_poll_interval_and_caps() {
 async fn linear_idles_until_its_key_appears() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(body_string_contains("HarnessWork"))
+        .and(body_string_contains("DispatchWork"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"issues": {
             "nodes": [{"id": "uuid-1", "identifier": "EX-1", "title": "Example task",
                        "url": "https://linear.app/example/issue/EX-1", "updatedAt": "2026-01-15T10:00:00.000Z"}],
@@ -100,7 +100,7 @@ async fn linear_idles_until_its_key_appears() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(body_string_contains("HarnessDiscussion"))
+        .and(body_string_contains("DispatchDiscussion"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"data": {"notifications": {
             "nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}}})),
@@ -143,7 +143,9 @@ async fn linear_idles_until_its_key_appears() {
         .cursor("example-app", "intake:linear:work")
         .unwrap()
         .unwrap();
-    assert_eq!(cursor, "2026-01-15T09:30:00.000Z");
+    // The clock follows real time here: "now", give or take a busy test machine.
+    let cursor = crate::store::parse_time(&cursor).unwrap();
+    assert!((cursor - now()).num_seconds() < 5, "{cursor}");
 
     assert_eq!(poll_once(&ctx, SourceKind::Linear).await, Ok(1));
     assert_eq!(
@@ -208,7 +210,7 @@ async fn jira_polls_both_streams_with_the_personal_scope() {
 }
 
 #[tokio::test]
-async fn notifications_are_stored_and_wake_the_dispatcher() {
+async fn notifications_are_stored_and_wake_the_coordinator() {
     let mut env = test_env();
     env.config.intake.notifications.enabled = true;
     env.config.intake.notifications.match_ = vec!["#example-channel".into()];
@@ -228,7 +230,7 @@ async fn notifications_are_stored_and_wake_the_dispatcher() {
     assert_eq!(poll_once(&ctx, SourceKind::Notifications).await, Ok(1));
     tokio::time::timeout(Duration::from_secs(1), ctx.wake.notified())
         .await
-        .expect("dispatcher woken");
+        .expect("coordinator woken");
     assert_eq!(
         poll_once(&ctx, SourceKind::Notifications).await,
         Ok(0),

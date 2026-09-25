@@ -24,6 +24,27 @@ pub fn parse_duration(text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs_f64(value * seconds_per_unit))
 }
 
+/// Like `parse_duration`, but also `0` (`"0"`, `"0s"`, `"0m"`, `"0h"`): a setting switched off.
+pub fn parse_duration_or_zero(text: &str) -> Result<Duration, String> {
+    if matches!(text.trim(), "0" | "0s" | "0m" | "0h") {
+        return Ok(Duration::ZERO);
+    }
+    parse_duration(text)
+}
+
+/// The largest whole unit: `3h`, `15m`, `90s` (sub-second parts are dropped).
+#[must_use]
+pub fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds > 0 && seconds.is_multiple_of(3600) {
+        format!("{}h", seconds / 3600)
+    } else if seconds > 0 && seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// `\d+(\.\d+)?`
 fn is_decimal(text: &str) -> bool {
     let mut parts = text.split('.');
@@ -57,6 +78,24 @@ mod tests {
                 Ok(Duration::from_secs_f64(seconds)),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn zero_is_allowed_where_it_switches_something_off() {
+        for text in ["0", "0s", " 0m ", "0h"] {
+            assert_eq!(parse_duration_or_zero(text), Ok(Duration::ZERO), "{text}");
+        }
+        assert_eq!(parse_duration_or_zero("30s"), Ok(Duration::from_secs(30)));
+        assert!(parse_duration_or_zero("-1s").is_err());
+        assert!(parse_duration_or_zero("soon").is_err());
+    }
+
+    #[test]
+    fn formats_in_the_largest_whole_unit() {
+        let cases = [(10_800, "3h"), (900, "15m"), (90, "90s"), (0, "0s")];
+        for (seconds, text) in cases {
+            assert_eq!(format_duration(Duration::from_secs(seconds)), text);
         }
     }
 
