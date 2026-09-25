@@ -44,6 +44,23 @@ pub fn is_ready(card: &CardToWork, state: &State, batch: &HashSet<String>) -> bo
         })
 }
 
+/// `base` plus up to half of it again, picked by `random`: spreads session starts so a
+/// burst (several runners, or all of them right after a pause) does not hit the API at once.
+#[must_use]
+pub fn jittered(base: Duration, random: u64) -> Duration {
+    let millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
+    let extra = millis.saturating_mul(random % 501) / 1000;
+    Duration::from_millis(millis.saturating_add(extra))
+}
+
+/// A random number from the standard library's per-process hasher keys; enough for jitter.
+fn random() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
 /// `text` mentions `card_ref` as a whole token: `EX-1` is not in `EX-12` or `PREX-1`.
 #[must_use]
 pub fn mentions_ref(text: &str, card_ref: &str) -> bool {
@@ -126,9 +143,16 @@ struct Loop {
     state_error: Option<String>,
     /// The end of the machine-wide pause last seen, to print one line per change.
     pause_seen: Option<DateTime<Utc>>,
+    /// No session starts before this (`[sessions] start_stagger` after the previous one).
+    next_start: Instant,
 }
 
 impl Loop {
+    #[must_use]
+    fn may_start(&self) -> bool {
+        Instant::now() >= self.next_start
+    }
+
     fn running_cards(&self) -> HashSet<String> {
         self.running
             .values()
@@ -251,7 +275,7 @@ impl<S: Session> Runner<S> {
     fn start_ready(&self, work: &mut Loop, state: &State) {
         let max_parallel = self.config.card.max_parallel as usize;
         let now = self.now();
-        while work.running.len() < max_parallel {
+        while work.running.len() < max_parallel && work.may_start() {
             let Some(index) = work.discussions.iter().position(|d| d.ready(now)) else {
                 break;
             };
@@ -264,6 +288,7 @@ impl<S: Session> Runner<S> {
                 .sessions
                 .spawn(async move { Finished::Discussion(me.attempt_discussion(queued).await.1) });
             work.running.insert(handle.id(), Slot::Discussion(key));
+            self.stagger(work);
         }
         let batch: HashSet<String> = work
             .queue
@@ -273,7 +298,7 @@ impl<S: Session> Runner<S> {
             .chain(work.started_cards.iter().cloned())
             .collect();
         let mut index = 0;
-        while index < work.queue.len() && work.running.len() < max_parallel {
+        while index < work.queue.len() && work.running.len() < max_parallel && work.may_start() {
             if !is_ready(&work.queue[index], state, &batch) {
                 index += 1;
                 continue;
@@ -289,7 +314,13 @@ impl<S: Session> Runner<S> {
                 Finished::Card
             });
             work.running.insert(handle.id(), Slot::Card(card_ref));
+            self.stagger(work);
         }
+    }
+
+    /// A session just started: the next one waits `start_stagger` plus jitter.
+    fn stagger(&self, work: &mut Loop) {
+        work.next_start = Instant::now() + jittered(self.config.sessions.start_stagger, random());
     }
 
     /// Whether the machine-wide pause holds new sessions back now; one line when another
@@ -312,6 +343,9 @@ impl<S: Session> Runner<S> {
             (None, Some(_)) => {
                 self.emit("pause", "lifted", "");
                 work.pause_seen = None;
+                // Every runner sees the pause end at once; each waits its own jittered
+                // stagger before starting again.
+                self.stagger(work);
             }
             _ => {}
         }
@@ -394,6 +428,7 @@ impl<S: Session> Runner<S> {
         work.in_flight = events.iter().map(|e| e.id).collect();
         let me = self.clone();
         work.triage = Some(tokio::spawn(async move { me.triage(events).await }));
+        self.stagger(work);
     }
 
     /// Batched events become `done` on success, else go back to `new`. A store failure leaves
@@ -467,6 +502,7 @@ impl<S: Session> Runner<S> {
             batching: Batching::default(),
             state_error: None,
             pause_seen: None,
+            next_start: Instant::now(),
         };
         let mut sources = if once || self.should_stop() {
             JoinSet::new()
@@ -490,7 +526,7 @@ impl<S: Session> Runner<S> {
             // After a usage limit nothing new starts until the pause ends; running sessions
             // carry on.
             let paused = self.hold_for_pause(&mut work).await;
-            if !paused && work.triage.is_none() && triage_allowed {
+            if !paused && work.may_start() && work.triage.is_none() && triage_allowed {
                 self.start_triage(&mut work, once).await;
             }
             // An unreadable store skips this tick's scheduling; never an empty state.
@@ -501,8 +537,9 @@ impl<S: Session> Runner<S> {
                 self.queue_due_retries(&mut work, &state);
                 self.start_ready(&mut work, &state);
             }
+            // Past the stagger, anything ready has just been started: nothing left to wait for.
             let idle = work.triage.is_none() && work.sessions.is_empty();
-            if once && idle && (work.triaged || paused) {
+            if once && idle && (paused || (work.triaged && work.may_start())) {
                 if let (false, Some(until)) = (work.triaged, work.pause_seen) {
                     self.emit(
                         "triage",
@@ -524,6 +561,7 @@ impl<S: Session> Runner<S> {
                 }
                 () = sleep_until(work.next_sweep), if triage_idle => Wake::Tick,
                 () = sleep_until(window.unwrap_or_else(Instant::now)), if triage_idle && window.is_some() => Wake::Tick,
+                () = sleep_until(work.next_start), if !work.may_start() => Wake::Tick,
                 () = wake.notified() => Wake::Tick,
                 () = sleep(KILL_SWITCH_POLL) => Wake::Tick,
                 _ = shutdown.changed() => Wake::Tick,

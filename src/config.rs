@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::durations::parse_duration;
+use crate::durations::{parse_duration, parse_duration_or_zero};
 
 mod intake;
 
@@ -136,12 +136,16 @@ pub struct SessionsConfig {
     /// No stream event for this long means the session is stuck.
     #[serde(deserialize_with = "duration_from_str")]
     pub idle_timeout: Duration,
+    /// Between two session starts, plus up to 50% random jitter; `0s` switches it off.
+    #[serde(deserialize_with = "duration_or_zero_from_str")]
+    pub start_stagger: Duration,
 }
 
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
             idle_timeout: Duration::from_secs(15 * 60),
+            start_stagger: Duration::from_secs(30),
         }
     }
 }
@@ -306,6 +310,13 @@ fn duration_from_str<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Durat
     parse_duration(&text).map_err(serde::de::Error::custom)
 }
 
+fn duration_or_zero_from_str<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Duration, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    parse_duration_or_zero(&text).map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -322,6 +333,9 @@ plugin_dir = "{root}/plugin"
 [triage]
 interval = "10m"
 max_cards_per_tick = 2
+
+[sessions]
+start_stagger = "0s"
 
 [sources]
 slack_channels = ["C0000000001"]
@@ -379,6 +393,7 @@ match = ["EX-"]
         assert_eq!(config.card.timeout, minutes(180));
         assert_eq!(config.discussion.timeout, minutes(60));
         assert_eq!(config.sessions.idle_timeout, minutes(15));
+        assert_eq!(config.sessions.start_stagger, Duration::from_secs(30));
         assert_eq!(config.card.max_attempts, 3);
         assert_eq!(
             config.state_dir,
@@ -496,12 +511,13 @@ jql = "project = EX"
     #[test]
     fn session_limits_are_configurable() {
         let raw = "name = \"ex\"\n[triage]\ntimeout = \"5m\"\n[card]\ntimeout = \"2h\"\n\
-                   [discussion]\ntimeout = \"30m\"\n[sessions]\nidle_timeout = \"10m\"\n";
+                   [discussion]\ntimeout = \"30m\"\n[sessions]\nidle_timeout = \"10m\"\nstart_stagger = \"45s\"\n";
         let config = Config::from_toml(raw).unwrap();
         assert_eq!(config.triage.timeout, Duration::from_secs(300));
         assert_eq!(config.card.timeout, Duration::from_secs(7200));
         assert_eq!(config.discussion.timeout, Duration::from_secs(1800));
         assert_eq!(config.sessions.idle_timeout, Duration::from_secs(600));
+        assert_eq!(config.sessions.start_stagger, Duration::from_secs(45));
     }
 
     #[test]

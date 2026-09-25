@@ -670,6 +670,42 @@ async fn once_starts_nothing_while_another_runner_has_paused_the_machine() {
 }
 
 #[test]
+fn jitter_adds_up_to_half_the_stagger() {
+    let base = Duration::from_secs(30);
+    assert_eq!(jittered(base, 0), base);
+    assert_eq!(jittered(base, 500), Duration::from_secs(45));
+    assert_eq!(jittered(base, 501), base, "wraps");
+    for random in [1, 250, 499, 12_345, u64::MAX] {
+        let delay = jittered(base, random);
+        assert!(delay >= base && delay <= base + base / 2, "{delay:?}");
+    }
+    assert_eq!(jittered(Duration::ZERO, 400), Duration::ZERO);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sessions_start_a_stagger_apart_even_in_once() {
+    let mut env = test_env();
+    env.config.sessions.start_stagger = Duration::from_secs(30);
+    env.config.triage.max_cards_per_tick = 5;
+    env.config.card.max_parallel = 3;
+    let triage = triage_output(&[("EX-1", &[]), ("EX-2", &[])]);
+    let session = FakeSession::routed(vec![ok(triage)], |r| {
+        ok(card_output(r, "done")).after(TEN_MINUTES)
+    });
+    let (runner, _) = make_runner(&env, session);
+    runner.heartbeat(TEN_MINUTES, true).await;
+    let starts: Vec<Instant> = runner.session().calls().iter().map(|c| c.started).collect();
+    assert_eq!(starts.len(), 3, "triage and both cards ran");
+    for gap in starts.windows(2).map(|w| w[1] - w[0]) {
+        let base = Duration::from_secs(30);
+        assert!(
+            gap >= base && gap <= base + base / 2 + Duration::from_millis(5),
+            "{gap:?}"
+        );
+    }
+}
+
+#[test]
 fn refs_are_matched_as_whole_tokens() {
     assert!(mentions_ref("see EX-1.", "EX-1"));
     assert!(mentions_ref("{\"body\":\"EX-1\"}", "EX-1"));
