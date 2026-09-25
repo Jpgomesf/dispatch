@@ -7,6 +7,7 @@
 //! | `timeout`, `stuck`, `api_error`, `crash`, `invalid_output` | retry in a fresh session, backoff 1m doubling to 30m |
 //! | `failed` (the agent's own report) | one retry, then `needs_human` |
 //! | `blocked` | none: eligible again when triage lists it |
+//! | `environment` (plugin errors, a required MCP server not connected) | `needs_human`: never retried |
 //! | `rate_limited` (usage or rate limit) | retry once the machine-wide pause ends; not counted |
 //! | `interrupted` (kill switch, signal) | retry when the runner runs again; not counted |
 //!
@@ -48,12 +49,14 @@ pub enum Outcome {
     InvalidOutput,
     /// A usage or rate limit.
     RateLimited,
+    /// The session started without its plugins or required MCP servers.
+    Environment,
     /// Stopped by the kill switch or a signal.
     Interrupted,
 }
 
 impl Outcome {
-    const ALL: [Outcome; 14] = [
+    const ALL: [Outcome; 15] = [
         Outcome::Ok,
         Outcome::Done,
         Outcome::Blocked,
@@ -67,6 +70,7 @@ impl Outcome {
         Outcome::Crash,
         Outcome::InvalidOutput,
         Outcome::RateLimited,
+        Outcome::Environment,
         Outcome::Interrupted,
     ];
 
@@ -86,6 +90,7 @@ impl Outcome {
             Outcome::Crash => "crash",
             Outcome::InvalidOutput => "invalid_output",
             Outcome::RateLimited => "rate_limited",
+            Outcome::Environment => "environment",
             Outcome::Interrupted => "interrupted",
         }
     }
@@ -108,6 +113,7 @@ impl Outcome {
             Ended::Timeout(_) => Some(Outcome::Timeout),
             Ended::Stuck(_) => Some(Outcome::Stuck),
             Ended::RateLimited { .. } => Some(Outcome::RateLimited),
+            Ended::Environment(_) => Some(Outcome::Environment),
             Ended::Interrupted => Some(Outcome::Interrupted),
         }
     }
@@ -156,6 +162,7 @@ pub enum Reason {
     MaxAttempts,
     NoProgress,
     Failed,
+    Environment,
 }
 
 impl Reason {
@@ -165,6 +172,7 @@ impl Reason {
             Reason::MaxAttempts => "max_attempts",
             Reason::NoProgress => "no_progress",
             Reason::Failed => "failed",
+            Reason::Environment => "environment",
         }
     }
 }
@@ -223,6 +231,9 @@ pub fn next(
 ) -> Next {
     if outcome.is_finished() {
         return Next::Finished;
+    }
+    if outcome == Outcome::Environment {
+        return Next::NeedsHuman(Reason::Environment);
     }
     if !outcome.counts() {
         return Next::Retry { at: now };
@@ -389,6 +400,14 @@ mod tests {
             ),
             Next::Retry { at: now() },
             "an interruption is not an attempt at the work"
+        );
+    }
+
+    #[test]
+    fn a_broken_environment_needs_a_person_at_once() {
+        assert_eq!(
+            next(Outcome::Environment, None, &[], 3, now()),
+            Next::NeedsHuman(Reason::Environment)
         );
     }
 

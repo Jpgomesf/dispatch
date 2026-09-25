@@ -247,6 +247,15 @@ fn cmd_check(paths: &Paths, config: &Config) -> i32 {
     println!("outreach:     {}", paths.outreach_file.display());
     println!("worktrees:    {}", paths.worktrees_dir().display());
     println!("plugin dir:   {plugin}");
+    let required = &config.sessions.required_mcp;
+    println!(
+        "required mcp: {}",
+        if required.is_empty() {
+            "none".to_string()
+        } else {
+            required.join(", ")
+        }
+    );
     for kind in SourceKind::enabled(&config.intake) {
         println!(
             "source:       {} ({})",

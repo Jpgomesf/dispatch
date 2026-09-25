@@ -229,6 +229,7 @@ impl<S: Session> Runner<S> {
         Limits {
             timeout,
             idle_timeout: self.config.sessions.idle_timeout,
+            required_mcp: self.config.sessions.required_mcp.clone(),
         }
     }
 

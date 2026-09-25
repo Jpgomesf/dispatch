@@ -65,6 +65,8 @@ pub struct Limits {
     pub timeout: Duration,
     /// No stream event for this long means the session is stuck.
     pub idle_timeout: Duration,
+    /// MCP servers that must be connected when the session starts.
+    pub required_mcp: Vec<String>,
 }
 
 /// How a session ended, judged from the stream and the process, never from what the agent
@@ -85,6 +87,8 @@ pub enum Ended {
     Stuck(String),
     /// A usage or rate limit ended it (not a failure of the work).
     RateLimited { resets_at: Option<DateTime<Utc>> },
+    /// Stopped at start: plugin errors, or a required MCP server not connected.
+    Environment(String),
     /// Stopped by the kill switch or a signal.
     Interrupted,
 }
@@ -98,7 +102,8 @@ impl Ended {
             | Ended::InvalidOutput(detail)
             | Ended::Crash(detail)
             | Ended::Timeout(detail)
-            | Ended::Stuck(detail) => Err(detail.clone()),
+            | Ended::Stuck(detail)
+            | Ended::Environment(detail) => Err(detail.clone()),
             Ended::RateLimited { resets_at: None } => Err("usage or rate limit".into()),
             Ended::RateLimited {
                 resets_at: Some(at),
@@ -382,7 +387,7 @@ impl Session for ClaudeCli {
         let limits = &request.limits;
         let deadline = Instant::now() + limits.timeout;
         let mut last_event = Instant::now();
-        let mut stream = Stream::default();
+        let mut stream = Stream::new(limits.required_mcp.clone());
         let mut stop = None;
         let mut stopping = StopSequence::new(group, self.stop_grace);
         let mut exited: Option<String> = None;
@@ -396,8 +401,15 @@ impl Session for ClaudeCli {
                 line = lines.recv(), if stdout_open => match line {
                     Some(line) => {
                         last_event = Instant::now();
-                        for notice in stream.observe(&line).notices {
+                        let observed = stream.observe(&line);
+                        for notice in observed.notices {
                             let _ = notices.send(notice);
+                        }
+                        if let Some(reason) = observed.stop
+                            && stop.is_none()
+                        {
+                            stop = Some(reason);
+                            stopping.begin();
                         }
                     }
                     None => stdout_open = false,

@@ -139,6 +139,9 @@ pub struct SessionsConfig {
     /// Between two session starts, plus up to 50% random jitter; `0s` switches it off.
     #[serde(deserialize_with = "duration_or_zero_from_str")]
     pub start_stagger: Duration,
+    /// MCP servers (names as Claude Code reports them) every session needs connected; a
+    /// session without them is stopped at start.
+    pub required_mcp: Vec<String>,
 }
 
 impl Default for SessionsConfig {
@@ -146,6 +149,7 @@ impl Default for SessionsConfig {
         Self {
             idle_timeout: Duration::from_secs(15 * 60),
             start_stagger: Duration::from_secs(30),
+            required_mcp: Vec::new(),
         }
     }
 }
@@ -394,6 +398,7 @@ match = ["EX-"]
         assert_eq!(config.discussion.timeout, minutes(60));
         assert_eq!(config.sessions.idle_timeout, minutes(15));
         assert_eq!(config.sessions.start_stagger, Duration::from_secs(30));
+        assert!(config.sessions.required_mcp.is_empty());
         assert_eq!(config.card.max_attempts, 3);
         assert_eq!(
             config.state_dir,
@@ -511,13 +516,14 @@ jql = "project = EX"
     #[test]
     fn session_limits_are_configurable() {
         let raw = "name = \"ex\"\n[triage]\ntimeout = \"5m\"\n[card]\ntimeout = \"2h\"\n\
-                   [discussion]\ntimeout = \"30m\"\n[sessions]\nidle_timeout = \"10m\"\nstart_stagger = \"45s\"\n";
+                   [discussion]\ntimeout = \"30m\"\n[sessions]\nidle_timeout = \"10m\"\nstart_stagger = \"45s\"\nrequired_mcp = [\"linear\"]\n";
         let config = Config::from_toml(raw).unwrap();
         assert_eq!(config.triage.timeout, Duration::from_secs(300));
         assert_eq!(config.card.timeout, Duration::from_secs(7200));
         assert_eq!(config.discussion.timeout, Duration::from_secs(1800));
         assert_eq!(config.sessions.idle_timeout, Duration::from_secs(600));
         assert_eq!(config.sessions.start_stagger, Duration::from_secs(45));
+        assert_eq!(config.sessions.required_mcp, ["linear"]);
     }
 
     #[test]

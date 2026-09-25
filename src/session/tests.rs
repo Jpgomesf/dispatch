@@ -20,6 +20,7 @@ fn request() -> SessionRequest {
         limits: Limits {
             timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(60),
+            required_mcp: Vec::new(),
         },
     }
 }
@@ -29,6 +30,7 @@ fn limited(dir: &Path, timeout: u64, idle_timeout: u64) -> SessionRequest {
         limits: Limits {
             timeout: Duration::from_millis(timeout),
             idle_timeout: Duration::from_millis(idle_timeout),
+            required_mcp: Vec::new(),
         },
         ..in_dir(dir)
     }
@@ -408,6 +410,33 @@ async fn a_limit_hit_mid_session_is_announced_and_the_session_carries_on() {
         received[1],
         Notice::RateLimited { resets_at: None },
         "{received:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_without_its_environment_is_stopped_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let init = json!({"type": "system", "subtype": "init", "session_id": "session-example",
+                      "plugins": [], "mcp_servers": [{"name": "linear", "status": "failed"}]})
+    .to_string();
+    let body = format!("{}\nwhile true; do sleep 1 & wait $!; done", print(&[init]));
+    let cli = fake_cli(dir.path(), &body);
+    let request = SessionRequest {
+        limits: Limits {
+            required_mcp: vec!["linear".into()],
+            ..request().limits
+        },
+        ..in_dir(dir.path())
+    };
+    let (control, _shutdown, _notices) = new_control();
+    let report = timeout(Duration::from_secs(10), cli.run(request, control))
+        .await
+        .expect("stopped, not left running");
+    assert_eq!(
+        report.ended,
+        Ended::Environment(
+            "claude started without its environment: MCP server linear is failed".into()
+        )
     );
 }
 

@@ -31,6 +31,8 @@ pub enum Stop {
     Timeout(Duration),
     /// No stream event for this long.
     Idle(Duration),
+    /// `system/init` showed the session started without what it needs.
+    Environment(String),
 }
 
 /// What one line changed.
@@ -42,6 +44,9 @@ pub struct Observed {
 
 #[derive(Debug, Default)]
 pub struct Stream {
+    /// MCP servers that must be connected at `system/init`.
+    required_mcp: Vec<String>,
+    init_seen: bool,
     session_id: Option<String>,
     result: Option<Value>,
     /// A usage or rate limit was hit; the session may still be retrying.
@@ -50,7 +55,44 @@ pub struct Stream {
     resets_at: Option<DateTime<Utc>>,
 }
 
+/// What is wrong with the environment `system/init` describes: plugin load errors (the key
+/// is omitted when there are none) and required MCP servers that are missing or not
+/// `connected` (`failed`, `needs-auth`, `pending`, `disabled`).
+fn environment_problems(init: &Value, required_mcp: &[String]) -> Vec<String> {
+    let mut problems: Vec<String> = init["plugin_errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|error| {
+            format!(
+                "plugin {} did not load: {}",
+                error["plugin"].as_str().unwrap_or("?"),
+                error["message"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    let servers = init["mcp_servers"].as_array();
+    for name in required_mcp {
+        let status = servers
+            .and_then(|list| list.iter().find(|server| server["name"] == name.as_str()))
+            .map(|server| server["status"].as_str().unwrap_or("unknown"));
+        match status {
+            Some("connected") => {}
+            Some(status) => problems.push(format!("MCP server {name} is {status}")),
+            None => problems.push(format!("MCP server {name} is missing")),
+        }
+    }
+    problems
+}
+
 impl Stream {
+    pub fn new(required_mcp: Vec<String>) -> Self {
+        Stream {
+            required_mcp,
+            ..Stream::default()
+        }
+    }
+
     /// Take one stdout line. Lines that are not JSON objects (warnings) are ignored.
     pub fn observe(&mut self, line: &str) -> Observed {
         let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
@@ -64,6 +106,16 @@ impl Stream {
             observed.notices.push(Notice::Started {
                 session_id: id.to_string(),
             });
+        }
+        if !self.init_seen && event["type"] == "system" && event["subtype"] == "init" {
+            self.init_seen = true;
+            let problems = environment_problems(&event, &self.required_mcp);
+            if !problems.is_empty() {
+                observed.stop = Some(Stop::Environment(format!(
+                    "claude started without its environment: {}",
+                    problems.join("; ")
+                )));
+            }
         }
         let limit = match (event["type"].as_str(), event["subtype"].as_str()) {
             (Some("system"), Some("api_retry")) => (event["error"] == "rate_limit").then_some(None),
@@ -122,8 +174,10 @@ impl Stream {
         if let Some(output) = self.result.as_ref().and_then(valid_output) {
             return Ended::Output(output.clone());
         }
-        if stop == Some(Stop::Interrupted) {
-            return Ended::Interrupted;
+        match stop {
+            Some(Stop::Interrupted) => return Ended::Interrupted,
+            Some(Stop::Environment(detail)) => return Ended::Environment(detail),
+            _ => {}
         }
         // A limit hit mid-session explains the failure, unless the session ran into its own
         // budget or turn limit.
@@ -143,7 +197,7 @@ impl Stream {
             Some(Stop::Idle(limit)) => {
                 return Ended::Stuck(format!("no stream event for {}", format_duration(limit)));
             }
-            Some(Stop::Interrupted) | None => {}
+            Some(Stop::Interrupted | Stop::Environment(_)) | None => {}
         }
         match &self.result {
             Some(result) if is_error(result) => Ended::ApiError(error_detail(result)),
@@ -207,7 +261,7 @@ mod tests {
     }
 
     fn run(lines: &[String], stop: Option<Stop>) -> SessionReport {
-        let mut stream = Stream::default();
+        let mut stream = Stream::new(Vec::new());
         for line in lines {
             stream.observe(line);
         }
@@ -216,7 +270,7 @@ mod tests {
 
     #[test]
     fn the_first_session_id_is_announced_once() {
-        let mut stream = Stream::default();
+        let mut stream = Stream::new(Vec::new());
         assert_eq!(stream.observe("warning: not json"), Observed::default());
         let first = stream.observe(&init());
         assert_eq!(
@@ -248,7 +302,7 @@ mod tests {
 
     #[test]
     fn rate_limits_are_announced_with_the_latest_reset() {
-        let mut stream = Stream::default();
+        let mut stream = Stream::new(Vec::new());
         stream.observe(&init());
         let limited = |resets_at| Notice::RateLimited { resets_at };
         assert!(stream.observe(&api_retry("overloaded")).notices.is_empty());
@@ -402,6 +456,61 @@ mod tests {
                 Ended::Timeout(_)
             ),
             "the stop explains a result the stop itself caused"
+        );
+    }
+
+    fn init_with(plugin_errors: Value, mcp_servers: Value) -> String {
+        let mut init: Value = serde_json::from_str(&init()).unwrap();
+        init["mcp_servers"] = mcp_servers;
+        if !plugin_errors.is_null() {
+            init["plugin_errors"] = plugin_errors;
+        }
+        init.to_string()
+    }
+
+    #[test]
+    fn the_environment_guard_reads_the_first_init() {
+        let required = vec!["linear".to_string(), "github".to_string()];
+        let healthy = init_with(
+            Value::Null,
+            json!([{"name": "linear", "status": "connected"},
+                   {"name": "github", "status": "connected"},
+                   {"name": "other", "status": "failed"}]),
+        );
+        let mut stream = Stream::new(required.clone());
+        assert_eq!(
+            stream.observe(&healthy).stop,
+            None,
+            "only required servers matter"
+        );
+
+        let broken = init_with(
+            json!([{"plugin": "dispatch@inline", "type": "manifest", "message": "bad manifest"}]),
+            json!([{"name": "linear", "status": "needs-auth"}]),
+        );
+        let mut stream = Stream::new(required.clone());
+        let Some(Stop::Environment(detail)) = stream.observe(&broken).stop else {
+            panic!("the environment is not what the runner needs");
+        };
+        assert_eq!(
+            detail,
+            "claude started without its environment: plugin dispatch@inline did not load: \
+             bad manifest; MCP server linear is needs-auth; MCP server github is missing"
+        );
+        assert_eq!(stream.observe(&broken).stop, None, "checked once");
+        assert_eq!(
+            stream
+                .finish(Some(Stop::Environment(detail.clone())), "")
+                .ended,
+            Ended::Environment(detail)
+        );
+
+        let mut unguarded = Stream::new(Vec::new());
+        let bare = init_with(Value::Null, json!([]));
+        assert_eq!(
+            unguarded.observe(&bare).stop,
+            None,
+            "nothing required, no plugin errors"
         );
     }
 }

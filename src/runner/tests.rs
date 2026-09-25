@@ -371,6 +371,31 @@ async fn a_fresh_attempt_sees_the_last_three_attempts() {
 }
 
 #[tokio::test]
+async fn a_card_whose_session_lacks_its_environment_needs_a_person() {
+    let mut env = test_env();
+    env.config.sessions.required_mcp = vec!["linear".into()];
+    let detail = "claude started without its environment: MCP server linear is missing";
+    let session = FakeSession::sequence(vec![ended(crate::session::Ended::Environment(
+        detail.into(),
+    ))]);
+    let (runner, lines) = make_runner(&env, session);
+    assert!(runner.run_card("EX-1", None).await.unwrap().is_none());
+    assert_eq!(
+        runner.session().calls()[0].request.limits.required_mcp,
+        ["linear"]
+    );
+    let card = env.store().card("example-app", "EX-1").unwrap().unwrap();
+    assert_eq!(card.status, CardStatus::NeedsHuman);
+    assert_eq!(card.reason.as_deref(), Some("environment"));
+    assert_eq!(
+        lines_of(&lines),
+        [format!(
+            "2026-01-15T09:30:00Z card environment EX-1 cost=$0.05 — {detail}; needs_human (environment)"
+        )]
+    );
+}
+
+#[tokio::test]
 async fn each_mode_gets_its_timeout_and_the_shared_idle_limit() {
     let mut env = test_env();
     env.config.triage.timeout = MINUTE * 20;
