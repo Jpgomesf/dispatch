@@ -289,9 +289,14 @@ impl StopSequence {
         self.next = None;
     }
 
-    /// `claude` was reaped: send nothing more (leftovers holding its pipes are handled by
-    /// the pipe grace).
+    /// `claude` was just reaped. When it was being stopped, whatever it left in its group is
+    /// killed now (the group id stays taken while any member lives); after that nothing more
+    /// is sent to its pid, which another process may get. Leftovers of a session that ended
+    /// by itself are handled by the pipe grace.
     fn exited(&mut self) {
+        if self.started {
+            signal_group(self.pid, libc::SIGKILL);
+        }
         self.pid = None;
         self.next = None;
     }

@@ -367,6 +367,37 @@ async fn sigint_alone_ends_a_session_that_honours_it() {
 }
 
 #[tokio::test]
+async fn a_stop_kills_what_claude_leaves_in_its_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("server.pid");
+    // A background "server" with its own stdio (it holds none of claude's pipes); claude
+    // itself ends cleanly on SIGINT.
+    let body = format!(
+        "sleep 300 >/dev/null 2>&1 &\necho $! > {}\ntrap 'exit 0' INT\necho ready > {}\n{}\n\
+         while true; do sleep 1 >/dev/null 2>&1 & wait $!; done",
+        pid_file.display(),
+        dir.path().join("ready").display(),
+        print(&[init_line()])
+    );
+    let cli = ClaudeCli {
+        stop_grace: Duration::from_secs(30),
+        ..fake_cli(dir.path(), &body)
+    };
+    let (run, shutdown) = start_logger(cli, dir.path()).await;
+    shutdown.send_replace(Shutdown::Graceful);
+    let report = timeout(Duration::from_secs(5), run)
+        .await
+        .expect("SIGINT ended it")
+        .unwrap();
+    assert_eq!(report.ended, Ended::Interrupted);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !is_alive(read_pid(&pid_file)),
+        "the server was left running"
+    );
+}
+
+#[tokio::test]
 async fn a_second_signal_kills_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let cli = ClaudeCli {
