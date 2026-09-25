@@ -433,7 +433,8 @@ impl<S: Session> Runner<S> {
     }
 
     /// Pause every runner on the machine after a usage or rate limit hit in `source`: until
-    /// the reset the stream gave, else for `DEFAULT_PAUSE`. One line when it is set or grows.
+    /// the reset the stream gave (at most `MAX_PAUSE` away), else for `DEFAULT_PAUSE`. One
+    /// line when it is set or grows, with the reset it capped.
     async fn pause_for(&self, resets_at: Option<DateTime<Utc>>, source: &str) {
         let now = self.now();
         let until = outcome::pause_until(resets_at, now);
@@ -441,7 +442,11 @@ impl<S: Session> Runner<S> {
             self.name().to_string(),
             format!("usage or rate limit in {source}"),
         );
-        let detail = format!("until {} — {reason}", time(until));
+        let capped = resets_at
+            .filter(|at| *at > until)
+            .map(|at| format!(" (reset {} capped)", time(at)))
+            .unwrap_or_default();
+        let detail = format!("until {} — {reason}{capped}", time(until));
         match self
             .store
             .call(move |s| s.set_pause(until, &reason, &runner, now))

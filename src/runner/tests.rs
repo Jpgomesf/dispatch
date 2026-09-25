@@ -478,6 +478,24 @@ async fn a_card_whose_session_lacks_its_environment_needs_a_person() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_reset_too_far_out_pauses_the_machine_for_eight_days_at_most() {
+    let env = test_env();
+    let far = now() + chrono::TimeDelta::days(400);
+    let session = FakeSession::sequence(vec![rate_limited(Some(far))]);
+    let (runner, lines) = make_runner(&env, session);
+    runner.run_card("EX-1", None).await.unwrap();
+    let cap = now() + chrono::TimeDelta::days(8);
+    assert_eq!(env.store().pause(now()).unwrap().unwrap().until, cap);
+    let card = env.store().card("example-app", "EX-1").unwrap().unwrap();
+    assert_eq!(card.retry_at, Some(cap));
+    assert_eq!(
+        lines_of(&lines)[0],
+        "2026-01-15T09:30:00Z pause set until 2026-01-23T09:30:00Z — usage or rate limit in \
+         card EX-1 (reset 2027-02-19T09:30:00Z capped)"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_store_error_while_claiming_keeps_the_retry_scheduled() {
     let env = test_env();
     let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![]));

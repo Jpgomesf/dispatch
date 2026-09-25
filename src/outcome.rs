@@ -25,6 +25,9 @@ pub const RETRY_BASE: Duration = Duration::from_secs(60);
 pub const RETRY_CAP: Duration = Duration::from_secs(30 * 60);
 /// How long every runner pauses after a usage or rate limit when no reset time is known.
 pub const DEFAULT_PAUSE: Duration = Duration::from_secs(15 * 60);
+/// The longest pause a reset time can set: weekly limits reset days away, and a pause only
+/// grows, so a bogus far-off reset must not stop every runner for good.
+pub const MAX_PAUSE: Duration = Duration::from_secs(8 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -202,12 +205,13 @@ fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
 }
 
 /// Until when every runner starts no session after a limit: the reset time the stream gave,
-/// else `DEFAULT_PAUSE` from now.
+/// else `DEFAULT_PAUSE` from now; never more than `MAX_PAUSE` from now.
 #[must_use]
 pub fn pause_until(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<Utc> {
     resets_at
         .filter(|at| *at > now)
         .unwrap_or_else(|| after(now, DEFAULT_PAUSE))
+        .min(after(now, MAX_PAUSE))
 }
 
 /// The same `next`, with a retry moved to `at` if it would come sooner.
@@ -461,6 +465,20 @@ mod tests {
         assert_eq!(
             not_before(Next::Retry { at: minutes(120) }, reset),
             Next::Retry { at: minutes(120) }
+        );
+    }
+
+    #[test]
+    fn a_reset_is_believed_up_to_eight_days_out() {
+        let week = now() + TimeDelta::days(7);
+        assert_eq!(
+            pause_until(Some(week), now()),
+            week,
+            "weekly limits reset days away"
+        );
+        assert_eq!(
+            pause_until(Some(now() + TimeDelta::days(400)), now()),
+            now() + TimeDelta::days(8)
         );
     }
 
