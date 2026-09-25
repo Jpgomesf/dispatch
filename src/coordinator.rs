@@ -551,7 +551,11 @@ impl<S: Session> Runner<S> {
                 }
                 break;
             }
-            let triage_idle = work.triage.is_none() && triage_allowed;
+            // Only when a triage could start: an overdue sweep or window would otherwise fire at
+            // once on every pass while paused or staggered. The pause is polled every
+            // `KILL_SWITCH_POLL`; the stagger has its own wake-up.
+            let triage_idle =
+                work.triage.is_none() && triage_allowed && !paused && work.may_start();
             let window = work.batching.window_closes;
             let event = tokio::select! {
                 joined = wait_triage(&mut work.triage) => Wake::Triaged(joined.ok().flatten()),

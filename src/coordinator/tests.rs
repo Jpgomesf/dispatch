@@ -716,6 +716,35 @@ async fn once_does_not_wait_out_the_stagger_with_nothing_queued() {
     assert_eq!(start.elapsed(), MINUTE / 6, "exits when triage ends");
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_overdue_sweep_waits_out_the_pause_without_spinning() {
+    let env = test_env();
+    let kill_switch = env.paths.kill_switch();
+    // A sweep is due every minute, all through a 15 minute pause set by another runner.
+    let session = FakeSession::new(move |_| {
+        std::fs::write(&kill_switch, "").unwrap();
+        ok(triage_output(&[]))
+    });
+    let (runner, _) = make_runner(&env, session);
+    env.store()
+        .set_pause(
+            now() + chrono::TimeDelta::minutes(15),
+            "usage or rate limit in card EX-9",
+            "other-app",
+            now(),
+        )
+        .unwrap();
+    let start = Instant::now();
+    runner.heartbeat(MINUTE, false).await;
+    let calls = runner.session().calls();
+    assert_eq!(calls.len(), 1);
+    let waited = calls[0].started - start;
+    assert!(
+        waited >= MINUTE * 15 && waited < MINUTE * 15 + KILL_SWITCH_POLL * 2,
+        "{waited:?}"
+    );
+}
+
 #[test]
 fn refs_are_matched_as_whole_tokens() {
     assert!(mentions_ref("see EX-1.", "EX-1"));
