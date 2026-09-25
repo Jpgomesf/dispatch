@@ -7,6 +7,7 @@
 //! | `timeout`, `stuck`, `api_error`, `crash`, `invalid_output` | retry in a fresh session, backoff 1m doubling to 30m |
 //! | `failed` (the agent's own report) | one retry, then `needs_human` |
 //! | `blocked` | none: eligible again when triage lists it |
+//! | `rate_limited` (usage or rate limit) | retry once the machine-wide pause ends; not counted |
 //! | `interrupted` (kill switch, signal) | retry when the runner runs again; not counted |
 //!
 //! Counted attempts are capped at `max_attempts`; past it the card is `needs_human`. Two
@@ -21,6 +22,8 @@ use crate::session::Ended;
 
 pub const RETRY_BASE: Duration = Duration::from_secs(60);
 pub const RETRY_CAP: Duration = Duration::from_secs(30 * 60);
+/// How long every runner pauses after a usage or rate limit when no reset time is known.
+pub const DEFAULT_PAUSE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -43,12 +46,14 @@ pub enum Outcome {
     Crash,
     /// A successful result without a valid structured output.
     InvalidOutput,
+    /// A usage or rate limit.
+    RateLimited,
     /// Stopped by the kill switch or a signal.
     Interrupted,
 }
 
 impl Outcome {
-    const ALL: [Outcome; 13] = [
+    const ALL: [Outcome; 14] = [
         Outcome::Ok,
         Outcome::Done,
         Outcome::Blocked,
@@ -61,6 +66,7 @@ impl Outcome {
         Outcome::ApiError,
         Outcome::Crash,
         Outcome::InvalidOutput,
+        Outcome::RateLimited,
         Outcome::Interrupted,
     ];
 
@@ -79,6 +85,7 @@ impl Outcome {
             Outcome::ApiError => "api_error",
             Outcome::Crash => "crash",
             Outcome::InvalidOutput => "invalid_output",
+            Outcome::RateLimited => "rate_limited",
             Outcome::Interrupted => "interrupted",
         }
     }
@@ -100,6 +107,7 @@ impl Outcome {
             Ended::Crash(_) => Some(Outcome::Crash),
             Ended::Timeout(_) => Some(Outcome::Timeout),
             Ended::Stuck(_) => Some(Outcome::Stuck),
+            Ended::RateLimited { .. } => Some(Outcome::RateLimited),
             Ended::Interrupted => Some(Outcome::Interrupted),
         }
     }
@@ -129,7 +137,7 @@ impl Outcome {
     /// Counts toward `max_attempts`.
     #[must_use]
     pub fn counts(self) -> bool {
-        !matches!(self, Outcome::Interrupted)
+        !matches!(self, Outcome::RateLimited | Outcome::Interrupted)
     }
 }
 
@@ -183,6 +191,24 @@ pub fn retry_backoff(counted: u32) -> Duration {
 
 fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
     now + TimeDelta::from_std(delay).unwrap_or(TimeDelta::MAX)
+}
+
+/// Until when every runner starts no session after a limit: the reset time the stream gave,
+/// else `DEFAULT_PAUSE` from now.
+#[must_use]
+pub fn pause_until(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<Utc> {
+    resets_at
+        .filter(|at| *at > now)
+        .unwrap_or_else(|| after(now, DEFAULT_PAUSE))
+}
+
+/// The same `next`, with a retry moved to `at` if it would come sooner.
+#[must_use]
+pub fn not_before(next: Next, at: DateTime<Utc>) -> Next {
+    match next {
+        Next::Retry { at: retry } => Next::Retry { at: retry.max(at) },
+        other => other,
+    }
 }
 
 /// What follows `outcome`, given the counted attempts before it in this run (`chain`, newest
@@ -367,6 +393,33 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_is_not_counted_and_waits_for_the_pause() {
+        assert!(!Outcome::RateLimited.counts());
+        let full = chain(&[Outcome::Crash, Outcome::Crash, Outcome::Crash]);
+        let next = next(Outcome::RateLimited, None, &full, 3, now());
+        let reset = minutes(90);
+        assert_eq!(
+            not_before(next, pause_until(Some(reset), now())),
+            Next::Retry { at: reset }
+        );
+        assert_eq!(pause_until(None, now()), minutes(15));
+        assert_eq!(
+            pause_until(Some(minutes(-5)), now()),
+            minutes(15),
+            "a reset already past is no reset"
+        );
+        assert_eq!(
+            not_before(Next::Blocked, reset),
+            Next::Blocked,
+            "only retries move"
+        );
+        assert_eq!(
+            not_before(Next::Retry { at: minutes(120) }, reset),
+            Next::Retry { at: minutes(120) }
+        );
+    }
+
+    #[test]
     fn interruptions_retry_at_once_and_are_not_counted() {
         assert!(!Outcome::Interrupted.counts());
         let full = chain(&[Outcome::Crash, Outcome::Crash, Outcome::Crash]);
@@ -403,6 +456,10 @@ mod tests {
             (Ended::Crash("e".into()), Some(Outcome::Crash)),
             (Ended::Timeout("e".into()), Some(Outcome::Timeout)),
             (Ended::Stuck("e".into()), Some(Outcome::Stuck)),
+            (
+                Ended::RateLimited { resets_at: None },
+                Some(Outcome::RateLimited),
+            ),
             (Ended::Interrupted, Some(Outcome::Interrupted)),
         ];
         for (ended, outcome) in cases {

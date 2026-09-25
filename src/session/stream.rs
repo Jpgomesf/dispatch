@@ -1,14 +1,26 @@
 //! Reading `claude -p --output-format stream-json --verbose`: one JSON event per line. The
 //! stream names the session (`session_id` on every event, first on `system/init`) and ends
-//! with a `result` event carrying `subtype`, `is_error`, `structured_output` and
-//! `total_cost_usd`. Pure logic, so it is tested with scripted lines.
+//! with a `result` event carrying `subtype`, `is_error`, `structured_output`,
+//! `total_cost_usd` and `api_error_status`. Usage and rate limits show as a `system/api_retry`
+//! with `error: "rate_limit"`, a `rate_limit_event` whose `rate_limit_info.status` is
+//! `rejected` (with `resetsAt`, unix seconds), an `assistant` message with `error:
+//! "rate_limit"`, or a result with `api_error_status: 429`. Pure logic, so it is tested with
+//! scripted lines.
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{Ended, Notice, SessionReport};
 use crate::durations::format_duration;
+
+/// Error results that are the session's own limits, never a usage limit.
+const OWN_LIMITS: [&str; 3] = [
+    "error_max_budget_usd",
+    "error_max_turns",
+    "error_max_structured_output_retries",
+];
 
 /// Why the runner stopped a session before it ended by itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +36,7 @@ pub enum Stop {
 /// What one line changed.
 #[derive(Debug, Default, PartialEq)]
 pub struct Observed {
-    pub notice: Option<Notice>,
+    pub notices: Vec<Notice>,
     pub stop: Option<Stop>,
 }
 
@@ -32,6 +44,10 @@ pub struct Observed {
 pub struct Stream {
     session_id: Option<String>,
     result: Option<Value>,
+    /// A usage or rate limit was hit; the session may still be retrying.
+    rate_limited: bool,
+    /// When the limit resets, if an event said.
+    resets_at: Option<DateTime<Utc>>,
 }
 
 impl Stream {
@@ -45,14 +61,46 @@ impl Stream {
             && let Some(id) = event["session_id"].as_str().filter(|id| !id.is_empty())
         {
             self.session_id = Some(id.to_string());
-            observed.notice = Some(Notice::Started {
+            observed.notices.push(Notice::Started {
                 session_id: id.to_string(),
             });
         }
+        let limit = match (event["type"].as_str(), event["subtype"].as_str()) {
+            (Some("system"), Some("api_retry")) => (event["error"] == "rate_limit").then_some(None),
+            (Some("rate_limit_event"), _) => {
+                let info = &event["rate_limit_info"];
+                (info["status"] == "rejected").then(|| {
+                    info["resetsAt"]
+                        .as_i64()
+                        .and_then(|secs| DateTime::from_timestamp(secs, 0))
+                })
+            }
+            (Some("assistant"), _) => (event["error"] == "rate_limit").then_some(None),
+            _ => None,
+        };
+        if let Some(resets_at) = limit {
+            observed.notices.extend(self.rate_limit(resets_at));
+        }
         if event["type"] == "result" {
+            if event["api_error_status"] == 429 {
+                observed.notices.extend(self.rate_limit(None));
+            }
             self.result = Some(event);
         }
         observed
+    }
+
+    /// Record a rate limit; a notice the first time, and whenever a later reset is learned.
+    fn rate_limit(&mut self, resets_at: Option<DateTime<Utc>>) -> Option<Notice> {
+        let first = !self.rate_limited;
+        self.rate_limited = true;
+        let later = resets_at.filter(|at| self.resets_at.is_none_or(|known| *at > known));
+        if later.is_some() {
+            self.resets_at = later;
+        }
+        (first || later.is_some()).then_some(Notice::RateLimited {
+            resets_at: self.resets_at,
+        })
     }
 
     /// How the session ended, from what the stream said and why the runner stopped it (if it
@@ -74,15 +122,28 @@ impl Stream {
         if let Some(output) = self.result.as_ref().and_then(valid_output) {
             return Ended::Output(output.clone());
         }
+        if stop == Some(Stop::Interrupted) {
+            return Ended::Interrupted;
+        }
+        // A limit hit mid-session explains the failure, unless the session ran into its own
+        // budget or turn limit.
+        let own_limit = self
+            .result
+            .as_ref()
+            .is_some_and(|r| OWN_LIMITS.contains(&r["subtype"].as_str().unwrap_or("")));
+        if self.rate_limited && !own_limit {
+            return Ended::RateLimited {
+                resets_at: self.resets_at,
+            };
+        }
         match stop {
-            Some(Stop::Interrupted) => return Ended::Interrupted,
             Some(Stop::Timeout(limit)) => {
                 return Ended::Timeout(format!("no result within {}", format_duration(limit)));
             }
             Some(Stop::Idle(limit)) => {
                 return Ended::Stuck(format!("no stream event for {}", format_duration(limit)));
             }
-            None => {}
+            Some(Stop::Interrupted) | None => {}
         }
         match &self.result {
             Some(result) if is_error(result) => Ended::ApiError(error_detail(result)),
@@ -159,12 +220,109 @@ mod tests {
         assert_eq!(stream.observe("warning: not json"), Observed::default());
         let first = stream.observe(&init());
         assert_eq!(
-            first.notice,
-            Some(Notice::Started {
+            first.notices,
+            [Notice::Started {
                 session_id: "session-a".into()
-            })
+            }]
         );
         assert_eq!(stream.observe(&init()), Observed::default());
+    }
+
+    fn api_retry(error: &str) -> String {
+        json!({"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10,
+               "retry_delay_ms": 5000, "error_status": 429, "error": error,
+               "session_id": "session-a"})
+        .to_string()
+    }
+
+    fn rate_limit_event(status: &str, resets_at: i64) -> String {
+        json!({"type": "rate_limit_event", "session_id": "session-a",
+               "rate_limit_info": {"status": status, "resetsAt": resets_at,
+                                   "rateLimitType": "five_hour"}})
+        .to_string()
+    }
+
+    fn at(secs: i64) -> Option<DateTime<Utc>> {
+        DateTime::from_timestamp(secs, 0)
+    }
+
+    #[test]
+    fn rate_limits_are_announced_with_the_latest_reset() {
+        let mut stream = Stream::default();
+        stream.observe(&init());
+        let limited = |resets_at| Notice::RateLimited { resets_at };
+        assert!(stream.observe(&api_retry("overloaded")).notices.is_empty());
+        assert!(
+            stream
+                .observe(&rate_limit_event("allowed", 1_790_305_200))
+                .notices
+                .is_empty(),
+            "an allowed status is only information"
+        );
+        assert_eq!(
+            stream.observe(&api_retry("rate_limit")).notices,
+            [limited(None)]
+        );
+        assert!(stream.observe(&api_retry("rate_limit")).notices.is_empty());
+        let rejected = rate_limit_event("rejected", 1_790_305_200);
+        assert_eq!(
+            stream.observe(&rejected).notices,
+            [limited(at(1_790_305_200))]
+        );
+        assert!(stream.observe(&rejected).notices.is_empty(), "nothing new");
+        let assistant = json!({"type": "assistant", "error": "rate_limit",
+                               "message": {"content": []}})
+        .to_string();
+        assert!(stream.observe(&assistant).notices.is_empty());
+        let report = stream.finish(None, "exit status: 1");
+        assert_eq!(
+            report.ended,
+            Ended::RateLimited {
+                resets_at: at(1_790_305_200)
+            }
+        );
+    }
+
+    #[test]
+    fn a_limit_explains_a_failed_or_stopped_session_but_not_its_own_budget() {
+        let assistant = json!({"type": "assistant", "error": "rate_limit",
+                               "message": {"content": [{"type": "text",
+                                                        "text": "You've hit your limit"}]}})
+        .to_string();
+        let limited = Ended::RateLimited { resets_at: None };
+        // The usage-limit stop that looks like a clean completion: no structured output.
+        let success = result(json!({"structured_output": null, "result": "You've hit your limit"}));
+        assert_eq!(
+            run(&[init(), assistant.clone(), success], None).ended,
+            limited
+        );
+        let http = result(json!({"is_error": true, "api_error_status": 429,
+                                 "structured_output": null}));
+        assert_eq!(run(&[init(), http], None).ended, limited);
+        let hours = Duration::from_secs(3 * 3600);
+        assert_eq!(
+            run(
+                &[init(), api_retry("rate_limit")],
+                Some(Stop::Timeout(hours))
+            )
+            .ended,
+            limited,
+            "still retrying when the timeout came"
+        );
+        let budget = result(json!({"is_error": true, "subtype": "error_max_budget_usd",
+                                   "errors": ["Reached maximum budget"], "structured_output": null}));
+        assert_eq!(
+            run(&[init(), api_retry("rate_limit"), budget], None).ended,
+            Ended::ApiError("Reached maximum budget".into())
+        );
+        assert!(matches!(
+            run(&[init(), api_retry("rate_limit"), result(json!({}))], None).ended,
+            Ended::Output(_)
+        ));
+        assert_eq!(
+            run(&[init(), api_retry("rate_limit")], Some(Stop::Interrupted)).ended,
+            Ended::Interrupted
+        );
     }
 
     #[test]

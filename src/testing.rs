@@ -104,6 +104,8 @@ pub fn write_plugin(root: &Path) {
 pub struct Step {
     pub delay: Duration,
     pub ended: Ended,
+    /// Sent as soon as the session starts, after `Started`.
+    pub notices: Vec<Notice>,
 }
 
 /// A session that ends how `ended` says.
@@ -111,7 +113,15 @@ pub fn ended(ended: Ended) -> Step {
     Step {
         delay: Duration::ZERO,
         ended,
+        notices: Vec::new(),
     }
+}
+
+/// A session that hits a usage limit: it says so while running, then ends on it.
+pub fn rate_limited(resets_at: Option<DateTime<Utc>>) -> Step {
+    let mut step = ended(Ended::RateLimited { resets_at });
+    step.notices.push(Notice::RateLimited { resets_at });
+    step
 }
 
 pub fn ok(output: Value) -> Step {
@@ -243,6 +253,9 @@ impl Session for FakeSession {
         let _ = notices.send(Notice::Started {
             session_id: session_id.clone(),
         });
+        for notice in step.notices {
+            let _ = notices.send(notice);
+        }
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_active.fetch_max(active, Ordering::SeqCst);
         let terminated = if step.delay.is_zero() {

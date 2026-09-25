@@ -204,6 +204,24 @@ async fn enqueued_event_reaches_the_next_triage() {
 }
 
 #[tokio::test]
+async fn card_refuses_while_the_machine_is_paused() {
+    let env = test_env();
+    let later = chrono::Utc::now() + chrono::TimeDelta::minutes(15);
+    Store::open(&env.paths.db)
+        .unwrap()
+        .set_pause(
+            later,
+            "usage or rate limit in card EX-9",
+            "other-app",
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    let (code, session) = run_with(&env, &["card", "EX-1"], no_session()).await;
+    assert_eq!(code, EXIT_FAILED);
+    assert!(session.calls().is_empty());
+}
+
+#[tokio::test]
 async fn status_and_history_are_read_only() {
     let env = test_env();
     for args in [&["status"][..], &["history"], &["history", "EX-1"]] {

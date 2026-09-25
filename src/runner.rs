@@ -17,7 +17,7 @@ use tokio::time::{Instant, interval_at};
 use crate::config::{Config, Effort};
 use crate::intake::secrets::{EnvLookup, process_env};
 use crate::intake::{Event, IntakeContext};
-use crate::outcome::{Next, Outcome};
+use crate::outcome::{self, Next, Outcome};
 use crate::paths::Paths;
 use crate::prompts::{Escalation, INTAKE_CURSOR_PREFIX, triage_prompt};
 use crate::results::{TriageResult, triage_schema};
@@ -25,7 +25,7 @@ use crate::session::{
     Control, Ended, Limits, Mode, Notice, Session, SessionReport, SessionRequest, Shutdown,
 };
 use crate::state::CardStatus;
-use crate::store::{AttemptEnd, CLAIM_LEASE, CLAIM_RENEW, Claim, Store};
+use crate::store::{AttemptEnd, CLAIM_LEASE, CLAIM_RENEW, Claim, Pause, Store};
 
 mod cards;
 mod discussions;
@@ -320,29 +320,43 @@ impl<S: Session> Runner<S> {
             .map_err(|e| format!("store: {e}"))
     }
 
-    /// Run one session for attempt `id`, acting on its notices while it runs.
-    async fn run_session(&self, request: SessionRequest, id: i64) -> SessionReport {
+    /// Run one session for attempt `id` (of `reference`, empty for triage), acting on its
+    /// notices while it runs. A session that is already running when a limit is hit keeps
+    /// going (Claude Code retries on its own) until it ends or its timeout.
+    async fn run_session(
+        &self,
+        request: SessionRequest,
+        id: i64,
+        reference: &str,
+    ) -> SessionReport {
+        let source = format!("{} {reference}", request.mode.as_str())
+            .trim_end()
+            .to_string();
         let (notices, mut received) = mpsc::unbounded_channel();
         let control = Control {
             shutdown: self.shutdown.subscribe(),
             notices,
         };
         let mut run = pin!(self.session.run(request, control));
-        loop {
+        let report = loop {
             tokio::select! {
                 report = &mut run => {
                     while let Ok(notice) = received.try_recv() {
-                        self.on_notice(id, notice).await;
+                        self.on_notice(id, &source, notice).await;
                     }
-                    return report;
+                    break report;
                 }
-                Some(notice) = received.recv() => self.on_notice(id, notice).await,
+                Some(notice) = received.recv() => self.on_notice(id, &source, notice).await,
             }
+        };
+        if let Ended::RateLimited { resets_at } = report.ended {
+            self.pause_for(resets_at, &source).await;
         }
+        report
     }
 
     /// Best effort: a notice never fails the session.
-    async fn on_notice(&self, id: i64, notice: Notice) {
+    async fn on_notice(&self, id: i64, source: &str, notice: Notice) {
         match notice {
             Notice::Started { session_id } => {
                 let _ = self
@@ -350,7 +364,39 @@ impl<S: Session> Runner<S> {
                     .call(move |s| s.set_attempt_session(id, &session_id))
                     .await;
             }
+            Notice::RateLimited { resets_at } => self.pause_for(resets_at, source).await,
         }
+    }
+
+    /// Pause every runner on the machine after a usage or rate limit hit in `source`: until
+    /// the reset the stream gave, else for `DEFAULT_PAUSE`. One line when it is set or grows.
+    async fn pause_for(&self, resets_at: Option<DateTime<Utc>>, source: &str) {
+        let now = self.now();
+        let until = outcome::pause_until(resets_at, now);
+        let (runner, reason) = (
+            self.name().to_string(),
+            format!("usage or rate limit in {source}"),
+        );
+        let detail = format!("until {} — {reason}", time(until));
+        match self
+            .store
+            .call(move |s| s.set_pause(until, &reason, &runner, now))
+            .await
+        {
+            Ok(true) => self.emit("pause", "set", &detail),
+            Ok(false) => {}
+            Err(error) => self.emit(
+                "pause",
+                "failed",
+                &one_line(&format!("{detail} — store: {error}")),
+            ),
+        }
+    }
+
+    /// The machine-wide pause in force now, if any; `None` when the store cannot say.
+    pub async fn paused(&self) -> Option<Pause> {
+        let now = self.now();
+        self.store.call(move |s| s.pause(now)).await.ok().flatten()
     }
 
     /// How an attempt ended, as recorded; callers add `blocked_on` and `new_commits`.
@@ -492,7 +538,7 @@ impl<S: Session> Runner<S> {
             .begin_attempt(Mode::Triage, "", &cwd)
             .await
             .map_err(|e| (Outcome::Crash, e))?;
-        let report = self.run_session(request, id).await;
+        let report = self.run_session(request, id, "").await;
         let (outcome, summary, result) = judge(&report.ended, "triage", |r: &TriageResult| {
             (Outcome::Ok, r.summary.clone())
         });

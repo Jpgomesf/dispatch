@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Command;
@@ -82,6 +83,8 @@ pub enum Ended {
     Timeout(String),
     /// Stopped by the inactivity watchdog.
     Stuck(String),
+    /// A usage or rate limit ended it (not a failure of the work).
+    RateLimited { resets_at: Option<DateTime<Utc>> },
     /// Stopped by the kill switch or a signal.
     Interrupted,
 }
@@ -96,6 +99,13 @@ impl Ended {
             | Ended::Crash(detail)
             | Ended::Timeout(detail)
             | Ended::Stuck(detail) => Err(detail.clone()),
+            Ended::RateLimited { resets_at: None } => Err("usage or rate limit".into()),
+            Ended::RateLimited {
+                resets_at: Some(at),
+            } => Err(format!(
+                "usage or rate limit until {}",
+                at.format("%Y-%m-%dT%H:%M:%SZ")
+            )),
             Ended::Interrupted => Err(INTERRUPTED.into()),
         }
     }
@@ -126,6 +136,9 @@ impl SessionReport {
 pub enum Notice {
     /// The stream named the session.
     Started { session_id: String },
+    /// A usage or rate limit was hit (the session keeps retrying on its own); the reset
+    /// time when an event gave one.
+    RateLimited { resets_at: Option<DateTime<Utc>> },
 }
 
 /// Runner-wide shutdown level, broadcast to every running session.
@@ -383,7 +396,7 @@ impl Session for ClaudeCli {
                 line = lines.recv(), if stdout_open => match line {
                     Some(line) => {
                         last_event = Instant::now();
-                        if let Some(notice) = stream.observe(&line).notice {
+                        for notice in stream.observe(&line).notices {
                             let _ = notices.send(notice);
                         }
                     }

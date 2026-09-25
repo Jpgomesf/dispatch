@@ -12,11 +12,13 @@ mod attempts;
 mod cards;
 mod claims;
 mod events;
+mod pause;
 mod schema;
 
 pub use attempts::{Attempt, AttemptEnd};
 pub use claims::{CLAIM_LEASE, CLAIM_RENEW, Claim};
 pub use events::Enqueued;
+pub use pause::Pause;
 
 pub const DB_ENV: &str = "DISPATCH_DB";
 pub const DEFAULT_DB: &str = "~/.local/state/dispatch/dispatch.db";

@@ -7,12 +7,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use tokio::task::{Id, JoinError, JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::intake::{self, Event};
 use crate::results::{CardToWork, DiscussionToRun, TriageResult};
-use crate::runner::{QueuedDiscussion, Runner, one_line};
+use crate::runner::{QueuedDiscussion, Runner, one_line, time};
 use crate::session::Session;
 use crate::state::{CardStatus, State};
 
@@ -123,6 +124,8 @@ struct Loop {
     next_sweep: Instant,
     batching: Batching,
     state_error: Option<String>,
+    /// The end of the machine-wide pause last seen, to print one line per change.
+    pause_seen: Option<DateTime<Utc>>,
 }
 
 impl Loop {
@@ -289,6 +292,32 @@ impl<S: Session> Runner<S> {
         }
     }
 
+    /// Whether the machine-wide pause holds new sessions back now; one line when another
+    /// runner's pause is first seen and when it lifts.
+    async fn hold_for_pause(&self, work: &mut Loop) -> bool {
+        let pause = self.paused().await;
+        match (&pause, work.pause_seen) {
+            (Some(pause), seen) if seen != Some(pause.until) => {
+                if pause.runner != self.name() {
+                    let detail = format!(
+                        "until {} — {} (set by {})",
+                        time(pause.until),
+                        pause.reason,
+                        pause.runner
+                    );
+                    self.emit("pause", "waiting", &detail);
+                }
+                work.pause_seen = Some(pause.until);
+            }
+            (None, Some(_)) => {
+                self.emit("pause", "lifted", "");
+                work.pause_seen = None;
+            }
+            _ => {}
+        }
+        pause.is_some()
+    }
+
     /// A new event that mentions a `needs_human` card is the external change it waited for:
     /// its attempt count starts over and triage may list it again.
     async fn reopen_mentioned(&self, events: &[Event]) {
@@ -437,6 +466,7 @@ impl<S: Session> Runner<S> {
             next_sweep: Instant::now(),
             batching: Batching::default(),
             state_error: None,
+            pause_seen: None,
         };
         let mut sources = if once || self.should_stop() {
             JoinSet::new()
@@ -457,17 +487,29 @@ impl<S: Session> Runner<S> {
                 let pending = self.pending_events().await;
                 work.batching.observe(pending, self.batch_window());
             }
-            if work.triage.is_none() && triage_allowed {
+            // After a usage limit nothing new starts until the pause ends; running sessions
+            // carry on.
+            let paused = self.hold_for_pause(&mut work).await;
+            if !paused && work.triage.is_none() && triage_allowed {
                 self.start_triage(&mut work, once).await;
             }
             // An unreadable store skips this tick's scheduling; never an empty state.
-            if work.running.len() < max_parallel
+            if !paused
+                && work.running.len() < max_parallel
                 && let Some(state) = self.load_for_scheduling(&mut work.state_error).await
             {
                 self.queue_due_retries(&mut work, &state);
                 self.start_ready(&mut work, &state);
             }
-            if once && work.triaged && work.triage.is_none() && work.sessions.is_empty() {
+            let idle = work.triage.is_none() && work.sessions.is_empty();
+            if once && idle && (work.triaged || paused) {
+                if let (false, Some(until)) = (work.triaged, work.pause_seen) {
+                    self.emit(
+                        "triage",
+                        "skipped",
+                        &format!("paused until {}", time(until)),
+                    );
+                }
                 break;
             }
             let triage_idle = work.triage.is_none() && triage_allowed;

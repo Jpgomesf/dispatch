@@ -83,13 +83,18 @@ impl<S: Session> Runner<S> {
             }
         };
         let now = self.now();
-        let next = outcome::next(
+        let mut next = outcome::next(
             outcome,
             None,
             &queued.chain,
             self.config.card.max_attempts,
             now,
         );
+        if outcome == Outcome::RateLimited
+            && let Some(pause) = self.paused().await
+        {
+            next = outcome::not_before(next, pause.until);
+        }
         let retry = match next {
             Next::Retry { at } => {
                 let mut chain = queued.chain;
@@ -156,7 +161,10 @@ impl<S: Session> Runner<S> {
             .begin_attempt(Mode::Discussion, &discussion.discussion_ref, &checkout)
             .await;
         let report = match &attempt {
-            Ok((id, _)) => self.run_session(request, *id).await,
+            Ok((id, _)) => {
+                self.run_session(request, *id, &discussion.discussion_ref)
+                    .await
+            }
             Err(error) => SessionReport::ended(Ended::Crash(error.clone())),
         };
         if let Some(workspace) = &workspace {

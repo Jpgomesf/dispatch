@@ -381,6 +381,37 @@ async fn a_second_signal_kills_at_once() {
 }
 
 #[tokio::test]
+async fn a_limit_hit_mid_session_is_announced_and_the_session_carries_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let retry = json!({"type": "system", "subtype": "api_retry", "attempt": 1,
+                       "max_retries": 10, "retry_delay_ms": 500, "error_status": 429,
+                       "error": "rate_limit", "session_id": "session-example"})
+    .to_string();
+    let body = format!(
+        "{}\nsleep 0.5\n{}",
+        print(&[init_line(), retry]),
+        print(&[result_line(json!({}))])
+    );
+    let cli = fake_cli(dir.path(), &body);
+    let (control, _shutdown, mut notices) = new_control();
+    let report = cli.run(in_dir(dir.path()), control).await;
+    assert_eq!(
+        report.ended,
+        Ended::Output(json!({"summary": "ok"})),
+        "it retried and finished"
+    );
+    let mut received = Vec::new();
+    while let Ok(notice) = notices.try_recv() {
+        received.push(notice);
+    }
+    assert_eq!(
+        received[1],
+        Notice::RateLimited { resets_at: None },
+        "{received:?}"
+    );
+}
+
+#[tokio::test]
 async fn grandchild_holding_stdout_does_not_pin_the_session() {
     let dir = tempfile::tempdir().unwrap();
     let pid_file = dir.path().join("grandchild.pid");

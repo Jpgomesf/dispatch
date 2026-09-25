@@ -41,7 +41,8 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (runner, key)
     );
     ",
-    // 2: one row per session attempt (triage, card, discussion); card retries.
+    // 2: one row per session attempt (triage, card, discussion); card retries; the
+    //    machine-wide pause after a usage or rate limit.
     "
     ALTER TABLE cards ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE cards ADD COLUMN retry_at TEXT;
@@ -63,5 +64,12 @@ pub const MIGRATIONS: &[&str] = &[
         new_commits INTEGER
     );
     CREATE INDEX attempts_by_ref ON attempts (runner, ref, id);
+    CREATE TABLE pause (
+        id     INTEGER PRIMARY KEY CHECK (id = 1),
+        until  TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        runner TEXT NOT NULL,
+        set_at TEXT NOT NULL
+    );
     ",
 ];

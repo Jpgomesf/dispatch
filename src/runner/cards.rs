@@ -188,7 +188,7 @@ impl<S: Session> Runner<S> {
             card_schema(),
         );
         let (id, report) = match self.begin_attempt(Mode::Card, card_ref, &checkout).await {
-            Ok((id, _)) => (Some(id), self.run_session(request, id).await),
+            Ok((id, _)) => (Some(id), self.run_session(request, id, card_ref).await),
             Err(error) => (
                 None,
                 SessionReport::ended(crate::session::Ended::Crash(error)),
@@ -246,7 +246,12 @@ impl<S: Session> Runner<S> {
                     .card(&runner, &card_ref)?
                     .unwrap_or_else(|| CardState::new(CardStatus::InProgress, now));
                 let chain = s.card_chain(&runner, &card_ref, current, card.attempts)?;
-                let next = outcome::next(outcome, new_commits, &chain, max_attempts, now);
+                let mut next = outcome::next(outcome, new_commits, &chain, max_attempts, now);
+                if outcome == Outcome::RateLimited
+                    && let Some(pause) = s.pause(now)?
+                {
+                    next = outcome::not_before(next, pause.until);
+                }
                 apply(&mut card, outcome, next, now);
                 if pr_url.is_some() {
                     card.pr_url = pr_url;

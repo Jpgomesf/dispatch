@@ -581,6 +581,94 @@ async fn a_retry_that_cannot_start_is_left_to_triage() {
     assert_eq!((card.status, card.retry_at), (CardStatus::Failed, None));
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_usage_limit_pauses_every_session_start_and_is_not_a_failure() {
+    let mut env = test_env();
+    env.config.card.max_parallel = 1;
+    env.config.triage.max_cards_per_tick = 5;
+    let kill_switch = env.paths.kill_switch();
+    let triage = triage_output(&[("EX-1", &[]), ("EX-2", &[])]);
+    let tries = AtomicUsize::new(0);
+    // EX-1 hits the limit once; after the pause EX-2 and EX-1's retry finish, then the loop
+    // stops.
+    let session = FakeSession::routed(vec![ok(triage)], move |r| match r {
+        "EX-1" if tries.fetch_add(1, Ordering::SeqCst) == 0 => rate_limited(None),
+        "EX-1" => {
+            std::fs::write(&kill_switch, "").unwrap();
+            ok(card_output(r, "done"))
+        }
+        _ => ok(card_output(r, "done")),
+    });
+    let (runner, lines) = make_runner(&env, session);
+    let start = Instant::now();
+    runner.heartbeat(Duration::from_secs(3600), false).await;
+
+    let session = runner.session();
+    let calls = session.calls();
+    let cards: Vec<(String, Duration)> = calls
+        .iter()
+        .filter(|c| c.request.mode == crate::session::Mode::Card)
+        .map(|c| (c.reference(), c.started - start))
+        .collect();
+    assert_eq!(cards.len(), 3, "{cards:?}");
+    assert_eq!(cards[0], ("EX-1".to_string(), Duration::ZERO));
+    let pause = Duration::from_secs(15 * 60);
+    for (card_ref, at) in &cards[1..] {
+        assert!(
+            *at >= pause && *at < pause + KILL_SWITCH_POLL * 2,
+            "{card_ref} waited out the pause: {cards:?}"
+        );
+    }
+    let lines = lines_of(&lines);
+    assert!(
+        lines.iter().any(|l| l
+            .contains("pause set until 2026-01-15T09:45:00Z — usage or rate limit in card EX-1")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("card rate_limited EX-1")
+            && l.ends_with("retry at 2026-01-15T09:45:00Z")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("pause lifted")),
+        "{lines:?}"
+    );
+    let ex1 = card_of(&runner, "EX-1");
+    assert_eq!(ex1.status, CardStatus::Done);
+    let attempts = runner
+        .store()
+        .attempts(runner.name(), Some("EX-1"), -1)
+        .unwrap();
+    assert_eq!(
+        attempts.last().unwrap().outcome.as_deref(),
+        Some("rate_limited"),
+        "recorded, but not counted as a failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn once_starts_nothing_while_another_runner_has_paused_the_machine() {
+    let env = test_env();
+    let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![]));
+    env.store()
+        .set_pause(
+            now() + chrono::TimeDelta::minutes(15),
+            "usage or rate limit in card EX-9",
+            "other-app",
+            now(),
+        )
+        .unwrap();
+    runner.heartbeat(TEN_MINUTES, true).await;
+    assert!(runner.session().calls().is_empty());
+    let lines = lines_of(&lines);
+    assert!(
+        lines[0].contains("pause waiting until 2026-01-15T09:45:00Z — usage or rate limit in card EX-9 (set by other-app)"),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("triage skipped paused until 2026-01-15T09:45:00Z"));
+}
+
 #[test]
 fn refs_are_matched_as_whole_tokens() {
     assert!(mentions_ref("see EX-1.", "EX-1"));

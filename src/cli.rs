@@ -358,6 +358,15 @@ async fn cmd_card<S: Session>(runner: Runner<S>, card_ref: &str, workspace: Opti
     }
     install_signal_handlers(runner.shutdown_handle());
     runner.recover().await;
+    if let Some(pause) = runner.paused().await {
+        eprintln!(
+            "paused until {} ({}, set by {}); not starting",
+            pause.until.format("%Y-%m-%dT%H:%M:%SZ"),
+            pause.reason,
+            pause.runner
+        );
+        return EXIT_FAILED;
+    }
     match runner.run_card(card_ref, workspace).await {
         Err(error) => {
             eprintln!("{error}");

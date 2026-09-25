@@ -38,9 +38,20 @@ pub fn status_lines(
     kill_switch: bool,
     now: DateTime<Utc>,
 ) -> Result<Vec<String>> {
+    let pause = match store.pause(now)? {
+        Some(pause) => format!(
+            "until {} — {} (set by {} at {})",
+            time(pause.until),
+            pause.reason,
+            pause.runner,
+            time(pause.set_at)
+        ),
+        None => "none".to_string(),
+    };
     let mut lines = vec![
         format!("runner:       {runner}"),
         format!("kill switch:  {}", if kill_switch { "SET" } else { "off" }),
+        format!("pause:        {pause}"),
     ];
 
     let running = store.open_attempts(runner)?;
@@ -215,6 +226,7 @@ mod tests {
         let (_dir, store) = seeded();
         let lines = status_lines(&store, "example-app", false, now()).unwrap();
         let text = lines.join("\n");
+        assert!(text.contains("pause:        none"), "{text}");
         assert!(text.contains("sessions:     1 running"), "{text}");
         assert!(
             text.contains("  card EX-1 #2 since 2026-01-15T09:30:00Z session=not yet known"),
@@ -245,6 +257,30 @@ mod tests {
         assert!(
             !text.contains("EX-9"),
             "other runners are not shown: {text}"
+        );
+    }
+
+    #[test]
+    fn status_shows_the_machine_wide_pause() {
+        let (_dir, store) = seeded();
+        let until = now() + chrono::TimeDelta::minutes(15);
+        store
+            .set_pause(
+                until,
+                "usage or rate limit in card EX-9",
+                "other-app",
+                now(),
+            )
+            .unwrap();
+        let text = status_lines(&store, "example-app", false, now())
+            .unwrap()
+            .join("\n");
+        assert!(
+            text.contains(
+                "pause:        until 2026-01-15T09:45:00Z — usage or rate limit in card EX-9 \
+                 (set by other-app at 2026-01-15T09:30:00Z)"
+            ),
+            "{text}"
         );
     }
 
