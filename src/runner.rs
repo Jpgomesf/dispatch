@@ -509,12 +509,13 @@ impl<S: Session> Runner<S> {
             if card.status != CardStatus::NeedsHuman {
                 continue;
             }
-            let last = store.attempts(runner, Some(card_ref), 1)?;
+            // The card's own last attempt that ended, not a discussion about the same ref.
+            let last = store.recent_card_attempts(runner, card_ref, 1)?;
             escalations.push(Escalation {
                 card_ref: card_ref.clone(),
                 reason: card.reason.clone().unwrap_or_default(),
                 attempts: card.attempts,
-                last_summary: last.into_iter().next().and_then(|a| a.summary),
+                last_summary: last.into_iter().next_back().and_then(|a| a.summary),
             });
         }
         Ok(escalations)

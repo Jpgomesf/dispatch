@@ -386,6 +386,44 @@ async fn a_worktree_that_cannot_be_created_counts_toward_the_cap() {
 }
 
 #[tokio::test]
+async fn an_escalation_is_summed_up_by_the_cards_own_last_attempt() {
+    let env = test_env();
+    let store = env.store();
+    let cwd = std::path::Path::new("/tmp/example");
+    let end = |summary: &str| crate::store::AttemptEnd {
+        outcome: "timeout".into(),
+        summary: summary.into(),
+        blocked_on: None,
+        session_id: None,
+        cost_usd: None,
+        new_commits: None,
+        ended_at: now(),
+    };
+    let (card, _) = store
+        .begin_attempt("example-app", "card", "EX-1", cwd, now())
+        .unwrap();
+    store
+        .end_attempt(card, &end("no result within 3h"))
+        .unwrap();
+    let (talk, _) = store
+        .begin_attempt("example-app", "discussion", "EX-1", cwd, now())
+        .unwrap();
+    store.end_attempt(talk, &end("answered in thread")).unwrap();
+    let mut escalated = crate::state::CardState::new(CardStatus::NeedsHuman, now());
+    escalated.attempts = 3;
+    escalated.reason = Some("max_attempts".into());
+    store.set_card("example-app", "EX-1", &escalated).unwrap();
+
+    let (runner, _) = make_runner(&env, FakeSession::sequence(vec![ok(triage_output(&[]))]));
+    runner.triage(vec![]).await.unwrap();
+    assert_eq!(
+        runner.session().calls()[0].context()["escalations"],
+        json!([{"ref": "EX-1", "reason": "max_attempts", "attempts": 3,
+                "last_summary": "no result within 3h"}])
+    );
+}
+
+#[tokio::test]
 async fn a_fresh_attempt_sees_the_last_three_attempts() {
     let mut env = test_env();
     env.config.card.max_attempts = 9;
