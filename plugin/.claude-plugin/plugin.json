@@ -1,8 +1,8 @@
 {
-  "name": "claude-harness",
-  "displayName": "Claude Harness",
-  "version": "0.2.0",
-  "description": "Skill pack for claude-harness: event triage, end-to-end card work and discussion answers (workflow), unblocking people (outreach), and reviewer-ready PR descriptions (pr-description).",
-  "author": { "name": "claude-harness contributors" },
+  "name": "dispatch",
+  "displayName": "Dispatch starter pack",
+  "version": "0.3.0",
+  "description": "Optional starter pack of skills for dispatch sessions: triaging new activity, working a card to completion and answering a mention in a thread (workflow), contacting people on the user's behalf (outreach), and reviewer-ready PR descriptions (pr-description). Replace or extend it with your own skills.",
+  "author": { "name": "dispatch contributors" },
   "keywords": ["automation", "workflow", "tracker", "slack", "pull-request"]
 }

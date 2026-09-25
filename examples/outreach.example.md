@@ -1,6 +1,6 @@
 # Outreach directory
 
-Copy to `~/.config/claude-harness/outreach.md` and replace every placeholder.
+Copy to `~/.config/dispatch/outreach.md` and replace every placeholder.
 The `outreach` skill reads this file on every contact. Everyone below is
 fictional.
 
@@ -8,7 +8,8 @@ fictional.
 
 - Name: Sam Example (Software engineer)
 - Slack: U0000000001 · Email: sam@example.com
-- Reach me for escalations: Slack DM to myself (draft), then email draft.
+- Reach me for escalations (including cards dispatch stopped retrying): Slack DM
+  to myself (draft), then email draft.
 - Time zone: America/New_York · Hours: Mon–Fri 09:00–18:00
 
 ### Voice
@@ -16,7 +17,7 @@ fictional.
 - Direct, friendly, no filler. First line is the ask.
 - Plain English, short sentences, no emoji.
 - Sign-off: none on Slack; "— Sam" on email.
-- Never say "as an AI" or mention the harness unless asked.
+- Never say "as an AI" or mention dispatch unless asked.
 
 ## People and roles
 
@@ -66,4 +67,4 @@ Always draft:
 - Anything committing me to dates, estimates, money, scope or priorities.
 - Opinions on people, disagreements, or declining a request.
 
-Commitments the harness may make without asking: none.
+Commitments the agent may make without asking: none.
