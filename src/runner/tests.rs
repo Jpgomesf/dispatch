@@ -478,6 +478,40 @@ async fn a_card_whose_session_lacks_its_environment_needs_a_person() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_store_error_while_claiming_keeps_the_retry_scheduled() {
+    let env = test_env();
+    let (runner, lines) = make_runner(&env, FakeSession::sequence(vec![]));
+    let mut waiting = crate::state::CardState::new(CardStatus::Failed, now());
+    waiting.attempts = 1;
+    waiting.retry_at = Some(now());
+    env.store()
+        .set_card("example-app", "EX-1", &waiting)
+        .unwrap();
+    rusqlite::Connection::open(&env.paths.db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER no_claims BEFORE INSERT ON claims
+             BEGIN SELECT RAISE(ABORT, 'claims unavailable'); END;",
+        )
+        .unwrap();
+    assert!(runner.run_card_in("EX-1", None, &[]).await.is_none());
+    assert!(runner.session().calls().is_empty());
+    let card = env.store().card("example-app", "EX-1").unwrap().unwrap();
+    assert_eq!(
+        (card.status, card.retry_at),
+        (CardStatus::Failed, Some(now())),
+        "not contention: the retry stays scheduled"
+    );
+    let lines = lines_of(&lines);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("2026-01-15T09:30:00Z card failed EX-1 — store: ")
+            && lines[0].contains("claims unavailable"),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_session_that_panics_ends_as_a_crash_and_releases_its_card() {
     let env = test_env();
     let session = FakeSession::new(|_| panic!("session blew up"));

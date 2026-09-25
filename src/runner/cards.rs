@@ -5,7 +5,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 
-use super::{Runner, cost, describe, judge, one_line};
+use super::{Runner, Unclaimed, cost, describe, judge, one_line};
 use crate::config::{UnknownWorkspace, Workspace};
 use crate::intake::secrets::Secrets;
 use crate::intake::{CardScope, card_scope};
@@ -107,9 +107,15 @@ impl<S: Session> Runner<S> {
             .await
         {
             Ok(result) => result,
-            Err(reason) => {
-                self.emit("card", "skipped", &format!("{card_ref} — {reason}"));
+            Err(held @ Unclaimed::HeldBy(_)) => {
+                self.emit("card", "skipped", &format!("{card_ref} — {held}"));
                 self.cancel_retry(card_ref).await;
+                None
+            }
+            // Nothing is known about the claim: a scheduled retry is tried again.
+            Err(error @ Unclaimed::Store(_)) => {
+                let detail = one_line(&format!("{card_ref} — {error}"));
+                self.emit("card", "failed", &detail);
                 None
             }
         }

@@ -93,6 +93,24 @@ fn describe(next: &Result<Next, String>) -> String {
     }
 }
 
+/// Why `claimed` ran nothing.
+#[derive(Debug)]
+pub(crate) enum Unclaimed {
+    /// A runner holds the key, this one included: real contention.
+    HeldBy(String),
+    /// The store could not say who holds it.
+    Store(String),
+}
+
+impl std::fmt::Display for Unclaimed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unclaimed::HeldBy(holder) => write!(f, "held by {holder}"),
+            Unclaimed::Store(error) => write!(f, "store: {error}"),
+        }
+    }
+}
+
 /// A task aborted when its handle is dropped, so a session never outlives its attempt.
 struct Aborting<T>(JoinHandle<T>);
 
@@ -471,16 +489,16 @@ impl<S: Session> Runner<S> {
     }
 
     /// Hold `key` for as long as `work` runs: claimed first, renewed every minute, released
-    /// at the end. `Err(holder)` when another runner holds it; nothing runs then.
-    async fn claimed<T>(&self, key: &str, work: impl Future<Output = T>) -> Result<T, String> {
+    /// at the end. `Err` when a runner holds it or the store cannot say; nothing runs then.
+    async fn claimed<T>(&self, key: &str, work: impl Future<Output = T>) -> Result<T, Unclaimed> {
         let (runner, owned_key, now) = (self.name().to_string(), key.to_string(), self.now());
         let claim = self
             .store
             .call(move |s| s.claim(&owned_key, &runner, now, CLAIM_LEASE))
             .await
-            .map_err(|e| format!("store: {e}"))?;
+            .map_err(|e| Unclaimed::Store(e.to_string()))?;
         if let Claim::HeldBy(holder) = claim {
-            return Err(format!("held by {holder}"));
+            return Err(Unclaimed::HeldBy(holder));
         }
         let mut work = pin!(work);
         let mut renew = interval_at(Instant::now() + CLAIM_RENEW, CLAIM_RENEW);
