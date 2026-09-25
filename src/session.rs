@@ -26,6 +26,9 @@ use stream::{Stop, Stream};
 /// Why a session ended without a result when the runner stopped it.
 pub const INTERRUPTED: &str = "interrupted: dispatch is stopping";
 
+/// The `--permission-mode` every session asks for; `system/init` must report it back.
+pub const PERMISSION_MODE: &str = "auto";
+
 /// Which kind of session: decides the objective, the schema and the limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -210,7 +213,7 @@ pub fn build_args(request: &SessionRequest) -> Vec<String> {
         "--json-schema".into(),
         request.output_schema.to_string(),
         "--permission-mode".into(),
-        "auto".into(),
+        PERMISSION_MODE.into(),
         "--permission-prompts".into(),
         "none".into(),
         "--append-system-prompt".into(),

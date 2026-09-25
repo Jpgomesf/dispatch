@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::loops::Loops;
-use super::{Ended, Limits, Notice, SessionReport};
+use super::{Ended, Limits, Notice, PERMISSION_MODE, SessionReport};
 use crate::durations::format_duration;
 
 /// Error results that are the session's own limits, never a usage limit.
@@ -59,9 +59,23 @@ pub struct Stream {
     resets_at: Option<DateTime<Utc>>,
 }
 
+/// A `permissionMode` other than the requested one: Claude Code falls back to `default` when
+/// auto mode is unavailable, and with nobody to answer every prompt is then denied. No
+/// field, no verdict.
+fn permission_problem(init: &Value) -> Option<String> {
+    let mode = init["permissionMode"].as_str()?;
+    (mode != PERMISSION_MODE).then(|| {
+        format!(
+            "permission mode is {mode}, not {PERMISSION_MODE} \
+             (auto mode may be unavailable for the model, plan or settings)"
+        )
+    })
+}
+
 /// What is wrong with the environment `system/init` describes: plugin load errors (the key
-/// is omitted when there are none) and required MCP servers that are missing or not
-/// `connected` (`failed`, `needs-auth`, `pending`, `disabled`).
+/// is omitted when there are none), a permission mode other than the requested one, and
+/// required MCP servers that are missing or not `connected` (`failed`, `needs-auth`,
+/// `pending`, `disabled`).
 fn environment_problems(init: &Value, required_mcp: &[String]) -> Vec<String> {
     let mut problems: Vec<String> = init["plugin_errors"]
         .as_array()
@@ -75,6 +89,7 @@ fn environment_problems(init: &Value, required_mcp: &[String]) -> Vec<String> {
             )
         })
         .collect();
+    problems.extend(permission_problem(init));
     let servers = init["mcp_servers"].as_array();
     for name in required_mcp {
         let status = servers
@@ -578,5 +593,28 @@ mod tests {
             None,
             "nothing required, no plugin errors"
         );
+    }
+
+    fn init_in_mode(mode: &str) -> String {
+        let mut init: Value = serde_json::from_str(&init()).unwrap();
+        init["permissionMode"] = json!(mode);
+        init.to_string()
+    }
+
+    #[test]
+    fn a_session_not_in_the_requested_permission_mode_lacks_its_environment() {
+        let mut stream = Stream::new(&limits_with(Vec::new()));
+        let Some(Stop::Environment(detail)) = stream.observe(&init_in_mode("default")).stop else {
+            panic!("every prompt would be denied");
+        };
+        assert_eq!(
+            detail,
+            "claude started without its environment: permission mode is default, not auto \
+             (auto mode may be unavailable for the model, plan or settings)"
+        );
+        let mut stream = Stream::new(&limits_with(Vec::new()));
+        assert_eq!(stream.observe(&init_in_mode("auto")).stop, None);
+        let mut stream = Stream::new(&limits_with(Vec::new()));
+        assert_eq!(stream.observe(&init()).stop, None, "no field, no verdict");
     }
 }
