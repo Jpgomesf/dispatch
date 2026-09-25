@@ -151,6 +151,17 @@ async fn card_refuses_when_stopped() {
 }
 
 #[tokio::test]
+async fn heartbeat_refuses_when_stopped() {
+    let env = test_env();
+    run_with(&env, &["stop"], no_session()).await;
+    for args in [&["heartbeat", "--once"][..], &["heartbeat"]] {
+        let (code, session) = run_with(&env, args, no_session()).await;
+        assert_eq!(code, EXIT_FAILED, "{args:?}");
+        assert!(session.calls().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn second_instance_of_a_runner_refuses_to_run_sessions() {
     let env = test_env();
     assert!(env.paths.instance_lock_file().ends_with("example-app.lock"));

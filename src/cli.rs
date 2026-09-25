@@ -123,6 +123,9 @@ pub async fn run<S: Session>(
             };
             let interval = interval.unwrap_or(config.triage.interval);
             let runner = Runner::new(config, paths, store, session());
+            if refused_by_kill_switch(&runner) {
+                return EXIT_FAILED;
+            }
             install_signal_handlers(runner.shutdown_handle());
             runner.heartbeat(interval, once).await;
             EXIT_OK
@@ -357,12 +360,20 @@ fn cmd_resume(paths: &Paths) -> i32 {
     EXIT_OK
 }
 
-async fn cmd_card<S: Session>(runner: Runner<S>, card_ref: &str, workspace: Option<&str>) -> i32 {
-    if runner.killed() {
+/// A command that runs sessions does not start while the kill switch is present.
+fn refused_by_kill_switch<S: Session>(runner: &Runner<S>) -> bool {
+    let killed = runner.killed();
+    if killed {
         eprintln!(
             "kill switch present ({}); not starting",
             runner.paths.kill_switch().display()
         );
+    }
+    killed
+}
+
+async fn cmd_card<S: Session>(runner: Runner<S>, card_ref: &str, workspace: Option<&str>) -> i32 {
+    if refused_by_kill_switch(&runner) {
         return EXIT_FAILED;
     }
     install_signal_handlers(runner.shutdown_handle());
