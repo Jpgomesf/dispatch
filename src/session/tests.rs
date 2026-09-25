@@ -20,6 +20,7 @@ fn request() -> SessionRequest {
         limits: Limits {
             timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(60),
+            loop_threshold: 10,
             required_mcp: Vec::new(),
         },
     }
@@ -30,6 +31,7 @@ fn limited(dir: &Path, timeout: u64, idle_timeout: u64) -> SessionRequest {
         limits: Limits {
             timeout: Duration::from_millis(timeout),
             idle_timeout: Duration::from_millis(idle_timeout),
+            loop_threshold: 10,
             required_mcp: Vec::new(),
         },
         ..in_dir(dir)
@@ -437,6 +439,31 @@ async fn a_session_without_its_environment_is_stopped_at_start() {
         Ended::Environment(
             "claude started without its environment: MCP server linear is failed".into()
         )
+    );
+}
+
+#[tokio::test]
+async fn a_looping_session_is_stopped_as_stuck() {
+    let dir = tempfile::tempdir().unwrap();
+    let call = json!({"type": "assistant", "session_id": "session-example",
+                      "parent_tool_use_id": null,
+                      "message": {"content": [{"type": "tool_use", "id": "t", "name": "Bash",
+                                               "input": {"command": "cargo test"}}]}})
+    .to_string();
+    let mut lines = vec![init_line()];
+    lines.extend(std::iter::repeat_n(call, 10));
+    let body = format!("{}\nwhile true; do sleep 1 & wait $!; done", print(&lines));
+    let cli = fake_cli(dir.path(), &body);
+    let (control, _shutdown, _notices) = new_control();
+    let report = timeout(
+        Duration::from_secs(10),
+        cli.run(in_dir(dir.path()), control),
+    )
+    .await
+    .expect("stopped, not left to its timeout");
+    assert_eq!(
+        report.ended,
+        Ended::Stuck("Bash called 10 times with the same input in the last 10 tool calls".into())
     );
 }
 

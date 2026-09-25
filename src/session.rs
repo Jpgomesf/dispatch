@@ -18,6 +18,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 use crate::config::Effort;
 use crate::prompts::RUNNER_RULES;
 
+mod loops;
 mod stream;
 
 use stream::{Stop, Stream};
@@ -65,6 +66,8 @@ pub struct Limits {
     pub timeout: Duration,
     /// No stream event for this long means the session is stuck.
     pub idle_timeout: Duration,
+    /// Identical tool calls within twice as many that mean a loop; 0: no check.
+    pub loop_threshold: u32,
     /// MCP servers that must be connected when the session starts.
     pub required_mcp: Vec<String>,
 }
@@ -387,7 +390,7 @@ impl Session for ClaudeCli {
         let limits = &request.limits;
         let deadline = Instant::now() + limits.timeout;
         let mut last_event = Instant::now();
-        let mut stream = Stream::new(limits.required_mcp.clone());
+        let mut stream = Stream::new(limits);
         let mut stop = None;
         let mut stopping = StopSequence::new(group, self.stop_grace);
         let mut exited: Option<String> = None;

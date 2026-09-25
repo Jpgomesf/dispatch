@@ -12,7 +12,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use super::{Ended, Notice, SessionReport};
+use super::loops::Loops;
+use super::{Ended, Limits, Notice, SessionReport};
 use crate::durations::format_duration;
 
 /// Error results that are the session's own limits, never a usage limit.
@@ -33,6 +34,8 @@ pub enum Stop {
     Idle(Duration),
     /// `system/init` showed the session started without what it needs.
     Environment(String),
+    /// The same tool call over and over.
+    Loop(String),
 }
 
 /// What one line changed.
@@ -46,6 +49,7 @@ pub struct Observed {
 pub struct Stream {
     /// MCP servers that must be connected at `system/init`.
     required_mcp: Vec<String>,
+    loops: Loops,
     init_seen: bool,
     session_id: Option<String>,
     result: Option<Value>,
@@ -86,9 +90,10 @@ fn environment_problems(init: &Value, required_mcp: &[String]) -> Vec<String> {
 }
 
 impl Stream {
-    pub fn new(required_mcp: Vec<String>) -> Self {
+    pub fn new(limits: &Limits) -> Self {
         Stream {
-            required_mcp,
+            required_mcp: limits.required_mcp.clone(),
+            loops: Loops::new(limits.loop_threshold),
             ..Stream::default()
         }
     }
@@ -132,6 +137,11 @@ impl Stream {
         };
         if let Some(resets_at) = limit {
             observed.notices.extend(self.rate_limit(resets_at));
+        }
+        if event["type"] == "assistant"
+            && let Some(detail) = self.loops.observe_event(&event)
+        {
+            observed.stop.get_or_insert(Stop::Loop(detail));
         }
         if event["type"] == "result" {
             if event["api_error_status"] == 429 {
@@ -177,6 +187,7 @@ impl Stream {
         match stop {
             Some(Stop::Interrupted) => return Ended::Interrupted,
             Some(Stop::Environment(detail)) => return Ended::Environment(detail),
+            Some(Stop::Loop(detail)) => return Ended::Stuck(detail),
             _ => {}
         }
         // A limit hit mid-session explains the failure, unless the session ran into its own
@@ -197,7 +208,7 @@ impl Stream {
             Some(Stop::Idle(limit)) => {
                 return Ended::Stuck(format!("no stream event for {}", format_duration(limit)));
             }
-            Some(Stop::Interrupted | Stop::Environment(_)) | None => {}
+            Some(Stop::Interrupted | Stop::Environment(_) | Stop::Loop(_)) | None => {}
         }
         match &self.result {
             Some(result) if is_error(result) => Ended::ApiError(error_detail(result)),
@@ -260,8 +271,44 @@ mod tests {
         base.to_string()
     }
 
+    fn limits_with(required_mcp: Vec<String>) -> Limits {
+        Limits {
+            timeout: Duration::from_secs(3600),
+            idle_timeout: Duration::from_secs(900),
+            loop_threshold: 3,
+            required_mcp,
+        }
+    }
+
+    fn tool_use(name: &str, input: Value) -> String {
+        json!({"type": "assistant", "session_id": "session-a", "parent_tool_use_id": null,
+               "message": {"content": [{"type": "tool_use", "id": "t", "name": name,
+                                        "input": input}]}})
+        .to_string()
+    }
+
+    #[test]
+    fn repeating_the_same_tool_call_stops_the_session_as_stuck() {
+        let mut stream = Stream::new(&limits_with(Vec::new()));
+        stream.observe(&init());
+        let call = tool_use("Bash", json!({"command": "cargo test"}));
+        assert_eq!(stream.observe(&call).stop, None);
+        assert_eq!(stream.observe(&call).stop, None);
+        let Some(Stop::Loop(detail)) = stream.observe(&call).stop else {
+            panic!("third identical call with a threshold of 3");
+        };
+        assert_eq!(
+            detail,
+            "Bash called 3 times with the same input in the last 3 tool calls"
+        );
+        assert_eq!(
+            stream.finish(Some(Stop::Loop(detail.clone())), "").ended,
+            Ended::Stuck(detail)
+        );
+    }
+
     fn run(lines: &[String], stop: Option<Stop>) -> SessionReport {
-        let mut stream = Stream::new(Vec::new());
+        let mut stream = Stream::new(&limits_with(Vec::new()));
         for line in lines {
             stream.observe(line);
         }
@@ -270,7 +317,7 @@ mod tests {
 
     #[test]
     fn the_first_session_id_is_announced_once() {
-        let mut stream = Stream::new(Vec::new());
+        let mut stream = Stream::new(&limits_with(Vec::new()));
         assert_eq!(stream.observe("warning: not json"), Observed::default());
         let first = stream.observe(&init());
         assert_eq!(
@@ -302,7 +349,7 @@ mod tests {
 
     #[test]
     fn rate_limits_are_announced_with_the_latest_reset() {
-        let mut stream = Stream::new(Vec::new());
+        let mut stream = Stream::new(&limits_with(Vec::new()));
         stream.observe(&init());
         let limited = |resets_at| Notice::RateLimited { resets_at };
         assert!(stream.observe(&api_retry("overloaded")).notices.is_empty());
@@ -477,7 +524,7 @@ mod tests {
                    {"name": "github", "status": "connected"},
                    {"name": "other", "status": "failed"}]),
         );
-        let mut stream = Stream::new(required.clone());
+        let mut stream = Stream::new(&limits_with(required.clone()));
         assert_eq!(
             stream.observe(&healthy).stop,
             None,
@@ -488,7 +535,7 @@ mod tests {
             json!([{"plugin": "dispatch@inline", "type": "manifest", "message": "bad manifest"}]),
             json!([{"name": "linear", "status": "needs-auth"}]),
         );
-        let mut stream = Stream::new(required.clone());
+        let mut stream = Stream::new(&limits_with(required.clone()));
         let Some(Stop::Environment(detail)) = stream.observe(&broken).stop else {
             panic!("the environment is not what the runner needs");
         };
@@ -505,7 +552,7 @@ mod tests {
             Ended::Environment(detail)
         );
 
-        let mut unguarded = Stream::new(Vec::new());
+        let mut unguarded = Stream::new(&limits_with(Vec::new()));
         let bare = init_with(Value::Null, json!([]));
         assert_eq!(
             unguarded.observe(&bare).stop,

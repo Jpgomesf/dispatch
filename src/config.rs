@@ -139,6 +139,9 @@ pub struct SessionsConfig {
     /// Between two session starts, plus up to 50% random jitter; `0s` switches it off.
     #[serde(deserialize_with = "duration_or_zero_from_str")]
     pub start_stagger: Duration,
+    /// This many identical tool calls within the last twice as many means the session is
+    /// looping (stopped as `stuck`); 0 switches the check off.
+    pub loop_threshold: u32,
     /// MCP servers (names as Claude Code reports them) every session needs connected; a
     /// session without them is stopped at start.
     pub required_mcp: Vec<String>,
@@ -149,6 +152,7 @@ impl Default for SessionsConfig {
         Self {
             idle_timeout: Duration::from_secs(15 * 60),
             start_stagger: Duration::from_secs(30),
+            loop_threshold: 10,
             required_mcp: Vec::new(),
         }
     }
@@ -399,6 +403,7 @@ match = ["EX-"]
         assert_eq!(config.sessions.idle_timeout, minutes(15));
         assert_eq!(config.sessions.start_stagger, Duration::from_secs(30));
         assert!(config.sessions.required_mcp.is_empty());
+        assert_eq!(config.sessions.loop_threshold, 10);
         assert_eq!(config.card.max_attempts, 3);
         assert_eq!(
             config.state_dir,
@@ -460,6 +465,7 @@ match = ["EX-"]
             "[sessions]\nidle_timeout = \"-1m\"",
             "[sessions]\nunknown = 1",
             "[card]\nmax_attempts = 0",
+            "[sessions]\nloop_threshold = -1",
         ] {
             let raw = format!("name = \"example-app\"\n{body}");
             assert!(Config::from_toml(&raw).is_err(), "{raw}");
@@ -516,7 +522,7 @@ jql = "project = EX"
     #[test]
     fn session_limits_are_configurable() {
         let raw = "name = \"ex\"\n[triage]\ntimeout = \"5m\"\n[card]\ntimeout = \"2h\"\n\
-                   [discussion]\ntimeout = \"30m\"\n[sessions]\nidle_timeout = \"10m\"\nstart_stagger = \"45s\"\nrequired_mcp = [\"linear\"]\n";
+                   [discussion]\ntimeout = \"30m\"\n[sessions]\nidle_timeout = \"10m\"\nstart_stagger = \"45s\"\nloop_threshold = 0\nrequired_mcp = [\"linear\"]\n";
         let config = Config::from_toml(raw).unwrap();
         assert_eq!(config.triage.timeout, Duration::from_secs(300));
         assert_eq!(config.card.timeout, Duration::from_secs(7200));
@@ -524,6 +530,7 @@ jql = "project = EX"
         assert_eq!(config.sessions.idle_timeout, Duration::from_secs(600));
         assert_eq!(config.sessions.start_stagger, Duration::from_secs(45));
         assert_eq!(config.sessions.required_mcp, ["linear"]);
+        assert_eq!(config.sessions.loop_threshold, 0, "switched off");
     }
 
     #[test]
