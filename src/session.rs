@@ -249,6 +249,7 @@ fn signal_group(group: Option<u32>, signal: libc::c_int) {
 /// unfinished.
 #[derive(Debug)]
 struct StopSequence {
+    /// `None` once `claude` has been reaped: its pid may belong to another process by then.
     pid: Option<u32>,
     grace: Duration,
     started: bool,
@@ -267,7 +268,7 @@ impl StopSequence {
     }
 
     fn begin(&mut self) {
-        if !self.started {
+        if !self.started && self.pid.is_some() {
             self.started = true;
             send_signal(self.pid, libc::SIGINT, false);
             self.next = Some((Instant::now() + self.grace, libc::SIGTERM));
@@ -285,6 +286,13 @@ impl StopSequence {
     fn kill(&mut self) {
         self.started = true;
         signal_group(self.pid, libc::SIGKILL);
+        self.next = None;
+    }
+
+    /// `claude` was reaped: send nothing more (leftovers holding its pipes are handled by
+    /// the pipe grace).
+    fn exited(&mut self) {
+        self.pid = None;
         self.next = None;
     }
 
@@ -399,7 +407,7 @@ impl Session for ClaudeCli {
         let mut watching_shutdown = true;
         while exited.is_none() || stdout_open {
             let running = exited.is_none() && stop.is_none();
-            let escalation = stopping.due().filter(|_| exited.is_none());
+            let escalation = stopping.due();
             tokio::select! {
                 line = lines.recv(), if stdout_open => match line {
                     Some(line) => {
@@ -433,6 +441,7 @@ impl Session for ClaudeCli {
                         Ok(status) => status.to_string(),
                         Err(e) => format!("waiting for claude: {e}"),
                     });
+                    stopping.exited();
                     pipe_deadline = Some(Instant::now() + self.pipe_grace);
                 }
                 () = sleep_until(pipe_deadline.unwrap_or_else(Instant::now)), if pipe_deadline.is_some() => {
