@@ -64,7 +64,7 @@ async fn is_checkout_root(path: &Path) -> bool {
 /// Where a card (or a discussion, named by its claim key) runs:
 /// `<worktrees_dir>/<workspace>/<name-slug>`, a detached worktree of the workspace, reused
 /// when it already exists (resume). A workspace that is not a git checkout
-/// is returned as is; the workflow skill reports it as blocked.
+/// is returned as is.
 pub async fn card_checkout(
     workspace: &Workspace,
     card_ref: &str,

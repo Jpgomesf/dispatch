@@ -158,7 +158,7 @@ impl Default for SessionsConfig {
     }
 }
 
-/// Free-form: the workflow skill interprets these values.
+/// Free-form: passed to triage in its context; the skills interpret these values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourcesConfig {

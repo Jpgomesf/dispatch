@@ -52,8 +52,9 @@ jql = "project = EX"             # optional narrowing; runner always ANDs assign
 `[heartbeat]` is renamed `[triage]` (it is now started by events as well as the
 timer); `interval` default becomes `30m` (the fallback sweep). Model/effort
 defaults stay `sonnet` / `medium`. Unknown keys are still rejected. The CLI
-command stays `dispatch heartbeat [--interval] [--once]`; only the session mode
-(`/dispatch:workflow triage`) and the config section are renamed.
+command stays `dispatch heartbeat [--interval] [--once]`. Sessions are pointed at
+an objective, never at a skill by name; objectives, timeouts, `[discussion]` and
+`[sessions]` are in the main spec.
 
 As implemented: every source defaults to `enabled = false`; `teams` accepts team
 keys or names; `jql` is validated at load (balanced parentheses outside quotes, no
@@ -106,14 +107,17 @@ Enforcement:
 
 - Runner (hard): before claiming a card, it re-checks through the tracker API that
   the card's assignee is me; otherwise the card is refused with one stdout line,
-  whatever triage returned. Refs from other trackers or without a key are refused.
+  whatever triage returned (a retry scheduled for it is dropped). Refs from other
+  trackers or without a key are refused.
   As implemented it asks every enabled tracker (`issue(id: <ref>) { assignee { isMe } }`;
   Jira `GET /rest/api/3/issue/<key>?fields=assignee` against `/myself`) and fails
   closed on a missing key, an API error or an unknown ref. **Deviation:** with no
   tracker intake enabled the runner has no API to ask, so the check is skipped
   and only the skill's soft check applies (phase 1 configs keep working).
-- Skill (soft): `discussion` events never go into `cards_to_work`; the skill may
-  offer to take the ticket if it gets assigned.
+- Session rules (soft): the runner rules appended to every session say to work
+  only cards assigned to the user; `discussion` events are expected never to go
+  into `cards_to_work`, and the skills may offer to take the ticket if it gets
+  assigned.
 
 ## Taking part in discussions (dispatch must not get in the way)
 
@@ -121,18 +125,20 @@ The assignee rule gates *doing work* (branch, code, PR), never *talking*.
 
 - Mentions of me and direct replies to me bypass `allow_senders` and every
   other intake filter.
-- The runner never gates replies or comments; only the skill and the user's
+- The runner never gates replies or comments; only the skills and the user's
   Claude Code permissions decide whether a reply is sent or drafted.
 - Discussion events are keyed per comment/message, so follow-ups in the same
   thread are new events, never deduplicated away.
 - Triage may return `discussions_to_run: [{ "ref": str, "thread": str, "question": str }]`
   for mentions that need investigation. The runner starts a **discussion session**
-  per item: `[card]` model/effort/budget, a detached worktree of the matching
-  workspace (read, run, test), JSON context `{now, runner, ref, thread, question,
-  workspace, workspaces, outreach_file}`, prompt
-  `/dispatch:workflow discussion <ref>`. It never creates a branch, commits
-  or opens a PR; it ends by replying (or drafting) through `outreach` and returns
+  per item: `[card]` model/effort/budget, `[discussion]` timeout and objective
+  ("You were mentioned in a discussion about {ref}. Investigate the question and
+  respond in the thread."), a detached worktree of the matching workspace (read,
+  run, test), JSON context `{now, runner, ref, thread, question, workspace,
+  workspaces, outreach_file}`. The runner rules forbid it to create a branch,
+  commit, push or open a PR; it ends by replying (or drafting) and returns
   `DiscussionResult { ref, status: replied|drafted|skipped|failed, summary }`.
+  It follows the retry rules of the main spec, with in-memory retries.
 - Discussion sessions share `max_parallel` with cards (queued discussions start
   before ready cards) and are claimed with `discussion:<thread>`, or
   `discussion:<ref>` when `thread` is empty (changed from
@@ -157,19 +163,23 @@ Tables (all runner-scoped rows carry `runner`):
 |---|---|---|
 | `events` | `id`; `UNIQUE(source, external_id)` | intake queue: `runner`, `source`, `external_id`, `payload` JSON, `status` (`new`/`batched`/`done`), `created_at` |
 | `claims` | `key` (PK) | cross-runner exclusivity: `runner`, `lease_until`, `claimed_at` |
-| `cards` | `(runner, ref)` | per-runner card state: `status`, `blocked_by` JSON, `pr_url`, `updated_at` |
+| `cards` | `(runner, ref)` | per-runner card state: `status` (`in_progress`/`done`/`blocked`/`failed`/`needs_human`), `blocked_by` JSON, `pr_url`, `updated_at`, `attempts` (counted in the current run), `retry_at`, `reason` |
 | `cursors` | `(runner, key)` | skill cursors and poller cursors |
+| `attempts` | `id` | one row per session: `runner`, `mode`, `ref` (empty for triage), `attempt` (per runner, mode and ref), `cwd`, `started_at`, `ended_at`, `outcome`, `summary`, `blocked_on`, `session_id`, `cost_usd`, `new_commits` |
+| `pause` | single row | machine-wide pause after a usage limit: `until`, `reason`, `runner`, `set_at` |
 | `schema_version` | — | migrations, applied in order at open |
 
 As implemented: the default path is fixed (not under `state_dir`) so runners
-with different state dirs still share it; `dispatch check` never creates it.
-`events` also stores `kind`, `mentions_me`, `sender`, `occurred_at`; its integer
-`id`, as a string, is the event `id` triage sees. Poller cursors live in
-`cursors` under `intake:<source>:<stream>` and are never shown to the skill.
+with different state dirs still share it; `dispatch check`, `status` and
+`history` never create it (`status` and `history` open it read-only and refuse a
+schema version other than their own). `events` also stores `kind`,
+`mentions_me`, `sender`, `occurred_at`; its integer `id`, as a string, is the
+event `id` triage sees. Poller cursors live in `cursors` under
+`intake:<source>:<stream>` and are never shown to the skills.
 `cards.blocked_by` records the triage's list when the card starts. At startup
-(`heartbeat` and `card`, under the instance lock) a runner marks its
-`in_progress` cards `failed`, releases its own claims and returns its `batched`
-events to `new`.
+(`heartbeat` and `card`, under the instance lock) a runner closes its open
+attempts as `crash`, settles its `in_progress` cards by the retry rules, releases
+its own claims and returns its `batched` events to `new`.
 
 ## Level 1 — hard claims (runner, same machine)
 
@@ -190,7 +200,8 @@ events to `new`.
 
 ## Level 2 — soft claims (skills, across machines and people)
 
-Runner passes `runner` (its `name`) in every JSON context. The `workflow` skill:
+The runner passes `runner` (its `name`) in every JSON context and enforces
+nothing here; these are the conventions the skills follow:
 
 - **Card start:** read the card first. If another assignee/agent label, an open
   branch or PR mentioning the ref, or a claim comment newer than 1 h by another
@@ -256,17 +267,22 @@ under `--once`.
 - Slack (via notifications) and other message events are not acted on by the
   runner: they only start triage. The triage session (`[triage]` model/effort,
   default sonnet/medium) reads the full thread through the connector, decides
-  relevance, and per event ignores, sends an initial response via `outreach`,
-  drafts, or turns it into a card. Whether an initial response is sent or
+  relevance, and per event ignores, sends an initial response, drafts, or turns
+  it into a card, using the user's skills. Whether an initial response is sent or
   drafted is decided by Claude Code permissions.
 - First `new` event for a runner opens a batch window; when it closes, all `new`
   events become `batched` and go to one triage session as `events: [...]` in the
-  heartbeat context (in addition to cursors, sources, workspaces). On success they
-  become `done`; on failure they return to `new` (retry with backoff).
+  triage context (with cursors, sources, workspaces and escalations). On success
+  they become `done`; on failure they return to `new` (retry with backoff).
+- A batched event whose payload or sender mentions a `needs_human` card of this
+  runner (the ref as a whole token) resets that card, with one `card reopened`
+  line: the external change it was waiting for.
+- Nothing starts while the machine-wide pause holds, and session starts are
+  staggered (main spec).
 - On success every batched event becomes `done`, whether or not `handled` names
   it (an event may only have produced a `discussions_to_run` entry). A failed
   batch (including a panicked triage task) waits for the later of the
-  30s-doubling backoff and a new batch window. Cursors the skill returns are
+  30s-doubling backoff and a new batch window. Cursors the session returns are
   saved best effort: a store failure there prints one line but does not fail
   the batch, which would repeat replies already sent.
 - A queued card that ends without a recorded status (refused by the assignee
@@ -276,11 +292,12 @@ under `--once`.
   the previous sweep, independent of event triages (an event triage handles only
   its events, so it does not replace a sweep). One triage runs at a time.
 - `--once`: one triage over the pending events right away (no window), else a
-  sweep; then its sessions.
+  sweep; then its sessions and any retry already due.
 - `allow_senders`, when set, drops events whose sender is not listed before they
   are stored; it never applies to `work` events or to `mentions_me` events.
-- The triage result and card scheduling are unchanged (`cards_to_work` with
-  `blocked_by`, `max_parallel`, per-card worktrees), plus Level 1 card claims.
+- The triage result and card scheduling follow the main spec (`cards_to_work`
+  with `blocked_by`, `max_parallel`, per-card worktrees, retries), plus Level 1
+  card claims.
 
 ## Out of scope
 
